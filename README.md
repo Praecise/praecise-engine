@@ -37,8 +37,10 @@ it needs (or uses the one a host already provides).
 - **Speculative decoding** — self-speculative block (DFlash) and multi-token
   prediction (MTP) paths, wired through the FFI with draft/target context sharing.
 - **Architecture coverage** — including the muse-glimmer family and its projector.
-- **Hardware tuning** — per-architecture matmul configuration and attention paths,
-  including recent NVIDIA GPUs.
+- **Hardware tuning** — per-architecture matmul configuration and attention paths.
+  The CUDA build is a single multi-architecture binary spanning Turing → Blackwell;
+  architecture-specific fast paths are gated and selected at runtime. See
+  [docs/hardware.md](docs/hardware.md) for the support matrix.
 
 ### Planned
 
