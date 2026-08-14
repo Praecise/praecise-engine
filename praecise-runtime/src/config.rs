@@ -42,6 +42,12 @@ pub struct GenerationConfig {
     /// autoregressive sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_n: Option<u8>,
+    /// Verifiable-inference commitment width. `Some(k)` records the top-`k`
+    /// logits at each generated step so the result carries a
+    /// [`crate::toploc::InferenceCommitment`] a verifier can later recompute
+    /// and check; `None` disables it (no commitment overhead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment_k: Option<u8>,
 }
 
 impl Default for GenerationConfig {
@@ -59,6 +65,7 @@ impl Default for GenerationConfig {
             presence_penalty: 0.0,
             stop: Vec::new(),
             draft_n: None,
+            commitment_k: None,
         }
     }
 }

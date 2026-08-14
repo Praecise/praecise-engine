@@ -61,6 +61,11 @@ pub struct InferenceResult {
     pub tokens_per_second: f64,
     /// Engine-observed termination cause.
     pub stop_reason: StopReason,
+    /// Verifiable-inference commitment, present when the request set
+    /// [`crate::config::GenerationConfig::commitment_k`]. Carries the per-step
+    /// top-k logit records a verifier can recompute against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<crate::toploc::InferenceCommitment>,
 }
 
 /// A chat message with role and content, for chat-template formatting.

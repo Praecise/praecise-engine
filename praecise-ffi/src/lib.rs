@@ -356,6 +356,7 @@ mod tests {
             generation_time_ms: 100,
             tokens_per_second: 50.0,
             stop_reason: StopReason::Eos,
+            commitment: None,
         };
         let raw = PraeciseInferenceResult::new(inner).into_raw();
         unsafe {

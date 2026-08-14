@@ -26,6 +26,10 @@ pub mod error;
 pub mod prompt;
 pub mod result;
 pub mod stream;
+/// Verifiable-inference commitments (TOPLOC-style top-k logit records): a
+/// backend-agnostic proof surface any consumer can commit to and verify. No
+/// backend required.
+pub mod toploc;
 
 /// llama.cpp sampler-chain assembly. Compiled only with a bundled backend.
 #[cfg(feature = "bundled-llama")]

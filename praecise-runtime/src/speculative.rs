@@ -241,5 +241,9 @@ pub fn generate_speculative(
         generation_time_ms,
         tokens_per_second,
         stop_reason,
+        // Speculative decode does not record a commitment yet; the top-k
+        // capture lives in the standard decode loop that moves in with the
+        // orchestrator.
+        commitment: None,
     })
 }

@@ -274,6 +274,10 @@ impl Sequence {
                 generation_time_ms,
                 tokens_per_second,
                 stop_reason,
+                // The batched scheduler does not capture per-step top-k logits;
+                // commitment recording belongs to the standard serial decode
+                // loop that moves in with the orchestrator.
+                commitment: None,
             }));
         }
     }
