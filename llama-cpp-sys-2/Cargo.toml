@@ -119,7 +119,7 @@ dynamic-backends = ["dynamic-link"]
 # Build the ggml RPC backend (GGML_RPC=ON) and the `rpc-server` binary. The
 # binary's path is exported to dependents via `cargo:rpc_server_bin=<path>`.
 # rpc-server is insecure on open networks; it is meant to be tunneled behind an
-# authenticated transport by the consumer (see tenzro cluster serving runtime).
+# authenticated transport by the consuming application.
 rpc = []
 # Intel oneAPI SYCL backend (Arc / Battlemage / Data Center GPU Max / integrated
 # Xe). Requires the oneAPI DPC++ compiler (icpx) on PATH at build time; the

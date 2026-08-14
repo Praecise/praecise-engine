@@ -1,10 +1,10 @@
-# Praecise Inference
+# Praecise Engine
 
-**A backend-agnostic inference acceleration layer for large language models.**
+**A backend-agnostic inference-acceleration engine for large language models.**
 
-Praecise sits between an application and an inference backend and speeds up token
-generation — through speculative decoding, hardware-aware tuning, and a uniform
-serving surface — without the application needing to know which backend is
+Praecise Engine sits between an application and an inference backend and speeds up
+token generation — through speculative decoding, hardware-aware tuning, and a
+uniform serving surface — without the application needing to know which backend is
 underneath. It is designed to support multiple backends behind one interface;
 **llama.cpp is the first supported backend.**
 
