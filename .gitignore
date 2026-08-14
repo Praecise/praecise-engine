@@ -1,0 +1,11 @@
+/target
+**/target
+*.o
+*.a
+*.rlib
+*.so
+*.dylib
+Cargo.lock.orig
+.DS_Store
+/models
+*.gguf
