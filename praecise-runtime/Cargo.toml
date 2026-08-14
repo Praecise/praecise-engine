@@ -1,0 +1,21 @@
+[package]
+name = "praecise-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Praecise general inference-acceleration runtime: speculative decode (DFlash/MTP), sampling, and the backend-agnostic inference API. Sits on top of a pulled backend (llama.cpp first)."
+
+[dependencies]
+llama-cpp-2 = { path = "../llama-cpp-2" }
+thiserror = "2"
+tracing = "0.1"
+encoding_rs = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[features]
+default = []
+cuda = ["llama-cpp-2/cuda"]
+cuda-no-vmm = ["llama-cpp-2/cuda-no-vmm"]
+rocm = ["llama-cpp-2/rocm"]
+metal = ["llama-cpp-2/metal"]
+vulkan = ["llama-cpp-2/vulkan"]
