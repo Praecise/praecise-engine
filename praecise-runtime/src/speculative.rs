@@ -8,13 +8,13 @@
 use std::num::NonZeroU32;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::AddBos;
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 
 use crate::config::GenerationConfig;
 use crate::error::{Error, Result};
-use crate::loaded::{LoadedDrafter, LoadedModel};
 use crate::result::{InferenceResult, StopReason};
 use crate::sampling::build_sampler_chain;
 use crate::stream::StopStream;
@@ -25,18 +25,29 @@ const DEFAULT_CONTEXT_LENGTH: u32 = 8192;
 /// Run speculative decoding: the drafter proposes a block of tokens, the target
 /// verifies them in one decode, and the longest matching prefix (plus a bonus
 /// token) is accepted. `draft_n` caps the block size (1..=6 typical).
+/// The draft model/backend are passed explicitly (not a consumer's model
+/// wrapper) so this one engine serves both modes: a *separate* drafter GGUF,
+/// and *inline* self-speculation where the draft head lives in the target's own
+/// GGUF — there the caller passes the target's own `model`/`backend`, so the
+/// draft context is built from the target weights with no second load.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_speculative(
-    loaded: &LoadedModel,
-    drafter: &LoadedDrafter,
+    target_model: &LlamaModel,
+    target_backend: &LlamaBackend,
+    target_context_length: u32,
+    draft_model: &LlamaModel,
+    draft_backend: &LlamaBackend,
+    draft_context_length: u32,
+    draft_spec_type: i32,
     prompt: &str,
     config: &GenerationConfig,
     token_tx: Option<&tokio::sync::mpsc::Sender<String>>,
     draft_n: u8,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<InferenceResult> {
     let start = std::time::Instant::now();
 
-    let tokens_list = loaded
-        .model
+    let tokens_list = target_model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|e| Error::Other(format!("Tokenization failed: {}", e)))?;
     if tokens_list.is_empty() {
@@ -44,28 +55,27 @@ pub fn generate_speculative(
     }
     let input_tokens = tokens_list.len() as u32;
 
-    let n_ctx_target = NonZeroU32::new(loaded.context_length)
+    let n_ctx_target = NonZeroU32::new(target_context_length)
         .unwrap_or(NonZeroU32::new(DEFAULT_CONTEXT_LENGTH).unwrap());
-    let n_ctx_draft = NonZeroU32::new(drafter.context_length)
+    let n_ctx_draft = NonZeroU32::new(draft_context_length)
         .unwrap_or(NonZeroU32::new(DEFAULT_CONTEXT_LENGTH).unwrap());
 
     // Target holds recurrent-state rollback slots (n_rs_seq = draft n_max) to
     // undo rejected draft tokens; the draft context keeps the default 0.
-    let target_ctx = loaded
-        .model
+    let target_ctx = target_model
         .new_context(
-            &loaded.backend,
+            target_backend,
             LlamaContextParams::default()
                 .with_n_ctx(Some(n_ctx_target))
                 .with_n_rs_seq(u32::from(draft_n)),
         )
         .map_err(|e| Error::Other(format!("Failed to create target context: {}", e)))?;
     // The draft context references the target via `ctx_other` (reads the
-    // target's token embeddings / lm_head through it).
-    let draft_ctx = drafter
-        .model
+    // target's token embeddings / lm_head through it). For inline self-spec the
+    // caller passes the target model here, so this shares the target weights.
+    let draft_ctx = draft_model
         .new_context_with_ctx_other(
-            &drafter.backend,
+            draft_backend,
             LlamaContextParams::default().with_n_ctx(Some(n_ctx_draft)),
             &target_ctx,
         )
@@ -78,7 +88,7 @@ pub fn generate_speculative(
             n_max: draft_n as i32,
             n_min: 0,
             p_min: 0.0,
-            spec_type: drafter.spec_type,
+            spec_type: draft_spec_type,
         },
     )
     .map_err(|e| Error::SpeculativeUnavailable {
@@ -89,7 +99,7 @@ pub fn generate_speculative(
     let mut batch = LlamaBatch::new((draft_n as usize) + 1, 1);
 
     // The drafter only PROPOSES tokens; the target's sampler decides.
-    let mut sampler = build_sampler_chain(config, loaded.model.n_vocab());
+    let mut sampler = build_sampler_chain(config, target_model.n_vocab());
     let mut output_tokens: u32 = 0;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut stream = StopStream::new(config.stop.clone());
@@ -134,7 +144,14 @@ pub fn generate_speculative(
 
     let mut prompt_so_far: Vec<llama_cpp_2::token::LlamaToken> = tokens_list.clone();
 
-    'genloop: while n_past < max_pos && !loaded.model.is_eog_token(id_last) {
+    'genloop: while n_past < max_pos && !target_model.is_eog_token(id_last) {
+        // Client-gone: stop before more GPU work if the stream receiver dropped
+        // or the caller flipped `cancel` on disconnect. Contexts drop at return.
+        if token_tx.is_some_and(|tx| tx.is_closed())
+            || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            break 'genloop;
+        }
         // 1. Ask the drafter for a block of candidates (may be empty).
         let drafts = match spec.draft(n_past, id_last, &prompt_so_far) {
             Ok(d) => d,
@@ -181,12 +198,12 @@ pub fn generate_speculative(
             sampler.accept(sampled);
             id_last = sampled;
             prompt_so_far.push(sampled);
-            if loaded.model.is_eog_token(sampled) {
+            if target_model.is_eog_token(sampled) {
                 stop_now = true;
                 break;
             }
             output_tokens += 1;
-            if let Ok(piece) = loaded.model.token_to_piece(sampled, &mut decoder, true, None) {
+            if let Ok(piece) = target_model.token_to_piece(sampled, &mut decoder, true, None) {
                 if !(stream.push(&piece, token_tx) && !stream.hit_stop()) {
                     stop_now = true;
                 }
