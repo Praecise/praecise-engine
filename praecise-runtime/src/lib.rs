@@ -1,4 +1,4 @@
-//! Praecise Engine — inference-acceleration runtime.
+//! Praecise general inference-acceleration runtime.
 //!
 //! Backend-agnostic acceleration on top of an inference backend (llama.cpp
 //! first). Provides the generation API — configuration, results, sampling and
@@ -26,9 +26,6 @@ pub mod error;
 pub mod prompt;
 pub mod result;
 pub mod stream;
-/// Verifiable-inference commitments (TOPLOC-style top-k logit records): a
-/// backend-agnostic proof surface any consumer can commit to and verify. No
-/// backend required.
 pub mod toploc;
 
 /// llama.cpp sampler-chain assembly. Compiled only with a bundled backend.

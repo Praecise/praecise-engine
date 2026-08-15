@@ -49,8 +49,7 @@ use crate::stream::StopStream;
 /// `n_ctx / n_seq_max`.
 const MAX_SLOTS_DEFAULT: usize = 32;
 
-/// Sequence slots, overridable with `PRAECISE_MAX_SLOTS` (or the legacy
-/// `TENZRO_MAX_SLOTS`, kept for the first consumer's existing deployments).
+/// Sequence slots, overridable with `TENZRO_MAX_SLOTS`.
 ///
 /// This is `n_seq_max`. On a device that cannot afford `32 x` a useful window,
 /// fewer slots buy back per-request context. The host's admission layer must
@@ -59,8 +58,7 @@ const MAX_SLOTS_DEFAULT: usize = 32;
 pub fn max_slots() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("PRAECISE_MAX_SLOTS")
-            .or_else(|_| std::env::var("TENZRO_MAX_SLOTS"))
+        std::env::var("TENZRO_MAX_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v > 0)
@@ -69,16 +67,15 @@ pub fn max_slots() -> usize {
 }
 
 /// Physical batch capacity for a single `llama_decode`, overridable with
-/// `PRAECISE_PHYSICAL_BATCH` (or the legacy `TENZRO_PHYSICAL_BATCH`). Sets
-/// `n_batch`/`n_ubatch`; the compute buffer scales with it.
+/// `TENZRO_PHYSICAL_BATCH`. Sets `n_batch`/`n_ubatch`; the compute buffer
+/// scales with it.
 const PHYSICAL_BATCH_DEFAULT: usize = 2048;
 
 /// Physical batch size (see [`PHYSICAL_BATCH_DEFAULT`]).
 fn physical_batch() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("PRAECISE_PHYSICAL_BATCH")
-            .or_else(|_| std::env::var("TENZRO_PHYSICAL_BATCH"))
+        std::env::var("TENZRO_PHYSICAL_BATCH")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v >= 32)
@@ -274,9 +271,6 @@ impl Sequence {
                 generation_time_ms,
                 tokens_per_second,
                 stop_reason,
-                // The batched scheduler does not capture per-step top-k logits;
-                // commitment recording belongs to the standard serial decode
-                // loop that moves in with the orchestrator.
                 commitment: None,
             }));
         }
@@ -348,15 +342,10 @@ fn scheduler_loop(
             break;
         }
 
-        // Cancellation sweep: free any slot whose client is gone before doing
-        // more GPU work for it. A dropped result receiver (non-streaming) or a
-        // dropped stream receiver (streaming) both close `result_tx`, so this
-        // one check covers both — and catches non-streaming cancellation, which
-        // the per-token `stream.push` drop check cannot see. Without it, a
-        // killed client's request keeps decoding to completion and pins the GPU.
-        // Mark-and-sweep: free the slot's KV and drop it; the next
-        // `llama_decode` simply won't include its rows. (Matches llama.cpp's
-        // server + TGI's `response_tx.is_closed()`.)
+        // Cancellation sweep: free any slot whose client is gone before more GPU
+        // work. A dropped result/stream receiver closes `result_tx`, covering
+        // both streaming and non-streaming cancellation. Matches the consumer's
+        // verified scheduler.
         for slot_idx in 0..slots.len() {
             let client_gone = slots[slot_idx]
                 .as_ref()
@@ -364,7 +353,6 @@ fn scheduler_loop(
                 .is_some_and(tokio::sync::oneshot::Sender::is_closed);
             if client_gone && let Some(seq) = slots[slot_idx].take() {
                 let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
-                // Client is gone: nothing to send; dropping `seq` frees the slot.
             }
         }
 
