@@ -7,7 +7,7 @@
 
 use std::num::NonZeroU32;
 
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaModel};
@@ -73,12 +73,17 @@ pub fn generate_speculative(
     // The draft context references the target via `ctx_other` (reads the
     // target's token embeddings / lm_head through it). For inline self-spec the
     // caller passes the target model here, so this shares the target weights.
+    //
+    // A draft-mtp head (spec_type 0) MUST run as an MTP-typed context so the
+    // graph builds the nextn head as the drafter; without `ctx_type = MTP` the
+    // draft decode runs the base graph and `common_speculative_process` fails
+    // (status -3). DFlash (spec_type 1) uses the default context type.
+    let mut draft_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx_draft));
+    if draft_spec_type == 0 {
+        draft_params = draft_params.with_context_type(LlamaContextType::Mtp);
+    }
     let draft_ctx = draft_model
-        .new_context_with_ctx_other(
-            draft_backend,
-            LlamaContextParams::default().with_n_ctx(Some(n_ctx_draft)),
-            &target_ctx,
-        )
+        .new_context_with_ctx_other(draft_backend, draft_params, &target_ctx)
         .map_err(|e| Error::Other(format!("Failed to create draft context: {}", e)))?;
 
     let mut spec = MtpSpeculative::new(
