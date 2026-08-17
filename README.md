@@ -2,6 +2,12 @@
 
 **A backend-agnostic inference-acceleration engine for large language models.**
 
+> **Praecise Engine**, not "Praecise". Praecise is the family; the engine is the
+> acceleration layer, and [praecise-harness](https://github.com/Praecise/praecise-harness)
+> is the agentic framework. They sit at different levels and are used
+> independently — the engine makes a model faster, the harness makes an agent
+> work. Use the full name in anything a reader might land on cold.
+
 Praecise Engine sits between an application and an inference backend and speeds up
 token generation — through speculative decoding, hardware-aware tuning, and a
 uniform serving surface — without the application needing to know which backend is
@@ -14,7 +20,7 @@ underneath. It is designed to support multiple backends behind one interface;
         application / serving layer
                    │
         ┌──────────▼───────────┐
-        │   Praecise (accel)   │   speculative decode, hardware tuning,
+        │ Praecise Engine      │   speculative decode, hardware tuning,
         │   uniform interface  │   sampling, KV strategy
         └──────────┬───────────┘
                    │  pluggable backends
@@ -24,10 +30,10 @@ underneath. It is designed to support multiple backends behind one interface;
   supported     TensorRT-LLM / SGLang       other runtimes
 ```
 
-Praecise is the acceleration layer — not a model server on its own, and not a fork
+Praecise Engine is the acceleration layer — not a model server on its own, and not a fork
 of any single engine. Each backend is an adapter. Optimizations that can be
-expressed generically live in the Praecise layer; backend-specific work lives in
-that backend's adapter. Praecise does not vendor a backend: it **pulls** the one
+expressed generically live in the Praecise Engine layer; backend-specific work lives in
+that backend's adapter. Praecise Engine does not vendor a backend: it **pulls** the one
 it needs (or uses the one a host already provides).
 
 ## Backends
@@ -53,7 +59,7 @@ Single-stream (batch-1) decode is memory-bandwidth-bound: each token streams the
 model's active weights from memory once, so throughput is bounded by
 `bandwidth ÷ bytes-per-token`. The software levers are to move fewer bytes per
 token (quantization, sparsity) or to emit more tokens per weight-read (speculative
-decoding). Praecise focuses on the latter and on tuning each backend for the target
+decoding). Praecise Engine focuses on the latter and on tuning each backend for the target
 hardware — techniques that are largely backend-independent, which is why they belong
 in a layer rather than a fork.
 
@@ -63,7 +69,7 @@ in a layer rather than a fork.
 - `llama-cpp-2` — safe Rust bindings, including the speculative-decode primitives.
 - `praecise-runtime` — the backend-agnostic acceleration runtime and inference API.
 
-## Consuming Praecise
+## Consuming Praecise Engine
 
 Depend on the crate you need (today, `llama-cpp-2` / `praecise-runtime`). The
 backend is pulled as a dependency; a host that already builds the same backend
