@@ -7,7 +7,7 @@ description = "Praecise Engine — inference-acceleration runtime: speculative d
 
 [dependencies]
 # The llama.cpp backend is OPTIONAL. Enable `bundled-llama` for standalone use
-# (Praecise pulls and builds the backend). A host application that already links
+# (Praecise Engine pulls and builds the backend). A host application that already links
 # llama-cpp-2 depends on this crate WITHOUT the feature and provides its own
 # backend handle, so the backend — and its GPU context — loads once rather than
 # being duplicated.

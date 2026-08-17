@@ -1,5 +1,5 @@
 Praecise Engine
-Copyright 2026 Praecise Inference contributors
+Copyright 2026 Praecise Engine contributors
 
 This product includes software developed as part of the Praecise Engine
 project, licensed under the Apache License, Version 2.0 (see LICENSE).
@@ -16,7 +16,7 @@ llama.cpp / ggml
     vendored backend under llama-cpp-sys-2/llama.cpp and modifications made
     to it. Those portions remain under the MIT License, whose terms are
     reproduced in LICENSE-MIT and are not superseded by the Apache License
-    applied to Praecise's own code.
+    applied to Praecise Engine's own code.
 
     The vendored copy is MODIFIED and is not stock upstream. The changes are
     listed in llama-cpp-sys-2/llama.cpp/MODIFICATIONS.md.
