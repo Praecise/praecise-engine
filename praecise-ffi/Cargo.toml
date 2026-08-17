@@ -1,0 +1,21 @@
+[package]
+name = "praecise-ffi"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine — C ABI surface. A stable extern \"C\" boundary over praecise-runtime's backend-agnostic types (config, result, stop reason, error) for cross-language consumers. cbindgen-ready."
+
+[lib]
+# `cdylib`/`staticlib` produce the C-linkable artifacts; `rlib` lets Rust
+# consumers depend on it directly too.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# Only the backend-agnostic surface is needed here, so the backend is NOT
+# bundled — this crate compiles and links without building llama.cpp. The
+# generation entry points bind once the runtime orchestrator moves into
+# praecise-runtime (they need a bundled or host-provided backend).
+praecise-runtime = { path = "../praecise-runtime" }
+
+[lints]
+workspace = true
