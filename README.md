@@ -72,6 +72,7 @@ shares it rather than building it twice.
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+SPDX for the distribution as a whole: `Apache-2.0 AND MIT`.
 
 Apache-2.0 rather than MIT because this engine is meant to sit in front of
 several vendors' backends, and Apache-2.0 carries an explicit patent grant where
