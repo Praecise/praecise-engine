@@ -18,6 +18,9 @@ llama.cpp / ggml
     reproduced in LICENSE-MIT and are not superseded by the Apache License
     applied to Praecise's own code.
 
+    The vendored copy is MODIFIED and is not stock upstream. The changes are
+    listed in llama-cpp-sys-2/llama.cpp/MODIFICATIONS.md.
+
 llama-cpp-2 / llama-cpp-sys-2
     Copyright (c) Dial AI and contributors
     Dual licensed under MIT OR Apache-2.0; used here under Apache-2.0.
