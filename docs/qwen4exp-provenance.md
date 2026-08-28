@@ -37,9 +37,8 @@ differing by ~440 lines of reordering and local edits. Same file, modified.
 
 ## The right way to get it
 
-**Do not commit the local copy to the fork.** Move the fork's base forward to an
-upstream commit that already contains qwen4exp, and let upstream's authorship
-travel with it.
+**Do not commit the local copy to the fork.** Take it from a newer upstream
+instead, so upstream's authorship travels with the code.
 
 qwen4exp lands between build tags **b10658** (absent) and **b10660** (present):
 
@@ -48,13 +47,41 @@ qwen4exp lands between build tags **b10658** (absent) and **b10660** (present):
 | b10650, b10652, b10654, b10656, b10658 | no |
 | **b10660**, b10666, b10667 | **yes** |
 
-So: rebase the fork onto **b10660 or later**, keep the fork's own commits on
-top, and bump the submodule pointer in this repo. The engine gets qwen4exp, and
-the commit history says who wrote what.
+⚠ **A rebase does not work here, despite being the obvious answer.**
+`hilarl/llama.cpp` shares **no history with upstream** — `git merge-base`
+against b10660 returns nothing. The repo has two commits, and the older one is a
+**squashed import with no parent**: 3,396 files and 1,435,194 insertions in a
+single root commit. There is nothing to rebase onto.
+
+So the options are:
+
+**A. Re-import from b10660+.** Take upstream at that tag, re-apply the local
+changes listed in `MODIFICATIONS.md`, commit under the correct identity. Same
+shape as today, current, and qwen4exp arrives with it.
+
+**B. Re-fork properly.** Clone upstream with its real history and put the local
+commits on top, so `git log` shows upstream's authorship rather than only the
+tree doing so. More work, and it moves the submodule pin.
+
+## On the licence, which is the thing that actually matters
+
+**The current arrangement is not a violation.** The import preserves upstream's
+`LICENSE`, `AUTHORS` and `README.md`, and `MODIFICATIONS.md` states it directly:
+
+> "This is **not** stock upstream llama.cpp... Upstream:
+> https://github.com/ggml-org/llama.cpp — Copyright (c) 2023-2026 The ggml
+> authors, MIT License. Those terms continue to govern this directory... The
+> Apache-2.0 licence applied to Praecise Engine's own crates does not relicense
+> this code."
+
+MIT asks that the copyright notice travel with the code, and it does. The commit
+*metadata* is a poor record of provenance — a squashed import authored locally
+reads as though the code were written here — but the attribution a reader needs
+is present in the tree.
 
 ## What the fork legitimately owns
 
-One commit, and it is real work:
+One of its two commits, and it is real work:
 
 ```
 dddf1d9  Halve the MMVQ warps per block on Blackwell
