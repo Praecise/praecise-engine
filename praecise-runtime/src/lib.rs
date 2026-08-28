@@ -48,6 +48,9 @@ pub mod prompt;
 /// decision, not a mechanism.
 pub mod spec_policy;
 pub mod result;
+/// Adapters for backends reached over HTTP (vLLM, SGLang). Builds and parses
+/// requests; the caller supplies the HTTP client. Backend-agnostic.
+pub mod served;
 /// Request shaping: grouping and rewriting requests so a batch is cheap before
 /// it reaches a backend. Backend-agnostic.
 pub mod shaping;
@@ -83,6 +86,7 @@ pub use backend::{plan_for as plan_speculation_for, Backend, Capabilities, Integ
 pub use drafters::{preflight as preflight_drafter, DeploymentIntent, Drafter, Licence, Trap};
 pub use entropy::{block_size_for, EntropyThresholds, Regime, RegimeTracker};
 pub use error::{Error, Result};
+pub use served::{Completion, Dialect, Endpoint, HttpRequest};
 pub use shaping::{group_by_class, BatchClass, Rewrite};
 pub use prax::{Allocation, Prax, Signals};
 pub use verify::{acceptance_rate, expected_tokens, MultiDraftSampling};

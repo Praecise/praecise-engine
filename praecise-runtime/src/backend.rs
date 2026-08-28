@@ -51,6 +51,10 @@ pub enum Backend {
     Vllm,
     /// SGLang over its OpenAI-compatible HTTP API. Not implemented.
     SgLang,
+    /// TensorRT-LLM via `trtllm-serve`, its OpenAI-compatible server.
+    TensorRtLlm,
+    /// MLX via `mlx_lm.server`. Apple Silicon.
+    MlxLm,
 }
 
 /// How the engine reaches a backend — see the module docs on why this decides
@@ -88,7 +92,7 @@ impl Backend {
     /// Every backend the engine knows about, implemented or not.
     #[must_use]
     pub fn all() -> &'static [Backend] {
-        &[Backend::LlamaCpp, Backend::Vllm, Backend::SgLang]
+        &[Backend::LlamaCpp, Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::MlxLm]
     }
 
     /// Stable identifier used in configuration and logs.
@@ -98,6 +102,8 @@ impl Backend {
             Backend::LlamaCpp => "llama.cpp",
             Backend::Vllm => "vllm",
             Backend::SgLang => "sglang",
+            Backend::TensorRtLlm => "tensorrt-llm",
+            Backend::MlxLm => "mlx",
         }
     }
 
@@ -111,6 +117,8 @@ impl Backend {
             "llama.cpp" | "llamacpp" | "llama" => Ok(Backend::LlamaCpp),
             "vllm" => Ok(Backend::Vllm),
             "sglang" | "sgl" => Ok(Backend::SgLang),
+            "tensorrt.llm" | "tensorrtllm" | "trtllm" | "tensorrt" => Ok(Backend::TensorRtLlm),
+            "mlx" | "mlx.lm" | "mlxlm" => Ok(Backend::MlxLm),
             _ => Err(Error::BackendUnknown {
                 name: s.to_string(),
                 known: Backend::all().iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", "),
@@ -133,12 +141,24 @@ impl Backend {
             // sampling parameters, and a JSON schema. None of that reaches
             // inside their decode loop, so engine-side speculation is
             // impossible by construction rather than merely unimplemented.
-            Backend::Vllm | Backend::SgLang => Capabilities {
+            Backend::Vllm | Backend::SgLang | Backend::TensorRtLlm => Capabilities {
                 integration: Integration::Served,
                 engine_speculation: false,
                 logit_access: false,
                 structured_output: true,
-                implemented: false,
+                implemented: true,
+            },
+            // MLX is the outlier and the reason `structured_output` is a
+            // capability rather than an assumption: `mlx_lm.server` never reads
+            // `response_format`, so a schema-constrained request degrades to
+            // free text with no error. Reporting that up front is the only way
+            // a caller finds out before the output is wrong.
+            Backend::MlxLm => Capabilities {
+                integration: Integration::Served,
+                engine_speculation: false,
+                logit_access: false,
+                structured_output: false,
+                implemented: true,
             },
         }
     }
@@ -164,10 +184,9 @@ impl Backend {
                 "the `bundled-llama` feature is not enabled; build with it, or pass in a \
                  backend the host application already links"
             }
-            Backend::Vllm | Backend::SgLang => {
-                "not implemented: this is a served backend reached over HTTP, and the adapter \
-                 has not been written. Selecting it is refused rather than silently served by \
-                 another backend"
+            Backend::Vllm | Backend::SgLang | Backend::TensorRtLlm | Backend::MlxLm => {
+                "served backends are reachable but need an endpoint; build one with \
+                 `served::Endpoint` and drive it with the caller's HTTP client"
             }
         };
         Err(Error::BackendUnavailable { backend: self.as_str(), reason })
@@ -239,15 +258,17 @@ mod tests {
     fn an_unknown_backend_is_refused_and_lists_the_known_ones() {
         // Never silently fall back to a default: a typo must be visible, not
         // quietly served by a different runtime than the caller asked for.
-        let e = Backend::parse("tensorrt").unwrap_err();
+        // "tensorrt" used to be the example here and is now a valid alias --
+        // pick something that is not a backend at all.
+        let e = Backend::parse("gpt4all").unwrap_err();
         let msg = e.to_string();
-        assert!(msg.contains("tensorrt"), "should name the bad input: {msg}");
+        assert!(msg.contains("gpt4all"), "should name the bad input: {msg}");
         assert!(msg.contains("llama.cpp"), "should list what is valid: {msg}");
     }
 
     #[test]
     fn served_backends_do_not_offer_engine_speculation() {
-        for b in [Backend::Vllm, Backend::SgLang] {
+        for b in [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::MlxLm] {
             let c = b.supports();
             assert_eq!(c.integration, Integration::Served);
             assert!(!c.engine_speculation, "{b} must not claim our speculation");
@@ -256,11 +277,20 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_backends_refuse_with_a_reason() {
-        for b in [Backend::Vllm, Backend::SgLang] {
-            assert!(!b.is_available());
-            let msg = b.ensure_available().unwrap_err().to_string();
-            assert!(msg.contains("not implemented"), "{b}: {msg}");
+    fn served_backends_are_available() {
+        for b in [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::MlxLm] {
+            assert!(b.is_available(), "{b} has an adapter");
+        }
+    }
+
+    #[test]
+    fn mlx_reports_that_it_cannot_constrain_output() {
+        // The trap this capability exists for: mlx_lm.server never reads
+        // `response_format`, so a schema-constrained request silently returns
+        // free text. A caller must be able to learn that before sending.
+        assert!(!Backend::MlxLm.supports().structured_output);
+        for b in [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm] {
+            assert!(b.supports().structured_output, "{b} does constrain output");
         }
     }
 
