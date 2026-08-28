@@ -2,12 +2,6 @@
 
 **A backend-agnostic inference-acceleration layer for large language models.**
 
-> **Praecise Engine**, not "Praecise". Praecise is the family; the engine is the
-> acceleration layer, and [praecise-harness](https://github.com/Praecise/praecise-harness)
-> is the agentic framework. They sit at different levels and are used
-> independently — the engine makes a model faster, the harness makes an agent
-> work. Use the full name in anything a reader might land on cold.
-
 Praecise Engine sits between an application and an inference backend and speeds
 up token generation — through speculative decoding, hardware-aware tuning, and a
 uniform serving surface — without the application needing to know which backend
@@ -23,10 +17,11 @@ is underneath. **llama.cpp is the first supported backend.**
         │   uniform interface  │   request shaping, sampling, KV strategy
         └──────────┬───────────┘
                    │  pluggable backends
-     ┌─────────────┼───────────────────────────┐
-     ▼             ▼                             ▼
-  llama.cpp     (planned) vLLM /            (planned) MLX /
-  supported     SGLang / TensorRT-LLM       other runtimes
+     ┌─────────────┴───────────────┐
+     ▼                             ▼
+  llama.cpp                vLLM · SGLang
+  linked (FFI)             TensorRT-LLM · MLX
+                           served (HTTP)
 ```
 
 Praecise Engine is the acceleration layer — not a model server on its own, and
@@ -76,11 +71,13 @@ let caps = backend.supports();
 The distinction that matters is **how** a backend is reached, because it decides
 what acceleration is available at all:
 
-| Backend | Integration | Engine-side speculation | Status |
+| Backend | Integration | Engine-side speculation | Structured output |
 |---|---|---|---|
-| llama.cpp | linked (FFI) | yes — the engine drives the decode loop | **implemented** |
-| vLLM | served (HTTP) | no — the runtime owns its decode loop | not implemented |
-| SGLang | served (HTTP) | no — the runtime owns its decode loop | not implemented |
+| llama.cpp | linked (FFI) | yes — the engine drives the decode loop | yes |
+| vLLM | served (HTTP) | no — the runtime owns its decode loop | `structured_outputs` |
+| SGLang | served (HTTP) | no | `response_format` |
+| TensorRT-LLM | served (HTTP) | no | `response_format` |
+| MLX | served (HTTP) | no | **none** |
 
 A *linked* backend is compiled in, so the engine can propose a draft block,
 verify it, and read per-position logits. A *served* backend is a separate
@@ -93,6 +90,26 @@ their own instead.
 An unknown backend name is an error listing the valid ones, never a quiet
 fallback: a typo that silently ran on a different runtime would invalidate any
 measurement taken against it, with nothing in the output to show it.
+
+`praecise_runtime::served` builds and parses the HTTP requests; the caller
+supplies the client. That keeps the crate free of a networking dependency and
+lets a host reuse the connection pool, timeouts and tracing it already has.
+
+The four served runtimes are **not interchangeable**, and the differences are
+silent rather than loud — an unknown JSON key is dropped, not rejected:
+
+- vLLM takes `top_k`/`min_p`/`repetition_penalty` **flat**; SGLang wants them
+  nested under `extra_body`. Sent the wrong way, generation proceeds with
+  different sampling than was asked for.
+- vLLM's `structured_outputs` accepts **exactly one** of json/regex/choice/
+  grammar — two is a hard validation error, not a preference. `guided_json` was
+  removed in v0.12.0.
+- **MLX never reads `response_format` at all**, so a schema-constrained request
+  returns free text with no error. `Backend::MlxLm.supports().structured_output`
+  is `false` so a caller can find out before sending rather than after.
+- MLX reads `max_completion_tokens` before `max_tokens`; ports differ
+  (8000/30000/8000/8080); SGLang's `/metrics` needs `--enable-metrics`, and MLX
+  has no metrics endpoint at all.
 
 ## What the layer provides
 
