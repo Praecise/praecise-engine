@@ -48,6 +48,14 @@ pub struct GenerationConfig {
     /// and check; `None` disables it (no commitment overhead).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commitment_k: Option<u8>,
+    /// Reasoning budget for model families whose chat template exposes one
+    /// (Qwen 3.8: `xhigh` -- its own default -- plus `medium` and `low`). This is
+    /// a template variable rather than a sampler setting, so it is rendered
+    /// into the prompt, not applied to logits. `None` leaves the template's
+    /// default in place; an unrecognised value is rejected by the template
+    /// itself rather than being silently dropped here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for GenerationConfig {
@@ -66,6 +74,7 @@ impl Default for GenerationConfig {
             stop: Vec::new(),
             draft_n: None,
             commitment_k: None,
+            reasoning_effort: None,
         }
     }
 }

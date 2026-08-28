@@ -452,11 +452,19 @@ impl LlamaModelParams {
     /// (`args: refactor mlock/mmap/directio into load-mode`, #20834); this
     /// getter decodes the combined mode back into the two independent flags
     /// this crate's public API still exposes.
+    ///
+    /// `AUTO` -- the default -- counts as mmap: the loader starts with mmap on
+    /// and only turns it off for a device whose props report no mmap support
+    /// (`llama_model::load_tensors`). Reporting `false` for it would say the
+    /// default does not mmap, which is the opposite of what it does on every
+    /// device that supports it.
     #[must_use]
     pub fn use_mmap(&self) -> bool {
         matches!(
             self.params.load_mode,
-            llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_AUTO
+                | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP
+                | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK
         )
     }
 

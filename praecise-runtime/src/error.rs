@@ -1,4 +1,4 @@
-//! Error types for the Praecise inference runtime.
+//! Error types for the Praecise Engine runtime.
 //!
 //! These are the backend-agnostic inference errors. Platform-specific errors
 //! (modality mismatch, license acceptance, registry/routing) belong to the
@@ -15,6 +15,26 @@ pub enum Error {
     /// Inference request failed.
     #[error("Inference error: {0}")]
     Inference(String),
+
+    /// A backend name did not match any the engine knows.
+    ///
+    /// Deliberately an error rather than a fallback to the default: a
+    /// misspelled backend that silently ran on another runtime would make any
+    /// measurement taken against it meaningless, with nothing in the output to
+    /// show it happened.
+    #[error("Unknown backend {name:?}; known backends: {known}")]
+    BackendUnknown { name: String, known: String },
+
+    /// A known backend that cannot serve a request as built or as written.
+    #[error("Backend {backend} is unavailable: {reason}")]
+    BackendUnavailable { backend: &'static str, reason: &'static str },
+
+    /// A drafter whose licence does not permit shipping it.
+    ///
+    /// Refused at selection rather than left to whoever writes the config: a
+    /// checkpoint path is just a string, and the licence is not visible in it.
+    #[error("Drafter {repo} is licensed {licence}, which does not permit commercial use or redistribution")]
+    DrafterLicence { repo: &'static str, licence: &'static str },
 
     /// Not enough free memory to load the model. Raised by the load-time
     /// admission check before the backend loads the weights, so a load fails
