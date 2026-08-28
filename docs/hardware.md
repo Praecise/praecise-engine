@@ -1,6 +1,6 @@
 # Hardware support
 
-Praecise inherits its device coverage from the active backend and adds
+Praecise Engine inherits its device coverage from the active backend and adds
 architecture-gated tuning on top. This page tracks what is supported and what has
 been verified.
 

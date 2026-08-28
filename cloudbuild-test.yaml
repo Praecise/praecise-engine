@@ -1,0 +1,221 @@
+# Correctness gate for Praecise Engine, run off the serving hosts.
+#
+# Why this exists: builds must never run on spark. spark is the validator and
+# model server, and compiling there has twice thrashed it into unresponsiveness
+# — the second time hard enough to need a physical power cycle. A CUDA build
+# compiles llama.cpp across seven GPU architectures, which is exactly the shape
+# of work that kills a host holding a live model in memory.
+#
+# What this gate does and does not prove
+# --------------------------------------
+# Cloud Build has NO ARM workers (only c3/e2/n2d are permitted worker types;
+# T2A exists in Compute but is not accepted here), so this runs x86-64 and
+# proves *correctness*, not spark's shipping binary:
+#
+#   - PROVES: the backend-agnostic runtime compiles and its tests pass. That
+#     covers n-gram self-speculation, config, stop-sequence handling, result
+#     shaping and toploc — all pure logic, so the answer is the same on any
+#     architecture.
+#   - DOES NOT PROVE: anything about CUDA kernels, the vendored llama.cpp, the
+#     GB10/sm_121 tuning, or an aarch64 artifact. Those need real hardware.
+#
+# Do not read a green run here as "safe to deploy to spark". Read it as "the
+# logic is right"; the hardware path is validated separately, on hardware.
+#
+# Submit (as praeciselabs@gmail.com):
+#   gcloud builds submit --config cloudbuild-test.yaml \
+#     --project tenzro-code-ci-566 .
+#
+# NOTE: `gcloud builds submit` tarballs the WORKING TREE at submit time, not the
+# pushed commit. Confirm the tree holds what you mean to test before submitting;
+# do not chain `git push && gcloud builds submit` in one command, or you can
+# build a pre-edit snapshot and debug errors you already fixed.
+
+steps:
+  # Toolchain. Each step runs in a FRESH container off the same image, so only
+  # /workspace survives between them — hence CARGO_HOME points there and the
+  # rustup components are installed into it too. Anything written to / here
+  # (apt packages, a default rustup home) is gone by the next step.
+  - id: deps
+    name: rust:1-bookworm
+    entrypoint: bash
+    env:
+      - CARGO_HOME=/workspace/.cargo-home
+      - RUSTUP_HOME=/workspace/.rustup-home
+      - CARGO_TERM_COLOR=never
+      - DEBIAN_FRONTEND=noninteractive
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends \
+          cmake clang libclang-dev pkg-config git
+        # rust:1-bookworm ships neither rustfmt nor clippy, and each build step
+        # is a fresh container off the image — only /workspace persists. So seed
+        # a workspace RUSTUP_HOME from the image's own and add the components
+        # there, where later steps will find them.
+        #
+        # The image keeps its toolchain at /usr/local/rustup (it sets RUSTUP_HOME
+        # to that in the Dockerfile). Copy from the literal path: asking rustup
+        # where its home is requires a configured default toolchain, which is
+        # exactly what is unset the moment RUSTUP_HOME points somewhere empty.
+        rm -rf /workspace/.rustup-home
+        cp -a /usr/local/rustup /workspace/.rustup-home
+        rustup component add rustfmt clippy
+        rustc --version && cargo --version && cargo fmt --version
+
+  # Formatting: REPORTED, not enforced.
+  #
+  # `main` at the time this gate was written already had 13 rustfmt diffs in
+  # praecise-runtime (verified against a clean clone), concentrated in
+  # batching.rs and speculative.rs. Making --check fatal would fail every build
+  # until someone reformats those files, and a gate that is red on arrival gets
+  # ignored rather than fixed — and worse, it would push contributors to reformat
+  # files they did not otherwise touch, burying real changes in whitespace churn.
+  #
+  # So print the drift and pass. Promote this to `-D` (drop the `|| true` and the
+  # message) once the tree is clean; that is a deliberate one-off commit, not
+  # something to smuggle in alongside a feature.
+  - id: fmt
+    name: rust:1-bookworm
+    entrypoint: bash
+    env:
+      - CARGO_HOME=/workspace/.cargo-home
+      - RUSTUP_HOME=/workspace/.rustup-home
+      - CARGO_TERM_COLOR=never
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        if cargo fmt --package praecise-runtime --check; then
+          echo "rustfmt: clean"
+        else
+          echo "rustfmt: drift above is PRE-EXISTING on main and is reported, not enforced."
+          echo "         Fix it in its own commit, then make this step fatal."
+        fi
+
+  # The backend-agnostic runtime. `default = []` means no llama.cpp is pulled,
+  # so this needs neither the submodule nor a GPU — it is the part of the engine
+  # that is genuinely architecture-independent.
+  - id: runtime-clippy
+    name: rust:1-bookworm
+    entrypoint: bash
+    env:
+      - CARGO_HOME=/workspace/.cargo-home
+      - RUSTUP_HOME=/workspace/.rustup-home
+      - CARGO_TERM_COLOR=never
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        cargo clippy --package praecise-runtime --all-targets -- -D warnings
+
+  # Tests, with the result line echoed deliberately. A build that only ran
+  # `cargo check` can still report SUCCESS, and "Finished ... RC=0" is not
+  # evidence that a single test executed — so make the count visible in the log.
+  - id: runtime-test
+    name: rust:1-bookworm
+    entrypoint: bash
+    env:
+      - CARGO_HOME=/workspace/.cargo-home
+      - RUSTUP_HOME=/workspace/.rustup-home
+      - CARGO_TERM_COLOR=never
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        cargo test --package praecise-runtime 2>&1 | tee /workspace/test.log
+        # Print the allocator comparison so a green build also shows the margins
+        # it is asserting. A pass with no numbers is a pass nobody can sanity-check.
+        cargo test --package praecise-runtime report -- --nocapture --test-threads=1 2>&1 \
+          | sed -n '/trace *conc/,/^$/p' || true
+        # The experiment that decides whether regime memory earns its place.
+        cargo test --package praecise-runtime autocorrelation -- --nocapture --test-threads=1 2>&1 \
+          | sed -n '/lag-1\|Does regime memory/,/^$/p' || true
+        # The operating envelope: where PRAX wins, loses, and stops paying.
+        cargo test --package praecise-runtime envelope -- --nocapture --test-threads=1 2>&1 \
+          | grep -E 'PRAX vs best|trace  |bursty|uniform|chaotic|drifting|last concurrency|worst fixed|capacity ' || true
+        # Validation against llama.cpp's own synthetic acceptance model, which
+        # upstream ships specifically for benchmarking draft-block policy.
+        cargo test --package praecise-runtime synthetic -- --nocapture --test-threads=1 2>&1 \
+          | grep -E 'spec-synth|curve  |strong|moderate|weak|cliff|tuned on' || true
+        # The comparison that decides whether to enable this at all: PRAX
+        # against ONE fixed block held across a varied workload, which is what a
+        # deployment actually ships.
+        cargo test --package praecise-runtime deployed -- --nocapture --test-threads=1 2>&1 \
+          | grep -E 'fixed +prax|idle|busy|saturated|MEAN|optimal block' || true
+        echo "--- test results ---"
+        grep -E "^test result:" /workspace/test.log
+        # Guard against a silently empty run: the runtime must have real tests.
+        if ! grep -qE "^test result: ok\. [1-9]" /workspace/test.log; then
+          echo "FAIL: no tests actually ran — a green 'cargo check' is not a pass" >&2
+          exit 1
+        fi
+
+  # Compile-check the backend-gated code. Everything above runs with
+  # `default = []`, which never compiles anything behind `bundled-llama` —
+  # including the speculative decode paths, the batching engine, and the n-gram
+  # drafter's decode loop. Those are the parts most likely to break, so leaving
+  # them unbuilt would make a green run misleading.
+  #
+  # `bundled-llama` WITHOUT an accelerator feature builds llama.cpp CPU-only:
+  # slow, but it needs no GPU and no CUDA toolkit, so it runs here. It is a
+  # type-check of the FFI surface, not a test of inference — the CUDA kernels
+  # and anything GB10-specific still need real hardware.
+  #
+  # Not `--all-targets`: the unit tests above already ran, and this step exists
+  # to prove the gated code compiles at all.
+  - id: bundled-check
+    name: rust:1-bookworm
+    entrypoint: bash
+    env:
+      - CARGO_HOME=/workspace/.cargo-home
+      - RUSTUP_HOME=/workspace/.rustup-home
+      - CARGO_TERM_COLOR=never
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # The vendored backend is a submodule, and `gcloud builds submit` uploads
+        # a working-tree snapshot in which a submodule directory is empty. Fetch
+        # the PINNED commit rather than a branch tip: the pin is what the parent
+        # repo actually declares, and a branch tip would silently check something
+        # else. If the pin cannot be fetched, SKIP rather than build against the
+        # wrong tree — a green run against unpinned code is worse than no run.
+        # The source tarball carries no .git (gcloud uploads a working-tree
+        # snapshot), so the submodule pin cannot be read with git ls-tree here.
+        # BACKEND_PIN must be supplied by the submitter, who does have the repo:
+        #   --substitutions=_BACKEND_PIN=$(git ls-tree HEAD llama-cpp-sys-2/llama.cpp | awk '{print $3}')
+        # Without it, skip rather than guess: checking out a branch tip would
+        # validate code the parent repo does not declare, and a green run
+        # against the wrong tree is worse than no run at all.
+        PIN="${_BACKEND_PIN}"
+        if [ ! -f llama-cpp-sys-2/llama.cpp/CMakeLists.txt ]; then
+          if [ -z "$$PIN" ]; then
+            echo "SKIP: no _BACKEND_PIN given and the submodule is not in the snapshot."
+            echo "      Pass --substitutions=_BACKEND_PIN=<sha> to compile-check the"
+            echo "      backend-gated code (ngram_decode, speculative, batching)."
+            exit 0
+          fi
+          echo "fetching pinned backend $$PIN"
+          rm -rf llama-cpp-sys-2/llama.cpp
+          git clone --quiet https://github.com/hilarl/llama.cpp.git llama-cpp-sys-2/llama.cpp
+          if ! git -C llama-cpp-sys-2/llama.cpp checkout --quiet "$$PIN" 2>/dev/null; then
+            echo "SKIP: pinned commit $$PIN is not on the remote."
+            echo "      The backend work exists locally but has not been pushed, so there"
+            echo "      is nothing to check it against. Push the fork, then re-run."
+            exit 0
+          fi
+        fi
+        cargo check --package praecise-runtime --features bundled-llama
+
+substitutions:
+  _BACKEND_PIN: ''
+
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 100
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 3600s
