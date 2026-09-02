@@ -673,6 +673,10 @@ fn admit(
     };
     let seq_id = slot_idx as i32;
 
+    // The engine's thinking mode is the default; a request may override it.
+    // This is what lets one served model answer plainly to API callers and
+    // show its reasoning to a client that asked to see it.
+    let enable_thinking = req.config.enable_thinking.unwrap_or(enable_thinking);
     let prompt = match render_prompt(model, &req.prompt, enable_thinking) {
         Ok(p) => p,
         Err(e) => {

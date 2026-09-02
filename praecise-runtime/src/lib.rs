@@ -21,6 +21,10 @@
 //! [`result::InferenceResult`], [`result::StopReason`], [`error::Error`] —
 //! compiles and is usable with or without a bundled backend.
 
+/// Admission and queueing: a two-term cost model (prefill and decode learned
+/// separately), a queue-wait SLO instead of an end-to-end deadline, and a
+/// scheduler that answers with an ETA before it ever refuses. Backend-agnostic.
+pub mod admission;
 /// Backend selection: which inference runtime executes a request, and what
 /// each one is actually capable of. Backend-agnostic by construction.
 pub mod backend;
@@ -81,6 +85,10 @@ pub mod ngram_decode;
 #[cfg(feature = "bundled-llama")]
 pub mod speculative;
 
+pub use admission::{
+    Class as AdmissionClass, CostModel, Decision as AdmissionDecision, Estimate, Observation,
+    Policy as AdmissionPolicy, Refusal as AdmissionRefusal, Scheduler, Shape,
+};
 pub use config::GenerationConfig;
 pub use backend::{plan_for as plan_speculation_for, Backend, Capabilities, Integration};
 pub use drafters::{preflight as preflight_drafter, DeploymentIntent, Drafter, Licence, Trap};

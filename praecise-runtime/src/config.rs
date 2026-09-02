@@ -56,6 +56,16 @@ pub struct GenerationConfig {
     /// itself rather than being silently dropped here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-request override of the served model's thinking mode, for chat
+    /// templates with an `enable_thinking` toggle (Qwen 3.x, Gemma 4). `None`
+    /// keeps the engine's default — which an operator may have pinned off for
+    /// an API-facing model so plain callers get answers, not deliberation.
+    /// `Some(true)` is how a client that *renders* the reasoning (a coding
+    /// assistant showing its process) asks for it on a request-by-request
+    /// basis; the host returns it separately from the answer so the two never
+    /// mix in the caller's output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
 }
 
 impl Default for GenerationConfig {
@@ -75,6 +85,7 @@ impl Default for GenerationConfig {
             draft_n: None,
             commitment_k: None,
             reasoning_effort: None,
+            enable_thinking: None,
         }
     }
 }
