@@ -85,6 +85,10 @@ pub struct Observation {
     /// Tokens the model produced. Zero means the request did not run and
     /// teaches nothing.
     pub generated_tokens: u64,
+    /// The most tokens the caller allowed (`Shape::max_output_tokens`). With
+    /// `generated_tokens` this teaches how much of a budget requests really
+    /// use, which is what turns a ceiling into an expected length.
+    pub budget_tokens: u64,
     /// Wall time from start of service (not arrival) to completion.
     pub service_ms: u64,
     /// Time to the first generated token, when the host can measure it. This
@@ -109,6 +113,13 @@ pub struct CostModel {
     prefill_us_per_tok: u64,
     /// Solo-equivalent decode cost per token.
     decode_us_per_tok: u64,
+    /// Share of the caller's output budget that requests actually use, in
+    /// percent. `max_output_tokens` is a ceiling and most generations stop
+    /// well short of it; pricing every request at its ceiling makes a
+    /// 2,000-token budget look like a minute of decode when the answer takes
+    /// ten seconds, and refuses the caller behind it for a wait that never
+    /// happens. Learned per model, since chat and agent traffic differ.
+    budget_use_pct: u64,
     samples: u32,
 }
 
@@ -119,6 +130,15 @@ impl CostModel {
     pub const DEFAULT_PREFILL_US_PER_TOK: u64 = 2_000;
     /// Prior for decode: 25 tok/s. Same reasoning.
     pub const DEFAULT_DECODE_US_PER_TOK: u64 = 40_000;
+    /// Prior for budget use: the whole budget. Pessimistic on purpose, for
+    /// the same reason as the rates — an ETA promised short and kept long
+    /// is worse than one promised long. The truth arrives with the first
+    /// completions.
+    pub const DEFAULT_BUDGET_USE_PCT: u64 = 100;
+    /// Never predict less output than this, however small the learned share:
+    /// a run of one-word answers must not make the next real question look
+    /// free.
+    const MIN_EXPECTED_OUTPUT_TOKENS: u64 = 32;
     /// Weight of the newest sample in the moving average. A quarter converges
     /// in a handful of requests without one outlier owning the estimate.
     const NEW_SAMPLE_PCT: u64 = 25;
@@ -127,6 +147,7 @@ impl CostModel {
         Self {
             prefill_us_per_tok: Self::DEFAULT_PREFILL_US_PER_TOK,
             decode_us_per_tok: Self::DEFAULT_DECODE_US_PER_TOK,
+            budget_use_pct: Self::DEFAULT_BUDGET_USE_PCT,
             samples: 0,
         }
     }
@@ -137,6 +158,7 @@ impl CostModel {
         Self {
             prefill_us_per_tok: 1_000_000 / prefill_tok_per_s.max(1),
             decode_us_per_tok: 1_000_000 / decode_tok_per_s.max(1),
+            budget_use_pct: Self::DEFAULT_BUDGET_USE_PCT,
             samples: 1,
         }
     }
@@ -153,6 +175,11 @@ impl CostModel {
     /// Learned prefill throughput, tokens per second.
     pub fn prefill_tok_per_s(&self) -> u64 {
         1_000_000 / self.prefill_us_per_tok.max(1)
+    }
+
+    /// Learned share of the output budget that requests use, in percent.
+    pub fn budget_use_pct(&self) -> u64 {
+        self.budget_use_pct
     }
 
     fn ema(old: u64, new: u64, first: bool) -> u64 {
@@ -198,6 +225,13 @@ impl CostModel {
         if us_per_tok > 0 {
             self.decode_us_per_tok = Self::ema(self.decode_us_per_tok, us_per_tok, first);
         }
+
+        // Budget use: how much of what the caller allowed was actually
+        // generated. A request that hit its ceiling counts as 100%, not more.
+        if o.budget_tokens > 0 {
+            let pct = (o.generated_tokens.saturating_mul(100) / o.budget_tokens).min(100);
+            self.budget_use_pct = Self::ema(self.budget_use_pct, pct, first);
+        }
         self.samples = self.samples.saturating_add(1);
     }
 
@@ -205,15 +239,25 @@ impl CostModel {
     /// other requests.
     ///
     /// `max_output_tokens` is an upper bound, and most generations stop
-    /// early — but admission has nothing better, and over-estimating an ETA
-    /// costs a caller a little extra wait while under-estimating it costs
-    /// them a broken promise.
+    /// early, so the decode term is priced at the share of the budget this
+    /// model's requests have been using — the whole budget until something
+    /// has been observed. Over-estimating an ETA costs a caller a little
+    /// extra wait; under-estimating it costs them a broken promise, so the
+    /// prior is the ceiling and the floor is never zero.
     pub fn predict(&self, shape: Shape, concurrency: u32) -> Estimate {
         let conc = u64::from(concurrency.max(1));
         let prefill_ms = self.prefill_us_per_tok.saturating_mul(shape.prompt_tokens) / 1_000;
         let decode_ms =
-            self.decode_us_per_tok.saturating_mul(shape.max_output_tokens).saturating_mul(conc) / 1_000;
+            self.decode_us_per_tok.saturating_mul(self.expected_output(shape)).saturating_mul(conc) / 1_000;
         Estimate { prefill_ms, decode_ms }
+    }
+
+    /// Tokens this request is expected to generate: its budget scaled by the
+    /// learned use, floored so a run of short answers cannot make the next
+    /// request look free, and never more than the budget itself.
+    fn expected_output(&self, shape: Shape) -> u64 {
+        let scaled = shape.max_output_tokens.saturating_mul(self.budget_use_pct) / 100;
+        scaled.max(Self::MIN_EXPECTED_OUTPUT_TOKENS).min(shape.max_output_tokens)
     }
 }
 
@@ -458,6 +502,7 @@ impl Scheduler {
         self.cost.observe(Observation {
             prompt_tokens: r.shape.prompt_tokens,
             generated_tokens,
+            budget_tokens: r.shape.max_output_tokens,
             service_ms: now_ms.saturating_sub(r.started_ms),
             first_token_ms,
             concurrency,
@@ -490,6 +535,7 @@ mod tests {
         c.observe(Observation {
             prompt_tokens: 20,
             generated_tokens: 1_000,
+            budget_tokens: 1_000,
             service_ms: 32_300,
             first_token_ms: Some(30),
             concurrency: 1,
@@ -505,6 +551,7 @@ mod tests {
             c.observe(Observation {
                 prompt_tokens: 100,
                 generated_tokens: 500,
+                budget_tokens: 500,
                 service_ms: 16_300, // 500 / 31 tok/s + a little prefill
                 first_token_ms: Some(140),
                 concurrency: 1,
@@ -522,6 +569,7 @@ mod tests {
             c.observe(Observation {
                 prompt_tokens: 50,
                 generated_tokens: 500,
+                budget_tokens: 500,
                 service_ms: 32_300,
                 first_token_ms: Some(100),
                 concurrency: 2,
@@ -531,6 +579,51 @@ mod tests {
         // And predicting for c=2 gives the wall time actually seen.
         let e = c.predict(Shape::new(50, 500), 2).total_ms();
         assert!((30_000..35_000).contains(&e), "{e}");
+    }
+
+    #[test]
+    fn the_budget_asked_for_is_not_the_time_it_takes() {
+        // Callers ask for 2,000 tokens and answer in 200. Until that has been
+        // seen, the ceiling is the estimate; once seen, the estimate follows
+        // the answers, and the caller behind a big budget is told a wait it
+        // will actually get.
+        let mut c = spark();
+        let ceiling = c.predict(Shape::new(20, 2_000), 1).total_ms();
+        assert!(ceiling > 60_000, "prior should price the whole budget: {ceiling}");
+        for _ in 0..8 {
+            c.observe(Observation {
+                prompt_tokens: 20,
+                generated_tokens: 200,
+                budget_tokens: 2_000,
+                service_ms: 6_500,
+                first_token_ms: Some(30),
+                concurrency: 1,
+            });
+        }
+        assert!(c.budget_use_pct() < 30, "{}", c.budget_use_pct());
+        let learned = c.predict(Shape::new(20, 2_000), 1).total_ms();
+        assert!((5_000..20_000).contains(&learned), "{learned}");
+    }
+
+    #[test]
+    fn short_answers_never_make_the_next_request_free() {
+        let mut c = spark();
+        for _ in 0..16 {
+            c.observe(Observation {
+                prompt_tokens: 20,
+                generated_tokens: 1,
+                budget_tokens: 4_000,
+                service_ms: 60,
+                first_token_ms: Some(30),
+                concurrency: 1,
+            });
+        }
+        // Floor: at least MIN_EXPECTED_OUTPUT_TOKENS of decode, ~1 s here.
+        let e = c.predict(Shape::new(20, 4_000), 1).decode_ms;
+        assert!(e >= 900, "{e}");
+        // And never more than the budget asks for.
+        let tiny = c.predict(Shape::new(20, 8), 1).decode_ms;
+        assert!(tiny <= 300, "{tiny}");
     }
 
     #[test]
