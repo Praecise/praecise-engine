@@ -340,6 +340,12 @@ impl Scheduler {
         self
     }
 
+    /// Replace the cost model in place — e.g. seeding from an operator's
+    /// declared throughput after the scheduler already exists.
+    pub fn set_cost(&mut self, cost: CostModel) {
+        self.cost = cost;
+    }
+
     pub fn cost(&self) -> &CostModel {
         &self.cost
     }

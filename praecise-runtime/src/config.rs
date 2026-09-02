@@ -66,6 +66,13 @@ pub struct GenerationConfig {
     /// mix in the caller's output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+    /// OpenAI-style structured-output constraint (`{"type":"json_schema",…}`,
+    /// `{"type":"json_object"}`), forwarded verbatim to external engines —
+    /// SGLang enforces it at the sampler through its grammar backend
+    /// (xgrammar), so a constrained response cannot be malformed. The
+    /// in-process llama.cpp path does not enforce it yet and ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
 }
 
 impl Default for GenerationConfig {
@@ -86,6 +93,7 @@ impl Default for GenerationConfig {
             commitment_k: None,
             reasoning_effort: None,
             enable_thinking: None,
+            response_format: None,
         }
     }
 }
