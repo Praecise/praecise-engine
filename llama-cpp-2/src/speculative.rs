@@ -17,7 +17,8 @@ pub struct MtpSpeculativeParams {
     /// Minimum draft probability accepted by llama.cpp's MTP drafter.
     pub p_min: f32,
     /// Speculative draft algorithm: 0 = draft-mtp (default), 1 = draft-dflash
-    /// (block-diffusion DFlash drafter, e.g. Muse-Glimmer's dflash-*.gguf).
+    /// (a DFlash or DFlash2 block-diffusion drafter), 2 = draft-dspark (a DSpark
+    /// drafter: the DFlash layout plus a Markov head).
     pub spec_type: i32,
 }
 
@@ -206,6 +207,174 @@ impl Drop for MtpSpeculative<'_> {
     fn drop(&mut self) {
         unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_free(self.raw.as_ptr());
+        }
+    }
+}
+
+/// Speculative decoding across the sequences of one shared target context.
+///
+/// This is how llama-server runs speculation for parallel slots: every
+/// generating sequence [`request`](Self::request)s a draft, one
+/// [`draft`](Self::draft) call fills them all, the caller verifies every block
+/// in a single target decode, feeds that batch to [`process`](Self::process)
+/// and reports each sequence's accepted count with [`accept`](Self::accept).
+///
+/// Unlike [`MtpSpeculative`] it does not own the contexts, because the batch
+/// engine keeps decoding its target context around it.
+pub struct SpeculativeBatch {
+    raw: NonNull<llama_cpp_sys_2::llama_rs_spec_batch>,
+    n_max: usize,
+}
+
+impl SpeculativeBatch {
+    /// Create the helper over a target context and a draft context built with
+    /// `n_seq_max == n_seq`.
+    ///
+    /// # Safety
+    ///
+    /// Both contexts must outlive the returned value, and neither may be
+    /// dropped or replaced while it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parameters are invalid or llama.cpp cannot
+    /// initialize speculation for these contexts.
+    pub unsafe fn new(
+        target_context: &LlamaContext<'_>,
+        draft_context: &LlamaContext<'_>,
+        params: MtpSpeculativeParams,
+        n_seq: u32,
+    ) -> Result<Self, MtpSpeculativeError> {
+        if params.n_max <= 0 || params.n_min < 0 || params.n_min > params.n_max || n_seq == 0 {
+            return Err(MtpSpeculativeError::InvalidParams);
+        }
+        let n_max = usize::try_from(params.n_max).map_err(|_| MtpSpeculativeError::InvalidParams)?;
+        let raw = unsafe {
+            llama_cpp_sys_2::llama_rs_spec_batch_init(
+                target_context.context.as_ptr(),
+                draft_context.context.as_ptr(),
+                params.n_max,
+                params.n_min,
+                params.p_min,
+                params.spec_type,
+                n_seq,
+            )
+        };
+        let raw = NonNull::new(raw).ok_or(MtpSpeculativeError::InitFailed)?;
+        Ok(Self { raw, n_max })
+    }
+
+    /// Start a sequence's generation from the tokens its KV now holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if llama.cpp rejects the call.
+    pub fn begin(&mut self, seq_id: i32, prompt_tokens: &[LlamaToken]) -> Result<(), MtpSpeculativeError> {
+        let prompt = tokens_to_raw(prompt_tokens);
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_spec_batch_begin(self.raw.as_ptr(), seq_id, prompt.as_ptr(), prompt.len())
+        };
+        status_to_result(status)
+    }
+
+    /// Ask for up to `n_max` draft tokens after `id_last` for one sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if llama.cpp rejects the call.
+    pub fn request(
+        &mut self,
+        seq_id: i32,
+        n_max: i32,
+        n_past: i32,
+        id_last: LlamaToken,
+        prompt_tokens: &[LlamaToken],
+    ) -> Result<(), MtpSpeculativeError> {
+        let prompt = tokens_to_raw(prompt_tokens);
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_spec_batch_request(
+                self.raw.as_ptr(),
+                seq_id,
+                n_max,
+                n_past,
+                id_last.0,
+                prompt.as_ptr(),
+                prompt.len(),
+            )
+        };
+        status_to_result(status)
+    }
+
+    /// Draft for every sequence that requested one since the last call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if llama.cpp fails while drafting.
+    pub fn draft(&mut self) -> Result<(), MtpSpeculativeError> {
+        status_to_result(unsafe { llama_cpp_sys_2::llama_rs_spec_batch_draft(self.raw.as_ptr()) })
+    }
+
+    /// The block drafted for `seq_id` by the last [`draft`](Self::draft) call;
+    /// empty when it requested nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence id is out of range.
+    pub fn result(&self, seq_id: i32) -> Result<Vec<LlamaToken>, MtpSpeculativeError> {
+        let mut raw_out = vec![0; self.n_max];
+        let mut out_len = 0_usize;
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_spec_batch_result(
+                self.raw.as_ptr(),
+                seq_id,
+                raw_out.as_mut_ptr(),
+                raw_out.len(),
+                &raw mut out_len,
+            )
+        };
+        if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
+            return Err(MtpSpeculativeError::DraftOverflow);
+        }
+        status_to_result(status)?;
+        raw_out.truncate(out_len);
+        Ok(raw_out.into_iter().map(LlamaToken).collect())
+    }
+
+    /// Feed a batch the target context just decoded to the drafter, so its
+    /// state follows the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if llama.cpp fails to process the batch.
+    pub fn process(&mut self, batch: &LlamaBatch<'_>) -> Result<(), MtpSpeculativeError> {
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_spec_batch_process(self.raw.as_ptr(), std::ptr::from_ref(&batch.llama_batch))
+        };
+        status_to_result(status)
+    }
+
+    /// Report how many of a sequence's drafted tokens the target accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if llama.cpp rejects the call.
+    pub fn accept(&mut self, seq_id: i32, n_accepted: u16) -> Result<(), MtpSpeculativeError> {
+        status_to_result(unsafe {
+            llama_cpp_sys_2::llama_rs_spec_batch_accept(self.raw.as_ptr(), seq_id, n_accepted)
+        })
+    }
+}
+
+impl std::fmt::Debug for SpeculativeBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpeculativeBatch").field("n_max", &self.n_max).finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpeculativeBatch {
+    fn drop(&mut self) {
+        unsafe {
+            llama_cpp_sys_2::llama_rs_spec_batch_free(self.raw.as_ptr());
         }
     }
 }

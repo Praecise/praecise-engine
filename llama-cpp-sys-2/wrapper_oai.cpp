@@ -323,7 +323,7 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
         }
 
         if (tools_json && std::strlen(tools_json) > 0) {
-            inputs.tools = common_chat_tools_parse_oaicompat(json::parse(tools_json));
+            inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(tools_json));
         }
         if (json_schema && std::strlen(json_schema) > 0) {
             inputs.json_schema = json_schema;
@@ -414,9 +414,9 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
         inputs.add_eos = params->add_eos;
         inputs.force_pure_content = params->force_pure_content;
 
-        inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(params->messages));
+        inputs.messages = common_chat_msgs_parse_oaicompat(common_json::parse(params->messages));
         if (params->tools && std::strlen(params->tools) > 0) {
-            inputs.tools = common_chat_tools_parse_oaicompat(json::parse(params->tools));
+            inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(params->tools));
         }
         if (params->tool_choice && std::strlen(params->tool_choice) > 0) {
             inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(params->tool_choice);
@@ -720,7 +720,7 @@ extern "C" llama_rs_status llama_rs_chat_tools_parse_oaicompat(
     *out_count = 0;
 
     try {
-        auto tools = common_chat_tools_parse_oaicompat(json::parse(tools_json));
+        auto tools = common_chat_tools_parse_oaicompat(common_json::parse(tools_json));
         if (tools.empty()) {
             return LLAMA_RS_STATUS_OK;
         }
@@ -810,7 +810,7 @@ extern "C" llama_rs_status llama_rs_chat_msgs_parse_oaicompat(
     *out_count = 0;
 
     try {
-        auto msgs = common_chat_msgs_parse_oaicompat(json::parse(messages_json));
+        auto msgs = common_chat_msgs_parse_oaicompat(common_json::parse(messages_json));
         if (msgs.empty()) {
             return LLAMA_RS_STATUS_OK;
         }

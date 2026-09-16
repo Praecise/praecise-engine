@@ -1,5 +1,6 @@
 #include "wrapper_common.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -27,7 +28,8 @@ extern "C" llama_rs_status llama_rs_json_schema_to_grammar(
 
     *out_grammar = nullptr;
     try {
-        const auto schema = nlohmann::ordered_json::parse(schema_json);
+        // common's API takes its own JSON type since upstream moved off nlohmann.
+        const auto schema = common_json::parse(schema_json);
         const auto grammar = json_schema_to_grammar(schema, force_gbnf);
         *out_grammar = llama_rs_dup_string(grammar);
         return *out_grammar ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
@@ -191,11 +193,23 @@ extern "C" int llama_rs_fit_params(
         tensor_buft_overrides,
         margins,
         n_ctx_min,
+        // No second model to fit beside this one.
+        nullptr,
         log_level));
 }
 
 extern "C" void llama_rs_memory_breakdown_print(const struct llama_context * ctx) {
     common_memory_breakdown_print(ctx);
+}
+
+// 0 = the target model's own MTP head, 1 = a DFlash or DFlash2 drafter (the
+// GGUF says which), 2 = a DSpark drafter (DFlash layout plus a Markov head).
+static enum common_speculative_type llama_rs_spec_type(int32_t spec_type) {
+    switch (spec_type) {
+        case 1:  return COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        case 2:  return COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        default: return COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+    }
 }
 
 struct llama_rs_mtp_speculative {
@@ -248,9 +262,7 @@ extern "C" struct llama_rs_mtp_speculative * llama_rs_mtp_speculative_init(
     try {
         auto wrapper = std::make_unique<llama_rs_mtp_speculative>();
         // 1 = DFlash block-diffusion drafter; anything else = MTP head (default).
-        wrapper->params.types = { spec_type == 1
-            ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
-            : COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        wrapper->params.types = { llama_rs_spec_type(spec_type) };
         wrapper->params.draft.ctx_tgt = ctx_tgt;
         wrapper->params.draft.ctx_dft = ctx_dft;
         wrapper->params.draft.n_max = n_max;
@@ -383,6 +395,190 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_accept(
         common_speculative_accept(spec->spec, LLAMA_RS_MTP_SEQ_ID, n_accepted);
         spec->last_draft_len = 0;
         spec->draft_pending = false;
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+struct llama_rs_spec_batch {
+    common_params_speculative params;
+    common_speculative * spec = nullptr;
+    uint32_t n_seq = 0;
+    // Owned per sequence: the draft params point into these for the duration of
+    // a draft call, so they are sized once at init and never reallocated.
+    std::vector<std::vector<llama_token>> prompt;
+    std::vector<std::vector<llama_token>> draft;
+    std::vector<uint8_t> requested;
+};
+
+static bool llama_rs_spec_batch_seq_ok(const struct llama_rs_spec_batch * spec, llama_seq_id seq_id) {
+    return spec && spec->spec && seq_id >= 0 && (uint32_t) seq_id < spec->n_seq;
+}
+
+extern "C" struct llama_rs_spec_batch * llama_rs_spec_batch_init(
+    struct llama_context * ctx_tgt,
+    struct llama_context * ctx_dft,
+    int32_t n_max,
+    int32_t n_min,
+    float p_min,
+    int32_t spec_type,
+    uint32_t n_seq) {
+    if (!ctx_tgt || !ctx_dft || n_max <= 0 || n_min < 0 || n_min > n_max || n_seq == 0) {
+        return nullptr;
+    }
+
+    try {
+        auto wrapper = std::make_unique<llama_rs_spec_batch>();
+        wrapper->params.types = { llama_rs_spec_type(spec_type) };
+        wrapper->params.draft.ctx_tgt = ctx_tgt;
+        wrapper->params.draft.ctx_dft = ctx_dft;
+        wrapper->params.draft.n_max = n_max;
+        wrapper->params.draft.n_min = n_min;
+        wrapper->params.draft.p_min = p_min;
+        wrapper->n_seq = n_seq;
+        wrapper->prompt.resize(n_seq);
+        wrapper->draft.resize(n_seq);
+        wrapper->requested.assign(n_seq, 0);
+
+        wrapper->spec = common_speculative_init(wrapper->params, n_seq);
+        if (!wrapper->spec) {
+            return nullptr;
+        }
+        return wrapper.release();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" void llama_rs_spec_batch_free(struct llama_rs_spec_batch * spec) {
+    if (!spec) {
+        return;
+    }
+    if (spec->spec) {
+        common_speculative_free(spec->spec);
+        spec->spec = nullptr;
+    }
+    delete spec;
+}
+
+extern "C" llama_rs_status llama_rs_spec_batch_begin(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
+    const llama_token * prompt_tokens,
+    size_t prompt_tokens_count) {
+    if (!llama_rs_spec_batch_seq_ok(spec, seq_id) || (!prompt_tokens && prompt_tokens_count > 0)) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        llama_rs_assign_tokens(spec->prompt[seq_id], prompt_tokens, prompt_tokens_count);
+        spec->draft[seq_id].clear();
+        spec->requested[seq_id] = 0;
+        common_speculative_begin(spec->spec, seq_id, spec->prompt[seq_id]);
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" llama_rs_status llama_rs_spec_batch_request(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
+    int32_t n_max,
+    llama_pos n_past,
+    llama_token id_last,
+    const llama_token * prompt_tokens,
+    size_t prompt_tokens_count) {
+    if (!llama_rs_spec_batch_seq_ok(spec, seq_id) || n_max <= 0 || n_past < 0 ||
+        (!prompt_tokens && prompt_tokens_count > 0)) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        llama_rs_assign_tokens(spec->prompt[seq_id], prompt_tokens, prompt_tokens_count);
+        spec->draft[seq_id].clear();
+        spec->requested[seq_id] = 1;
+        auto & params = common_speculative_get_draft_params(spec->spec, seq_id);
+        params = {
+            true,
+            std::min(n_max, spec->params.draft.n_max),
+            n_past,
+            id_last,
+            &spec->prompt[seq_id],
+            &spec->draft[seq_id],
+        };
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" llama_rs_status llama_rs_spec_batch_draft(struct llama_rs_spec_batch * spec) {
+    if (!spec || !spec->spec) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        common_speculative_draft(spec->spec);
+        // A sequence that asked for nothing this round has nothing to verify,
+        // whatever an earlier round left in its buffer.
+        for (uint32_t s = 0; s < spec->n_seq; ++s) {
+            if (!spec->requested[s]) {
+                spec->draft[s].clear();
+            }
+            spec->requested[s] = 0;
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" llama_rs_status llama_rs_spec_batch_result(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
+    llama_token * out_tokens,
+    size_t out_tokens_capacity,
+    size_t * out_tokens_count) {
+    if (!llama_rs_spec_batch_seq_ok(spec, seq_id) || !out_tokens_count) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    const auto & d = spec->draft[seq_id];
+    *out_tokens_count = d.size();
+    if (d.size() > out_tokens_capacity) {
+        return LLAMA_RS_STATUS_ALLOCATION_FAILED;
+    }
+    if (!d.empty()) {
+        if (!out_tokens) {
+            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+        }
+        std::memcpy(out_tokens, d.data(), d.size() * sizeof(llama_token));
+    }
+    return LLAMA_RS_STATUS_OK;
+}
+
+extern "C" llama_rs_status llama_rs_spec_batch_process(
+    struct llama_rs_spec_batch * spec,
+    const struct llama_batch * batch) {
+    if (!spec || !spec->spec || !batch || batch->embd || batch->n_tokens <= 0) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        return common_speculative_process(spec->spec, *batch)
+            ? LLAMA_RS_STATUS_OK
+            : LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" llama_rs_status llama_rs_spec_batch_accept(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
+    uint16_t n_accepted) {
+    if (!llama_rs_spec_batch_seq_ok(spec, seq_id)) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        common_speculative_accept(spec->spec, seq_id, n_accepted);
         return LLAMA_RS_STATUS_OK;
     } catch (...) {
         return LLAMA_RS_STATUS_EXCEPTION;

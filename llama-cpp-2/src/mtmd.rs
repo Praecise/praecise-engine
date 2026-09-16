@@ -487,6 +487,8 @@ impl MtmdBitmap {
                 ctx.context.as_ptr(),
                 path_cstr.as_ptr(),
                 placeholder,
+                // Upstream default options; video decoding is not built here.
+                llama_cpp_sys_2::mtmd_helper_init_opt_default(),
             )
         };
 
@@ -532,6 +534,8 @@ impl MtmdBitmap {
                 data.as_ptr(),
                 data.len(),
                 placeholder,
+                // Upstream default options; video decoding is not built here.
+                llama_cpp_sys_2::mtmd_helper_init_opt_default(),
             )
         };
 

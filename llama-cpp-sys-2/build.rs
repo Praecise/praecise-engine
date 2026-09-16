@@ -449,11 +449,11 @@ fn find_ibverbs() -> Option<String> {
 ///   in `Dockerfile.cuda` is calibrated; another host compiler gives the same
 ///   silent CPU-only result.
 ///
-/// This lives in this crate rather than in the consuming application, which is
-/// where it would more naturally sit, for one reason: cargo runs a dependency's
-/// build script before its dependent's. A check in the consumer's build.rs would
-/// fire only after llama.cpp had already been configured and compiled, which is
-/// the cost it exists to avoid. Here it fires first.
+/// This lives in this crate rather than in the host application, where it would
+/// more naturally sit, for one reason: cargo runs a dependency's build script
+/// before its dependent's. A check in the host's own build script would fire
+/// only after llama.cpp had already been configured and compiled, which is the
+/// cost it exists to avoid. Here it fires first.
 ///
 /// A hard failure rather than a warning, because `cargo:warning` from a build
 /// script is easy to lose in a build that emits hundreds of lines, and the
@@ -1346,6 +1346,34 @@ fn main() {
         }
 
         mtmd_build.compile("mtmd");
+
+        // Upstream mtmd links vendor::hash, which names bitmaps by SHA-256. It is
+        // its own library there (vendor/hash/CMakeLists.txt), built the same way
+        // here: xxhash and sha256 as C, sha1 as C++ (it sits in a namespace to
+        // avoid clashing with BoringSSL), and the hash.cpp front end.
+        let hash_dir = llama_src.join("vendor/hash");
+        if hash_dir.join("hash.cpp").exists() {
+            let mut hash_c = cc::Build::new();
+            hash_c
+                .include(&hash_dir)
+                .file(hash_dir.join("xxhash/xxhash.c"))
+                .file(hash_dir.join("sha256/sha256.c"))
+                .warnings(false)
+                .pic(true);
+            hash_c.compile("vendor_hash_c");
+
+            let mut hash_cpp = cc::Build::new();
+            hash_cpp
+                .cpp(true)
+                .include(&hash_dir)
+                .include(llama_src.join("vendor"))
+                .file(hash_dir.join("hash.cpp"))
+                .file(hash_dir.join("sha1/sha1.c"))
+                .flag_if_supported("-std=c++17")
+                .warnings(false)
+                .pic(true);
+            hash_cpp.compile("vendor_hash_cpp");
+        }
     }
 
     // Search paths

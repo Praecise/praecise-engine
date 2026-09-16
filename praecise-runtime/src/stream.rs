@@ -17,10 +17,76 @@ pub fn matched_stop_len(text: &str, stop: &[String]) -> Option<usize> {
         .max()
 }
 
-/// Reasoning-span markers. Ordinary text, not special tokens, so they arrive
-/// split across pieces like anything else.
-const THINK_OPEN: &str = "<think>";
-const THINK_CLOSE: &str = "</think>";
+/// Where a generation's reasoning span is, as its chat template frames it.
+///
+/// Two things differ by template, and a splitter that guesses either one leaks
+/// reasoning into the answer:
+///
+/// * **The markers.** Qwen-family templates wrap reasoning in `<think>` …
+///   `</think>`. Gemma 4 uses a thought channel, `<|channel>thought` …
+///   `<channel|>`, and never emits `<think>` at all.
+/// * **Whether the prompt already opened the span.** Qwen3.8's generation
+///   prompt ends `<|im_start|>assistant\n<think>\n` whenever thinking is on,
+///   so the model's output begins mid-reasoning and only the close marker ever
+///   appears. Gemma 4 opens its channel in the prompt only for the turn after a
+///   tool response. A splitter that starts outside the span streams the
+///   reasoning as answer text, and by the time the close marker arrives those
+///   bytes have already been sent. That was measured on qwen3.8-27b: correct
+///   when not streaming (nothing had been released, so the text was
+///   reclaimable), and the whole reasoning in `content` when streaming.
+///
+/// Both are read off the rendered prompt, the one place that knows, which is
+/// what the reference parsers do: vLLM's and SGLang's `qwen3` parsers start in
+/// reasoning when thinking is enabled, and llama.cpp re-parses the output
+/// prefixed with the generation prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReasoningFrame {
+    /// Marker that opens a reasoning span.
+    pub open: &'static str,
+    /// Marker that closes it.
+    pub close: &'static str,
+    /// Whether the prompt ended inside an open span.
+    pub open_at_start: bool,
+}
+
+impl ReasoningFrame {
+    /// `<think>` … `</think>`, not already open.
+    pub const THINK: Self = Self {
+        open: "<think>",
+        close: "</think>",
+        open_at_start: false,
+    };
+
+    /// Gemma 4's thought channel, not already open.
+    pub const GEMMA4_THOUGHT: Self = Self {
+        open: "<|channel>thought",
+        close: "<channel|>",
+        open_at_start: false,
+    };
+
+    /// The frame a rendered prompt implies.
+    pub fn for_prompt(prompt: &str) -> Self {
+        // `<|turn>` is Gemma 4's turn marker; no other supported template has it.
+        let base = if prompt.contains("<|turn>") {
+            Self::GEMMA4_THOUGHT
+        } else {
+            Self::THINK
+        };
+        // Trailing whitespace is the template's own newline after the marker.
+        // A prompt that opened and closed an empty span (thinking switched off)
+        // ends with the close marker, so it is correctly not open.
+        Self {
+            open_at_start: prompt.trim_end().ends_with(base.open),
+            ..base
+        }
+    }
+}
+
+impl Default for ReasoningFrame {
+    fn default() -> Self {
+        Self::THINK
+    }
+}
 
 /// Length of the longest suffix of `s` that is a strict prefix of `marker`.
 ///
@@ -58,6 +124,7 @@ pub struct StopStream {
     stop: Vec<String>,
     hit: bool,
     in_think: bool,
+    frame: ReasoningFrame,
 }
 
 impl StopStream {
@@ -78,7 +145,26 @@ impl StopStream {
             stop,
             hit: false,
             in_think: false,
+            frame: ReasoningFrame::THINK,
         }
+    }
+
+    /// Split reasoning with this template's markers, starting inside a span
+    /// when the prompt left one open.
+    /// Whether the text arriving now is reasoning.
+    pub fn in_reasoning(&self) -> bool {
+        self.in_think
+    }
+
+    /// The reasoning markers this stream splits on.
+    pub fn frame(&self) -> ReasoningFrame {
+        self.frame
+    }
+
+    pub fn framed(mut self, frame: ReasoningFrame) -> Self {
+        self.in_think = frame.open_at_start;
+        self.frame = frame;
+        self
     }
 
     /// Absorb one decoded piece. Returns `false` when the stream receiver has
@@ -99,22 +185,22 @@ impl StopStream {
     fn classify(&mut self) {
         loop {
             if self.in_think {
-                if let Some(i) = self.pending.find(THINK_CLOSE) {
+                if let Some(i) = self.pending.find(self.frame.close) {
                     self.reasoning.push_str(&self.pending[..i]);
-                    self.pending.drain(..i + THINK_CLOSE.len());
+                    self.pending.drain(..i + self.frame.close.len());
                     self.in_think = false;
                     continue;
                 }
-                let keep = dangling_prefix(&self.pending, THINK_CLOSE);
+                let keep = dangling_prefix(&self.pending, self.frame.close);
                 let take = self.pending.len() - keep;
                 self.reasoning.push_str(&self.pending[..take]);
                 self.pending.drain(..take);
                 return;
             }
 
-            if let Some(i) = self.pending.find(THINK_OPEN) {
+            if let Some(i) = self.pending.find(self.frame.open) {
                 self.text.push_str(&self.pending[..i]);
-                self.pending.drain(..i + THINK_OPEN.len());
+                self.pending.drain(..i + self.frame.open.len());
                 self.in_think = true;
                 continue;
             }
@@ -123,9 +209,9 @@ impl StopStream {
             // prompt, so the model's output starts mid-thought. Everything so
             // far was reasoning — reclaimable only while nothing has been
             // streamed yet, since bytes already sent cannot be recalled.
-            if let Some(i) = self.pending.find(THINK_CLOSE) {
+            if let Some(i) = self.pending.find(self.frame.close) {
                 self.text.push_str(&self.pending[..i]);
-                self.pending.drain(..i + THINK_CLOSE.len());
+                self.pending.drain(..i + self.frame.close.len());
                 if self.emitted == 0 {
                     self.reasoning.push_str(&self.text);
                     self.text.clear();
@@ -133,8 +219,8 @@ impl StopStream {
                 continue;
             }
 
-            let keep = dangling_prefix(&self.pending, THINK_OPEN)
-                .max(dangling_prefix(&self.pending, THINK_CLOSE));
+            let keep = dangling_prefix(&self.pending, self.frame.open)
+                .max(dangling_prefix(&self.pending, self.frame.close));
             let take = self.pending.len() - keep;
             self.text.push_str(&self.pending[..take]);
             self.pending.drain(..take);
@@ -174,12 +260,104 @@ impl StopStream {
         let leftover = std::mem::take(&mut self.pending);
         if self.in_think {
             self.reasoning.push_str(&leftover);
-        } else if !THINK_OPEN.starts_with(&leftover) && !THINK_CLOSE.starts_with(&leftover) {
+        } else if !self.frame.open.starts_with(&leftover) && !self.frame.close.starts_with(&leftover) {
             self.text.push_str(&leftover);
         }
         self.hit = true;
         self.release(tx);
         let reasoning = self.reasoning.trim().to_string();
         (self.text, (!reasoning.is_empty()).then_some(reasoning))
+    }
+}
+
+#[cfg(test)]
+mod reasoning_frame_tests {
+    use super::{ReasoningFrame, StopStream};
+
+    fn stream_all(frame: ReasoningFrame, pieces: &[&str]) -> (String, String, Option<String>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1024);
+        let mut s = StopStream::new(vec![]).framed(frame);
+        for p in pieces {
+            assert!(s.push(p, Some(&tx)));
+        }
+        let (text, reasoning) = s.finish_parts(Some(&tx));
+        drop(tx);
+        let mut streamed = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            streamed.push_str(&chunk);
+        }
+        (streamed, text, reasoning)
+    }
+
+    #[test]
+    fn qwen_prompt_that_opened_think_streams_no_reasoning() {
+        let prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        let frame = ReasoningFrame::for_prompt(prompt);
+        assert!(frame.open_at_start);
+        let (streamed, text, reasoning) = stream_all(
+            frame,
+            &["The user", " wants a greeting.", "\n</thi", "nk>\n\n", "Hello", "!"],
+        );
+        assert_eq!(streamed.trim(), "Hello!", "reasoning must never reach the stream");
+        assert_eq!(text.trim(), "Hello!");
+        assert_eq!(reasoning.as_deref(), Some("The user wants a greeting."));
+    }
+
+    #[test]
+    fn qwen_prompt_with_thinking_off_is_not_open() {
+        let prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let frame = ReasoningFrame::for_prompt(prompt);
+        assert!(!frame.open_at_start);
+        let (streamed, _, reasoning) = stream_all(frame, &["Hello", "!"]);
+        assert_eq!(streamed, "Hello!");
+        assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn unclosed_span_at_the_token_limit_is_all_reasoning() {
+        let frame = ReasoningFrame::for_prompt("<|im_start|>assistant\n<think>\n");
+        let (streamed, text, reasoning) = stream_all(frame, &["still ", "thinking"]);
+        assert_eq!(streamed, "");
+        assert_eq!(text, "");
+        assert_eq!(reasoning.as_deref(), Some("still thinking"));
+    }
+
+    #[test]
+    fn gemma4_thought_channel_is_split() {
+        let prompt = "<|turn>user\nhi<turn|>\n<|turn>model\n";
+        let frame = ReasoningFrame::for_prompt(prompt);
+        assert_eq!(frame.open, "<|channel>thought");
+        assert!(!frame.open_at_start);
+        let (streamed, text, reasoning) = stream_all(
+            frame,
+            &["<|channel>", "thought\nweigh it", "<channel|>", "Answer."],
+        );
+        assert_eq!(streamed, "Answer.");
+        assert_eq!(text, "Answer.");
+        assert_eq!(reasoning.as_deref(), Some("weigh it"));
+    }
+
+    #[test]
+    fn gemma4_prompt_after_a_tool_response_starts_in_the_channel() {
+        let prompt = "<|turn>model\n<|tool_call>call:f{}<tool_call|><|tool_response>response:f{}<tool_response|><|channel>thought\n";
+        let frame = ReasoningFrame::for_prompt(prompt);
+        assert!(frame.open_at_start);
+        let (streamed, _, reasoning) = stream_all(frame, &["the tool said yes", "<channel|>", "Yes."]);
+        assert_eq!(streamed, "Yes.");
+        assert_eq!(reasoning.as_deref(), Some("the tool said yes"));
+    }
+
+    #[test]
+    fn gemma4_prompt_with_thinking_off_closes_the_empty_channel() {
+        let frame = ReasoningFrame::for_prompt("<|turn>model\n<|channel>thought\n<channel|>");
+        assert!(!frame.open_at_start);
+    }
+
+    #[test]
+    fn a_template_with_no_reasoning_passes_text_through() {
+        let frame = ReasoningFrame::for_prompt("<|start|>assistant");
+        let (streamed, _, reasoning) = stream_all(frame, &["plain ", "answer"]);
+        assert_eq!(streamed, "plain answer");
+        assert_eq!(reasoning, None);
     }
 }
