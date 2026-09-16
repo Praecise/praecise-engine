@@ -8,6 +8,7 @@
 struct llama_model;
 struct llama_sampler;
 struct llama_rs_mtp_speculative;
+struct llama_rs_spec_batch;
 struct llama_vocab;
 
 struct llama_rs_grammar_trigger {
@@ -116,6 +117,55 @@ llama_rs_status llama_rs_mtp_speculative_draft(
 
 llama_rs_status llama_rs_mtp_speculative_accept(
     struct llama_rs_mtp_speculative * spec,
+    uint16_t n_accepted);
+
+// Speculative decoding across many sequences of one target context, as
+// llama-server runs it for parallel slots: each sequence requests a draft, one
+// draft call fills them all, the caller verifies every block in a single target
+// decode and reports how many drafts each sequence accepted. The draft context
+// must be created with n_seq_max == n_seq.
+struct llama_rs_spec_batch * llama_rs_spec_batch_init(
+    struct llama_context * ctx_tgt,
+    struct llama_context * ctx_dft,
+    int32_t n_max,
+    int32_t n_min,
+    float p_min,
+    int32_t spec_type,
+    uint32_t n_seq);
+
+void llama_rs_spec_batch_free(struct llama_rs_spec_batch * spec);
+
+llama_rs_status llama_rs_spec_batch_begin(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
+    const llama_token * prompt_tokens,
+    size_t prompt_tokens_count);
+
+llama_rs_status llama_rs_spec_batch_request(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
+    int32_t n_max,
+    llama_pos n_past,
+    llama_token id_last,
+    const llama_token * prompt_tokens,
+    size_t prompt_tokens_count);
+
+llama_rs_status llama_rs_spec_batch_draft(struct llama_rs_spec_batch * spec);
+
+llama_rs_status llama_rs_spec_batch_result(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
+    llama_token * out_tokens,
+    size_t out_tokens_capacity,
+    size_t * out_tokens_count);
+
+llama_rs_status llama_rs_spec_batch_process(
+    struct llama_rs_spec_batch * spec,
+    const struct llama_batch * batch);
+
+llama_rs_status llama_rs_spec_batch_accept(
+    struct llama_rs_spec_batch * spec,
+    llama_seq_id seq_id,
     uint16_t n_accepted);
 
 void llama_rs_string_free(char * ptr);

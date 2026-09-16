@@ -33,3 +33,5 @@ cuda-no-vmm = ["bundled-llama", "llama-cpp-2/cuda-no-vmm"]
 rocm = ["bundled-llama", "llama-cpp-2/rocm"]
 metal = ["bundled-llama", "llama-cpp-2/metal"]
 vulkan = ["bundled-llama", "llama-cpp-2/vulkan"]
+# Image and audio input in the batching engine, through llama.cpp mtmd.
+mtmd = ["bundled-llama", "llama-cpp-2/mtmd"]

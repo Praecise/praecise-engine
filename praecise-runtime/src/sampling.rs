@@ -15,6 +15,9 @@ use crate::config::GenerationConfig;
 /// stages are omitted entirely when unset rather than passed a neutral value,
 /// so a request that does not ask for them samples exactly as it did before
 /// those knobs existed.
+/// Candidates kept before the sorting stages when a request names no `top_k`.
+const DEFAULT_TOP_K: i32 = 40;
+
 pub fn build_sampler_chain(config: &GenerationConfig, n_vocab: i32) -> LlamaSampler {
     build_sampler_chain_with_grammar(config, None, n_vocab)
 }
@@ -42,9 +45,13 @@ pub fn build_sampler_chain_with_grammar(
         config.frequency_penalty,
         config.presence_penalty,
     ));
-    if let Some(k) = config.top_k {
-        stages.push(LlamaSampler::top_k(k as i32));
-    }
+    // Truncate before anything that sorts. `top_p` over a whole vocabulary is a
+    // full sort per token per sequence, on the thread that schedules the GPU:
+    // on qwen3.8-27b (248k tokens) with sixteen sequences that thread spent a
+    // fifth of its time sampling while the GPU waited. llama-server truncates
+    // to 40 by default for the same reason, and the Qwen3.8 card recommends 20.
+    // A caller that names top_k gets exactly that.
+    stages.push(LlamaSampler::top_k(config.top_k.map_or(DEFAULT_TOP_K, |k| k as i32)));
     stages.push(LlamaSampler::temp(config.temperature as f32));
     stages.push(LlamaSampler::top_p(config.top_p as f32, 1));
     if let Some(p) = config.min_p {

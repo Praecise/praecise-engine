@@ -49,13 +49,36 @@ pub struct GenerationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commitment_k: Option<u8>,
     /// Reasoning budget for model families whose chat template exposes one
-    /// (Qwen 3.8: `xhigh` -- its own default -- plus `medium` and `low`). This is
+    /// (Qwen 3.8: `xhigh` — its own default — plus `medium` and `low`). This is
     /// a template variable rather than a sampler setting, so it is rendered
     /// into the prompt, not applied to logits. `None` leaves the template's
     /// default in place; an unrecognised value is rejected by the template
     /// itself rather than being silently dropped here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// The chat-template variable `reasoning_effort` is rendered into.
+    ///
+    /// Families name it differently: Qwen reads `reasoning_effort`,
+    /// muse-glimmer reads `reasoning_strength`, and a template ignores a
+    /// variable it does not know. `None` renders it as `reasoning_effort`.
+    /// The host resolves this from its catalog, as its serial path does.
+    pub reasoning_kwarg: Option<String>,
+    /// Most tokens the model may spend reasoning before the engine closes the
+    /// block for it. `None` reserves a quarter of `max_tokens` (at least 64,
+    /// at most 2048) for the answer and lets reasoning have the rest.
+    #[serde(default)]
+    pub reasoning_budget: Option<u32>,
+    /// The reasoning frame of the prompt this config is generating from, set
+    /// where the prompt is rendered. `None` is `<think>`, not already open.
+    #[serde(skip)]
+    pub reasoning_frame: Option<crate::stream::ReasoningFrame>,
+    /// OpenAI-style structured-output constraint (`{"type":"json_schema",…}`,
+    /// `{"type":"json_object"}`), forwarded verbatim to external engines —
+    /// SGLang enforces it at the sampler through its grammar backend
+    /// (xgrammar), so a constrained response cannot be malformed. The
+    /// in-process llama.cpp path does not enforce it yet and ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
     /// Per-request override of the served model's thinking mode, for chat
     /// templates with an `enable_thinking` toggle (Qwen 3.x, Gemma 4). `None`
     /// keeps the engine's default — which an operator may have pinned off for
@@ -66,13 +89,6 @@ pub struct GenerationConfig {
     /// mix in the caller's output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
-    /// OpenAI-style structured-output constraint (`{"type":"json_schema",…}`,
-    /// `{"type":"json_object"}`), forwarded verbatim to external engines —
-    /// SGLang enforces it at the sampler through its grammar backend
-    /// (xgrammar), so a constrained response cannot be malformed. The
-    /// in-process llama.cpp path does not enforce it yet and ignores it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<serde_json::Value>,
 }
 
 impl Default for GenerationConfig {
@@ -92,8 +108,11 @@ impl Default for GenerationConfig {
             draft_n: None,
             commitment_k: None,
             reasoning_effort: None,
-            enable_thinking: None,
+            reasoning_kwarg: None,
+            reasoning_budget: None,
+            reasoning_frame: None,
             response_format: None,
+            enable_thinking: None,
         }
     }
 }
