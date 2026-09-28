@@ -461,6 +461,12 @@ impl Scheduler {
         self.slots = slots.max(1);
     }
 
+    /// Replace the queue policy — e.g. a host that bounds this queue's depth
+    /// below the default. Callers already waiting are unaffected.
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
+
     pub fn running(&self) -> u32 {
         self.running.len() as u32
     }
@@ -966,6 +972,19 @@ mod tests {
         assert!(matches!(
             s.decide(Class::Batch, Shape::new(10, 10), 0),
             Decision::Refuse(Refusal::QueueFull { depth: 2, limit: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn a_replaced_policy_bounds_the_queue_from_then_on() {
+        let mut s = Scheduler::new(1, Policy::default());
+        s.start(Shape::new(10, 10), 0);
+        s.enqueue();
+        assert!(matches!(s.decide(Class::Batch, Shape::new(10, 10), 0), Decision::Wait { .. }));
+        s.set_policy(Policy { max_queue_depth: 1, ..Policy::default() });
+        assert!(matches!(
+            s.decide(Class::Batch, Shape::new(10, 10), 0),
+            Decision::Refuse(Refusal::QueueFull { depth: 1, limit: 1, .. })
         ));
     }
 
