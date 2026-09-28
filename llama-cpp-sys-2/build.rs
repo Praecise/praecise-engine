@@ -381,6 +381,48 @@ fn android_toolchain(target_triple: &str) -> AndroidToolchain {
     }
 }
 
+/// Identify the llama.cpp source this build compiles, published as
+/// `llama_cpp_sys_2::LLAMA_SOURCE_ID`. Processes that must run the
+/// exact same llama.cpp (the RPC protocol has no version negotiation) compare it.
+///
+/// - When `llama.cpp` is its own repository (a submodule, or a cargo git
+///   checkout), the identifier is its commit.
+/// - When it is plain files inside an enclosing repository, the identifier is
+///   that repository's object for the directory: the pinned commit of a
+///   gitlink, or the tree hash of vendored files. It changes when, and only
+///   when, the llama.cpp content changes.
+/// - Without git, it is `unknown`.
+fn emit_source_id(llama_src: &Path) {
+    let id = llama_source_id(llama_src).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=LLAMA_SOURCE_ID={id}");
+}
+
+fn llama_source_id(llama_src: &Path) -> Option<String> {
+    let src = llama_src.canonicalize().ok()?;
+    let toplevel = PathBuf::from(git_output(&src, &["rev-parse", "--show-toplevel"])?)
+        .canonicalize()
+        .ok()?;
+    if src == toplevel {
+        println!("cargo:rerun-if-changed={}", src.join(".git").display());
+        return git_output(&src, &["rev-parse", "--short=12", "HEAD"]);
+    }
+    let rel = src.strip_prefix(&toplevel).ok()?;
+    println!("cargo:rerun-if-changed={}", src.display());
+    git_output(
+        &toplevel,
+        &["rev-parse", "--short=12", &format!("HEAD:{}", rel.to_str()?)],
+    )
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 fn is_hidden(e: &DirEntry) -> bool {
     e.file_name()
         .to_str()
@@ -506,6 +548,7 @@ fn main() {
     let target_dir = get_cargo_target_dir().unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
     let llama_src = Path::new(&manifest_dir).join("llama.cpp");
+    emit_source_id(&llama_src);
     let build_shared_libs = cfg!(feature = "dynamic-link");
 
     let build_shared_libs = std::env::var("LLAMA_BUILD_SHARED_LIBS")
