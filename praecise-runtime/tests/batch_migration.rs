@@ -44,7 +44,6 @@ fn request(
         prompt: BatchPrompt::Raw(prompt.to_string()),
         config,
         token_tx,
-        reasoning_tx: None,
         result_tx,
         media: Vec::new(),
     };
@@ -145,7 +144,6 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
         reasoning: handoff.reasoning,
         config: greedy(MAX_TOKENS - handoff.generated_tokens),
         token_tx: None,
-        reasoning_tx: None,
         result_tx,
     })
     .expect("resume");
@@ -213,7 +211,6 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
         reasoning: handoff.reasoning,
         config: greedy(MAX_TOKENS - handoff.generated_tokens),
         token_tx: None,
-        reasoning_tx: None,
         result_tx,
     })
     .expect("resume");
@@ -236,7 +233,6 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
             reasoning: handoff.reasoning,
             config: greedy(4),
             token_tx: None,
-            reasoning_tx: None,
             result_tx,
         })
         .expect("resume");

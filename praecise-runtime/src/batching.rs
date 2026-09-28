@@ -164,15 +164,12 @@ pub enum BatchPrompt {
 pub struct BatchRequest {
     /// The prompt to serve.
     pub prompt: BatchPrompt,
-    /// Sampling / generation configuration.
+    /// Sampling / generation configuration. Its `reasoning_tx` streams the
+    /// model's reasoning apart from `token_tx`.
     pub config: GenerationConfig,
     /// Per-token streaming sink. `None` for non-streaming callers; the final
     /// aggregate still returns via `result_tx`.
     pub token_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    /// Streaming sink for the model's reasoning, delivered as it is produced
-    /// and kept apart from `token_tx`. `None` returns the reasoning only in
-    /// [`InferenceResult::thinking`].
-    pub reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Where the terminal [`InferenceResult`] (or error) is delivered.
     pub result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
     /// Images or audio, in the order their markers appear in the prompt. Empty
@@ -230,10 +227,9 @@ pub struct SequenceResume {
     /// Sampling for the continuation. `max_tokens` counts tokens generated
     /// after the resume; the imported positions are the request's input.
     pub config: GenerationConfig,
-    /// Per-token streaming sink for the continuation.
+    /// Per-token streaming sink for the continuation. The continuation's
+    /// reasoning streams to the config's `reasoning_tx`.
     pub token_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    /// Streaming sink for the continuation's reasoning.
-    pub reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Where the continuation's [`InferenceResult`] (or error) is delivered.
     pub result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
 }
@@ -2181,7 +2177,6 @@ fn admit_resume(
         model,
         resume.config,
         resume.token_tx,
-        resume.reasoning_tx,
         resume.result_tx,
         resume.reasoning,
         staged,
@@ -2477,7 +2472,7 @@ fn admit(
         0
     };
     let max_pos = ctx_size.min(input_tokens as i32 + req.config.max_tokens as i32);
-    let seq = Sequence::new(model, req.config, req.token_tx, req.reasoning_tx, req.result_tx, frame, staged, namespace, max_pos);
+    let seq = Sequence::new(model, req.config, req.token_tx, req.result_tx, frame, staged, namespace, max_pos);
     install(slots, slot_idx, seq);
     Some(PrefixReuse { slot_idx, shared })
 }
@@ -2490,7 +2485,6 @@ impl Sequence {
         model: &LlamaModel,
         config: GenerationConfig,
         token_tx: Option<tokio::sync::mpsc::Sender<String>>,
-        reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
         result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
         frame: ReasoningFrame,
         staged: Staged,
@@ -2520,7 +2514,7 @@ impl Sequence {
             max_pos,
             reasoning_budget: reasoning_budget(&config),
             close_tokens: close_marker_tokens(model, frame),
-            stream: StopStream::new(config.stop).framed(frame).nonblocking().with_reasoning(reasoning_tx),
+            stream: StopStream::new(config.stop).framed(frame).nonblocking().with_reasoning(config.reasoning_tx),
             started: Instant::now(),
             speculate: false,
             reasoning_tokens: 0,
@@ -2607,7 +2601,7 @@ fn admit_encoder_decoder(
         media: None,
     };
     let max_pos = ctx_size.min(1 + req.config.max_tokens as i32);
-    let mut seq = Sequence::new(model, req.config, req.token_tx, req.reasoning_tx, req.result_tx, frame, staged, namespace, max_pos);
+    let mut seq = Sequence::new(model, req.config, req.token_tx, req.result_tx, frame, staged, namespace, max_pos);
     // Billed and reported against the encoder input, which is the prompt.
     seq.input_tokens = prompt.len() as u32;
     seq.max_pos = max_pos + seq.input_tokens as i32 - 1;

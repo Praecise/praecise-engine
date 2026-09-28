@@ -273,7 +273,7 @@ fn three_processes_match_one_process() {
     // a whole greedy generation through the pipeline equals one in a single process
     let config = GenerationConfig { temperature: 0.0, repeat_penalty: 1.0, max_tokens: 12, ..Default::default() };
     let result = pipe
-        .generate(&BatchPrompt::Raw(TEXT_B.to_string()), &config, false, None, None, None)
+        .generate(&BatchPrompt::Raw(TEXT_B.to_string()), &config, false, None, None)
         .expect("generate");
     reference.ctx.clear_kv_cache_seq(Some(0), None, None).unwrap();
     let mut logits = reference.run(0, 0, &b);

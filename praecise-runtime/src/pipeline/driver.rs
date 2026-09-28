@@ -348,7 +348,7 @@ impl<'m> Pipeline<'m> {
     /// Generate a reply to `prompt` on sequence 0, which is cleared first: the prompt
     /// is rendered with the model's chat template, prefilled in micro-batches across
     /// the pipeline, and then sampled one token at a time. Text goes to `token_tx` as
-    /// it becomes final and reasoning to `reasoning_tx`; generation stops at an
+    /// it becomes final and reasoning to the config's `reasoning_tx`; generation stops at an
     /// end-of-generation token, a stop sequence, `max_tokens`, a dropped receiver or
     /// `cancel`. `enable_thinking` is the default thinking mode a request may override.
     ///
@@ -362,7 +362,6 @@ impl<'m> Pipeline<'m> {
         config: &crate::config::GenerationConfig,
         enable_thinking: bool,
         token_tx: Option<&tokio::sync::mpsc::Sender<String>>,
-        reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::result::InferenceResult, PipelineError> {
         use llama_cpp_2::model::AddBos;
@@ -392,7 +391,7 @@ impl<'m> Pipeline<'m> {
         let mut sampler = crate::sampling::build_sampler_chain(config, n_vocab);
         let mut stream = crate::stream::StopStream::new(config.stop.clone())
             .framed(crate::stream::ReasoningFrame::for_prompt(&rendered))
-            .with_reasoning(reasoning_tx);
+            .with_reasoning(config.reasoning_tx.clone());
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output_tokens = 0u32;
         let mut eos = false;

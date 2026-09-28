@@ -72,6 +72,11 @@ pub struct GenerationConfig {
     /// where the prompt is rendered. `None` is `<think>`, not already open.
     #[serde(skip)]
     pub reasoning_frame: Option<crate::stream::ReasoningFrame>,
+    /// Where the model's reasoning is streamed as it is produced, apart from
+    /// the answer's token channel. `None` returns the reasoning only on the
+    /// finished result's `thinking`.
+    #[serde(skip)]
+    pub reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// OpenAI-style structured-output constraint (`{"type":"json_schema",…}`,
     /// `{"type":"json_object"}`), forwarded verbatim to external engines —
     /// SGLang enforces it at the sampler through its grammar backend
@@ -119,6 +124,7 @@ impl Default for GenerationConfig {
             reasoning_kwarg: None,
             reasoning_budget: None,
             reasoning_frame: None,
+            reasoning_tx: None,
             response_format: None,
             enable_thinking: None,
             cache_salt: None,
