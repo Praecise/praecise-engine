@@ -410,12 +410,20 @@ fn llama_source_id(llama_src: &Path) -> Option<String> {
     println!("cargo:rerun-if-changed={}", src.display());
     git_output(
         &toplevel,
-        &["rev-parse", "--short=12", &format!("HEAD:{}", rel.to_str()?)],
+        &[
+            "rev-parse",
+            "--short=12",
+            &format!("HEAD:{}", rel.to_str()?),
+        ],
     )
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

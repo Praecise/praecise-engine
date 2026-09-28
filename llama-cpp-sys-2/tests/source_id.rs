@@ -4,7 +4,11 @@ use std::path::Path;
 use std::process::Command;
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -27,7 +31,10 @@ fn the_source_id_is_the_compiled_llama_cpp_commit() {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        git(Path::new(&toplevel), &["rev-parse", "--short=12", &format!("HEAD:{rel}")])
+        git(
+            Path::new(&toplevel),
+            &["rev-parse", "--short=12", &format!("HEAD:{rel}")],
+        )
     };
     assert_eq!(Some(llama_cpp_sys_2::LLAMA_SOURCE_ID.to_string()), expected);
     assert_ne!(llama_cpp_sys_2::LLAMA_SOURCE_ID, "unknown");
