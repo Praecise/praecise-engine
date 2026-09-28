@@ -37,7 +37,8 @@ fn grammar_is_accepted() {
     let Some(model) = model() else {
         return;
     };
-    assert!(LlamaSampler::grammar(model, GRAMMAR, "root").is_ok());
+    // SAFETY: the model is `'static`, so it outlives the sampler.
+    assert!(unsafe { LlamaSampler::grammar(model, GRAMMAR, "root") }.is_ok());
 }
 
 #[test]
@@ -46,7 +47,10 @@ fn lazy_patterns_grammar_is_accepted() {
         return;
     };
     let patterns = vec![r"\{".to_string()];
-    assert!(LlamaSampler::grammar_lazy_patterns(model, GRAMMAR, "root", &patterns, &[]).is_ok());
+    // SAFETY: the model is `'static`, so it outlives the sampler.
+    let sampler =
+        unsafe { LlamaSampler::grammar_lazy_patterns(model, GRAMMAR, "root", &patterns, &[]) };
+    assert!(sampler.is_ok());
 }
 
 #[test]
@@ -54,8 +58,9 @@ fn unparseable_grammar_gives_null_grammar() {
     let Some(model) = model() else {
         return;
     };
+    // SAFETY: the model is `'static`, so it outlives the sampler.
     assert_eq!(
-        LlamaSampler::grammar(model, "root ::= <<<", "root").err(),
+        unsafe { LlamaSampler::grammar(model, "root ::= <<<", "root") }.err(),
         Some(GrammarError::NullGrammar)
     );
 }
@@ -65,8 +70,9 @@ fn grammar_root_is_checked() {
     let Some(model) = model() else {
         return;
     };
+    // SAFETY: the model is `'static`, so it outlives the sampler.
     assert_eq!(
-        LlamaSampler::grammar(model, GRAMMAR, "missing").err(),
+        unsafe { LlamaSampler::grammar(model, GRAMMAR, "missing") }.err(),
         Some(GrammarError::RootNotFound)
     );
 }
