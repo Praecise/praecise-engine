@@ -257,6 +257,7 @@ pub fn generate_ngram_speculative(
             // Same as the drafted-model path: the top-k capture a commitment
             // needs lives in the standard decode loop, not here.
             commitment: None,
+            cached_tokens: 0,
         },
         stats,
     ))

@@ -53,7 +53,10 @@ pub struct InferenceResult {
     pub thinking: Option<String>,
     /// Prompt token count.
     pub input_tokens: u32,
-    /// Generated token count.
+    /// Tokens the model generated. Tokens the engine forced into the output
+    /// (the close marker of a reasoning block whose budget ran out) are not
+    /// counted, though they appear in the text and, when a commitment was
+    /// requested, in its steps.
     pub output_tokens: u32,
     /// Wall-clock generation time in milliseconds.
     pub generation_time_ms: u64,
@@ -66,6 +69,10 @@ pub struct InferenceResult {
     /// top-k logit records a verifier can recompute against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commitment: Option<crate::toploc::InferenceCommitment>,
+    /// Prompt tokens served from the engine's prefix cache instead of being
+    /// prefilled: already counted in [`Self::input_tokens`], and computed by an
+    /// earlier request.
+    pub cached_tokens: u32,
 }
 
 /// A chat message with role and content, for chat-template formatting.
@@ -98,6 +105,13 @@ pub struct ChatMessage {
     /// For `role == "tool"`: the call this result answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// For `role == "assistant"`: the reasoning the model produced before this
+    /// reply, when the client sends it back. Templates that render reasoning
+    /// into history (Qwen's read `reasoning_content`) then reproduce the
+    /// previous turn exactly as it was generated, so the engine's cache of that
+    /// turn is an exact prefix of the next request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {

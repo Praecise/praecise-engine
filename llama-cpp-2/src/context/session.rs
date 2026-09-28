@@ -496,28 +496,21 @@ impl LlamaContext<'_> {
     ///
     /// # Parameters
     ///
-    /// * `dest` - Destination buffer to copy state into.
+    /// * `dest` - Destination buffer to copy state into. llama.cpp is told its
+    ///   real length and writes nothing past it; a buffer smaller than
+    ///   [`Self::state_seq_get_size_ext`] yields 0.
     /// * `seq_id` - The sequence ID to get the state for.
     /// * `flags` - Optional flags (e.g., [`LlamaStateSeqFlags::PARTIAL_ONLY`]).
-    ///
-    /// # Safety
-    ///
-    /// Destination needs to have allocated enough memory.
     ///
     /// # Returns
     ///
     /// The number of bytes copied.
-    pub unsafe fn state_seq_get_data_ext(
-        &self,
-        dest: *mut u8,
-        seq_id: i32,
-        flags: LlamaStateSeqFlags,
-    ) -> usize {
+    pub fn state_seq_get_data_ext(&self, dest: &mut [u8], seq_id: i32, flags: LlamaStateSeqFlags) -> usize {
         unsafe {
             llama_cpp_sys_2::llama_state_seq_get_data_ext(
                 self.context.as_ptr(),
-                dest,
-                usize::MAX,
+                dest.as_mut_ptr(),
+                dest.len(),
                 seq_id,
                 flags.0,
             )

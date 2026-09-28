@@ -46,6 +46,9 @@ pub mod ngram;
 /// effect on throughput (~5% across a 16x range, non-monotonic). Kept for the
 /// negative result; nothing calls it. See the module docs.
 pub mod prax;
+/// Prefix reuse across requests: what each kind of model memory can rewind,
+/// where checkpoints go, and whose cache a request may match. Backend-agnostic.
+pub mod prefix_cache;
 pub mod prompt;
 /// Speculation policy: which drafting method and how long a block, given the
 /// model, the hardware and the current load. Backend-agnostic — it is a
@@ -86,7 +89,7 @@ pub mod ngram_decode;
 pub mod speculative;
 
 pub use admission::{
-    Class as AdmissionClass, CostModel, Decision as AdmissionDecision, Estimate, Observation,
+    Class as AdmissionClass, Client as AdmissionClient, CostModel, Decision as AdmissionDecision, Estimate, Observation,
     Policy as AdmissionPolicy, Refusal as AdmissionRefusal, Scheduler, Shape,
 };
 pub use config::GenerationConfig;

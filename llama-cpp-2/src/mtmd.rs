@@ -6,6 +6,7 @@
 //! # Warning
 //! This API is experimental and subject to breaking changes.
 use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::slice;
 
@@ -157,14 +158,19 @@ pub struct MtmdInputText {
 ///
 /// This represents an initialized multimodal context that can process
 /// text, images, and audio through llama.cpp's multimodal interface.
+///
+/// The context keeps a raw pointer to the text model it was built for, so it
+/// must be dropped before that model (see [`Self::init_from_file`]). It may be
+/// moved to another thread but not shared between threads: encoding and
+/// evaluation mutate its C state through `&self`.
 #[derive(Debug)]
 pub struct MtmdContext {
     pub(crate) context: NonNull<llama_cpp_sys_2::mtmd_context>,
 }
 
-// MtmdContext is thread safe
+// The context is owned by exactly one thread at a time. It is not `Sync`:
+// `encode_chunk` and the helpers write into it through a shared reference.
 unsafe impl Send for MtmdContext {}
-unsafe impl Sync for MtmdContext {}
 
 impl MtmdContext {
     /// Initialize MTMD context from a multimodal projection file.
@@ -184,7 +190,13 @@ impl MtmdContext {
     /// This function will return an error if:
     /// - The path cannot be converted to a C string
     /// - The underlying C function returns null (indicating initialization failure)
-    pub fn init_from_file(
+    ///
+    /// # Safety
+    ///
+    /// The returned context holds a pointer into `text_model` without a
+    /// borrow, because hosts keep the model and its projector side by side in
+    /// one struct. The caller must drop the context before `text_model`.
+    pub unsafe fn init_from_file(
         mmproj_path: &str,
         text_model: &LlamaModel,
         params: &MtmdContextParams,
@@ -361,12 +373,16 @@ impl Drop for MtmdContext {
 /// Represents bitmap data for images or audio that can be processed
 /// by the multimodal system. For images, data is stored in RGB format.
 /// For audio, data is stored as PCM F32 samples.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: the handle owns the C bitmap and frees it on drop, so a
+/// copied handle would free it twice.
+#[derive(Debug)]
 pub struct MtmdBitmap {
     pub(crate) bitmap: NonNull<llama_cpp_sys_2::mtmd_bitmap>,
 }
 
-// MtmdBitmap is thread safe
+// Reads go through `&self` and never mutate; the one mutation, `set_id`,
+// takes `&mut self`.
 unsafe impl Send for MtmdBitmap {}
 unsafe impl Sync for MtmdBitmap {}
 
@@ -401,7 +417,13 @@ impl MtmdBitmap {
     /// assert!(bitmap.is_ok());
     /// ```
     pub fn from_image_data(nx: u32, ny: u32, data: &[u8]) -> Result<Self, MtmdBitmapError> {
-        if data.len() != (nx * ny * 3) as usize {
+        // In usize and checked: `nx * ny * 3` in u32 wraps for large
+        // dimensions, and a wrapped size that happened to equal the buffer
+        // length would let the C side read `nx * ny * 3` real bytes past it.
+        let expected = (nx as usize)
+            .checked_mul(ny as usize)
+            .and_then(|n| n.checked_mul(3));
+        if expected != Some(data.len()) {
             return Err(MtmdBitmapError::InvalidDataSize);
         }
 
@@ -606,13 +628,13 @@ impl MtmdBitmap {
     ///
     /// ```no_run
     /// # use llama_cpp_2::mtmd::MtmdBitmap;
-    /// # fn example(bitmap: &MtmdBitmap) -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn example(bitmap: &mut MtmdBitmap) -> Result<(), Box<dyn std::error::Error>> {
     /// bitmap.set_id("image_001")?;
     /// assert_eq!(bitmap.id(), Some("image_001".to_string()));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn set_id(&self, id: &str) -> Result<(), std::ffi::NulError> {
+    pub fn set_id(&mut self, id: &str) -> Result<(), std::ffi::NulError> {
         let id_cstr = CString::new(id)?;
         unsafe {
             llama_cpp_sys_2::mtmd_bitmap_set_id(self.bitmap.as_ptr(), id_cstr.as_ptr());
@@ -677,9 +699,10 @@ impl MtmdInputChunks {
         self.len() == 0
     }
 
-    /// Get a chunk by index
+    /// Get a chunk by index. The chunk is borrowed from this collection and
+    /// cannot outlive it; [`MtmdInputChunk::copy`] makes an owned one.
     #[must_use]
-    pub fn get(&self, index: usize) -> Option<MtmdInputChunk> {
+    pub fn get(&self, index: usize) -> Option<MtmdInputChunk<'_>> {
         if index >= self.len() {
             return None;
         }
@@ -691,7 +714,52 @@ impl MtmdInputChunks {
         NonNull::new(chunk_ptr.cast_mut()).map(|ptr| MtmdInputChunk {
             chunk: ptr,
             owned: false,
+            _owner: PhantomData,
         })
+    }
+
+    /// Evaluate the chunk at `index` alone: decode a text chunk, or encode a
+    /// media chunk and decode its embeddings, into `seq_id` from `n_past` on.
+    ///
+    /// Returns the new `n_past`. This lets a caller evaluate a prompt chunk by
+    /// chunk, skipping the chunks a cache already holds.
+    ///
+    /// # Errors
+    ///
+    /// `MtmdEvalError::EvalFailure` when the index is out of range, or when
+    /// encoding or decoding fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn eval_chunk(
+        &self,
+        index: usize,
+        mtmd_ctx: &MtmdContext,
+        llama_ctx: &mut LlamaContext,
+        n_past: llama_cpp_sys_2::llama_pos,
+        seq_id: llama_cpp_sys_2::llama_seq_id,
+        n_batch: i32,
+        logits_last: bool,
+    ) -> Result<llama_cpp_sys_2::llama_pos, MtmdEvalError> {
+        let Some(chunk) = self.get(index) else {
+            return Err(MtmdEvalError::EvalFailure(-1));
+        };
+        let mut new_n_past: llama_cpp_sys_2::llama_pos = 0;
+        let result = unsafe {
+            llama_cpp_sys_2::mtmd_helper_eval_chunk_single(
+                mtmd_ctx.context.as_ptr(),
+                llama_ctx.context.as_ptr(),
+                chunk.chunk.as_ptr(),
+                n_past,
+                seq_id,
+                n_batch,
+                logits_last,
+                &raw mut new_n_past,
+            )
+        };
+        if result == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(result))
+        }
     }
 
     /// Get total number of tokens across all chunks.
@@ -741,7 +809,7 @@ impl MtmdInputChunks {
     pub fn eval_chunks(
         &self,
         mtmd_ctx: &MtmdContext,
-        llama_ctx: &LlamaContext,
+        llama_ctx: &mut LlamaContext,
         n_past: llama_cpp_sys_2::llama_pos,
         seq_id: llama_cpp_sys_2::llama_seq_id,
         n_batch: i32,
@@ -781,13 +849,17 @@ impl Drop for MtmdInputChunks {
 /// Represents a single chunk of input data, which can be either text tokens,
 /// image tokens, or audio tokens. The chunk type determines what kind of
 /// data and operations are available.
+///
+/// A chunk from [`MtmdInputChunks::get`] borrows the collection it came from
+/// (`'a`); an owned copy from [`Self::copy`] is `'static`.
 #[derive(Debug)]
-pub struct MtmdInputChunk {
+pub struct MtmdInputChunk<'a> {
     pub(crate) chunk: NonNull<llama_cpp_sys_2::mtmd_input_chunk>,
     owned: bool,
+    _owner: PhantomData<&'a MtmdInputChunks>,
 }
 
-impl MtmdInputChunk {
+impl MtmdInputChunk<'_> {
     /// Get the type of this chunk
     #[must_use]
     pub fn chunk_type(&self) -> MtmdInputChunkType {
@@ -871,14 +943,18 @@ impl MtmdInputChunk {
     /// # Errors
     ///
     /// Returns `MtmdInputChunkError::NullResult` if copying fails.
-    pub fn copy(&self) -> Result<Self, MtmdInputChunkError> {
+    pub fn copy(&self) -> Result<MtmdInputChunk<'static>, MtmdInputChunkError> {
         let chunk = unsafe { llama_cpp_sys_2::mtmd_input_chunk_copy(self.chunk.as_ptr()) };
         let chunk = NonNull::new(chunk).ok_or(MtmdInputChunkError::NullResult)?;
-        Ok(Self { chunk, owned: true })
+        Ok(MtmdInputChunk {
+            chunk,
+            owned: true,
+            _owner: PhantomData,
+        })
     }
 }
 
-impl Drop for MtmdInputChunk {
+impl Drop for MtmdInputChunk<'_> {
     fn drop(&mut self) {
         if self.owned {
             unsafe { llama_cpp_sys_2::mtmd_input_chunk_free(self.chunk.as_ptr()) }

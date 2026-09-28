@@ -27,6 +27,17 @@ pub const DEFAULT_COMMITMENT_K: u8 = 16;
 /// Maximum accepted `commitment_k` — bounds blob size per token.
 pub const MAX_COMMITMENT_K: u8 = 64;
 
+/// Minimum accepted `commitment_k`. With one or two logits per step the
+/// overlap test says almost nothing (a single committed id is either present
+/// or not), so a commitment below this is refused outright and producers
+/// raise a smaller request to it.
+pub const MIN_COMMITMENT_K: u8 = 4;
+
+/// The `k` a producer commits with for a requested `k`.
+pub fn commitment_k_for(requested: u8) -> u8 {
+    requested.clamp(MIN_COMMITMENT_K, MAX_COMMITMENT_K)
+}
+
 /// Minimum fraction of committed top-k token ids that must reappear in
 /// the recomputed top-k for a step to pass.
 pub const MIN_INDEX_OVERLAP: f32 = 0.75;
@@ -113,6 +124,10 @@ impl InferenceCommitment {
 /// Per-step comparison between a committed record and recomputed logits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepComparison {
+    /// Whether the token the provider says it emitted is among the
+    /// recomputed top-k. A substituted token that the model would not have
+    /// produced fails here even when the committed logits are genuine.
+    pub token_supported: bool,
     /// Fraction of committed token ids present in the recomputed top-k.
     pub index_overlap: f32,
     /// Mean absolute logit difference over the shared token ids.
@@ -157,9 +172,17 @@ pub fn top_k_from_logits(logits: &[f32], k: usize) -> Vec<TopKEntry> {
 
 /// Compare one committed step against the recomputed top-k at the same
 /// position.
+///
+/// A step passes only when the emitted token is among the recomputed top-k
+/// and the committed top-k matches the recomputed one within tolerance. A
+/// token sampled from outside the verifier's top-k therefore fails its step;
+/// the whole commitment tolerates that at the rate
+/// [`MIN_PASSING_STEP_FRACTION`] allows.
 pub fn compare_step(committed: &StepRecord, recomputed: &[TopKEntry]) -> StepComparison {
+    let token_supported = recomputed.iter().any(|r| r.token_id == committed.token_id);
     if committed.top_k.is_empty() {
         return StepComparison {
+            token_supported,
             index_overlap: 0.0,
             mean_logit_delta: f32::INFINITY,
             pass: false,
@@ -179,8 +202,9 @@ pub fn compare_step(committed: &StepRecord, recomputed: &[TopKEntry]) -> StepCom
     } else {
         f32::INFINITY
     };
-    let pass = index_overlap >= MIN_INDEX_OVERLAP && mean_logit_delta <= MAX_MEAN_LOGIT_DELTA;
+    let pass = token_supported && index_overlap >= MIN_INDEX_OVERLAP && mean_logit_delta <= MAX_MEAN_LOGIT_DELTA;
     StepComparison {
+        token_supported,
         index_overlap,
         mean_logit_delta,
         pass,
@@ -188,13 +212,18 @@ pub fn compare_step(committed: &StepRecord, recomputed: &[TopKEntry]) -> StepCom
 }
 
 /// Verify a full commitment against recomputed top-k rows, one per
-/// step. A length mismatch fails outright — the verifier could not
-/// reproduce the committed sequence shape.
+/// step. Fails outright when the verifier could not reproduce the committed
+/// shape: a step count that differs, a `k` outside
+/// [`MIN_COMMITMENT_K`]`..=`[`MAX_COMMITMENT_K`], or a step that commits a
+/// number of logits other than `k` (which would also make the canonical
+/// encoding ambiguous).
 pub fn verify_commitment(
     committed: &InferenceCommitment,
     recomputed: &[Vec<TopKEntry>],
 ) -> VerificationOutcome {
-    if committed.steps.is_empty() || committed.steps.len() != recomputed.len() {
+    let well_formed = (MIN_COMMITMENT_K..=MAX_COMMITMENT_K).contains(&committed.k)
+        && committed.steps.iter().all(|s| s.top_k.len() == usize::from(committed.k));
+    if !well_formed || committed.steps.is_empty() || committed.steps.len() != recomputed.len() {
         return VerificationOutcome {
             steps_total: committed.steps.len(),
             steps_passed: 0,
@@ -323,22 +352,20 @@ mod tests {
         assert_eq!(cmp.index_overlap, 0.0);
     }
 
+    fn four(first: u32) -> Vec<TopKEntry> {
+        vec![entry(first, 5.0), entry(first + 1, 4.0), entry(first + 2, 3.0), entry(first + 3, 2.0)]
+    }
+
     #[test]
     fn verify_requires_passing_fraction() {
-        let good = StepRecord {
-            token_id: 1,
-            top_k: vec![entry(1, 5.0), entry(2, 4.0)],
-        };
-        let bad = StepRecord {
-            token_id: 3,
-            top_k: vec![entry(3, 5.0), entry(4, 4.0)],
-        };
+        let good = StepRecord { token_id: 1, top_k: four(1) };
+        let bad = StepRecord { token_id: 3, top_k: four(3) };
         // 10 steps: 9 exact matches + 1 disjoint recompute = 0.9 passes.
         let mut steps = vec![good.clone(); 9];
         steps.push(bad.clone());
         let committed = commitment_with(steps);
         let mut recomputed: Vec<Vec<TopKEntry>> = vec![good.top_k.clone(); 9];
-        recomputed.push(vec![entry(100, 5.0), entry(101, 4.0)]);
+        recomputed.push(four(100));
         let outcome = verify_commitment(&committed, &recomputed);
         assert!(outcome.pass);
         assert_eq!(outcome.steps_passed, 9);
@@ -350,17 +377,46 @@ mod tests {
         steps.push(bad.clone());
         let committed = commitment_with(steps);
         let mut recomputed: Vec<Vec<TopKEntry>> = vec![good.top_k.clone(); 8];
-        recomputed.push(vec![entry(100, 5.0)]);
-        recomputed.push(vec![entry(100, 5.0)]);
+        recomputed.push(four(100));
+        recomputed.push(four(100));
         assert!(!verify_commitment(&committed, &recomputed).pass);
     }
 
     #[test]
+    fn a_substituted_token_fails_its_step_even_with_genuine_logits() {
+        // The committed logits are exactly what the verifier recomputes, but
+        // the emitted token is one the model does not rank at all.
+        let honest = StepRecord { token_id: 1, top_k: four(1) };
+        let forged = StepRecord { token_id: 999, top_k: four(1) };
+        assert!(compare_step(&honest, &four(1)).pass);
+        let cmp = compare_step(&forged, &four(1));
+        assert!(!cmp.token_supported);
+        assert!(!cmp.pass);
+        // A whole output of substituted tokens does not verify.
+        let committed = commitment_with(vec![forged; 10]);
+        assert!(!verify_commitment(&committed, &vec![four(1); 10]).pass);
+    }
+
+    #[test]
+    fn a_commitment_below_the_minimum_k_is_refused() {
+        let step = StepRecord { token_id: 1, top_k: vec![entry(1, 5.0)] };
+        let committed = InferenceCommitment { k: 1, prompt_tokens: 8, steps: vec![step.clone(); 10] };
+        assert!(!verify_commitment(&committed, &vec![step.top_k.clone(); 10]).pass);
+        assert_eq!(commitment_k_for(1), MIN_COMMITMENT_K);
+        assert_eq!(commitment_k_for(200), MAX_COMMITMENT_K);
+        assert_eq!(commitment_k_for(16), 16);
+    }
+
+    #[test]
+    fn a_step_with_other_than_k_logits_is_refused() {
+        let short = StepRecord { token_id: 1, top_k: four(1)[..3].to_vec() };
+        let committed = commitment_with(vec![StepRecord { token_id: 1, top_k: four(1) }, short]);
+        assert!(!verify_commitment(&committed, &[four(1), four(1)]).pass);
+    }
+
+    #[test]
     fn verify_fails_on_length_mismatch() {
-        let step = StepRecord {
-            token_id: 1,
-            top_k: vec![entry(1, 5.0)],
-        };
+        let step = StepRecord { token_id: 1, top_k: four(1) };
         let committed = commitment_with(vec![step.clone(), step.clone()]);
         let recomputed = vec![step.top_k.clone()];
         assert!(!verify_commitment(&committed, &recomputed).pass);

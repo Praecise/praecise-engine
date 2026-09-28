@@ -405,16 +405,17 @@ impl LlamaModel {
         special: bool,
         lstrip: Option<NonZeroU16>,
     ) -> Result<Vec<u8>, TokenToStringError> {
-        let string = CString::new(vec![b'*'; buffer_size]).expect("no null");
-        let len = string.as_bytes().len();
-        let len = c_int::try_from(len).expect("length fits into c_int");
-        let buf = string.into_raw();
+        // A plain byte buffer: llama.cpp writes `size` bytes and no terminator,
+        // and a piece may itself contain NUL bytes, so nothing here may treat
+        // the buffer as a C string. It is freed by `Vec` on every path.
+        let mut buf = vec![0u8; buffer_size];
+        let len = c_int::try_from(buf.len()).expect("length fits into c_int");
         let lstrip = lstrip.map_or(0, |it| i32::from(it.get()));
         let size = unsafe {
             llama_cpp_sys_2::llama_token_to_piece(
                 self.vocab_ptr(),
                 token.0,
-                buf,
+                buf.as_mut_ptr().cast::<c_char>(),
                 len,
                 lstrip,
                 special,
@@ -425,11 +426,9 @@ impl LlamaModel {
             0 => Err(TokenToStringError::UnknownTokenType),
             i if i.is_negative() => Err(TokenToStringError::InsufficientBufferSpace(i)),
             size => {
-                let string = unsafe { CString::from_raw(buf) };
-                let mut bytes = string.into_bytes();
                 let len = usize::try_from(size).expect("size is positive and fits into usize");
-                bytes.truncate(len);
-                Ok(bytes)
+                buf.truncate(len.min(buffer_size));
+                Ok(buf)
             }
         }
     }
@@ -499,6 +498,33 @@ impl LlamaModel {
     /// They require special handling for state checkpointing.
     pub fn is_hybrid(&self) -> bool {
         unsafe { llama_cpp_sys_2::llama_model_is_hybrid(self.model.as_ptr()) }
+    }
+
+    /// Sliding attention window in tokens, 0 when the model attends to its
+    /// whole context.
+    #[must_use]
+    pub fn n_swa(&self) -> u32 {
+        u32::try_from(unsafe { llama_cpp_sys_2::llama_model_n_swa(self.model.as_ptr()) }).unwrap_or(0)
+    }
+
+    /// Whether the model has an encoder (T5-style encoder-decoder, or an
+    /// encoder-only model).
+    #[must_use]
+    pub fn has_encoder(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_model_has_encoder(self.model.as_ptr()) }
+    }
+
+    /// Whether the model has a decoder.
+    #[must_use]
+    pub fn has_decoder(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_model_has_decoder(self.model.as_ptr()) }
+    }
+
+    /// Whether the model decodes by diffusion (LLaDA, Dream) rather than one
+    /// token at a time.
+    #[must_use]
+    pub fn is_diffusion(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_model_is_diffusion(self.model.as_ptr()) }
     }
 
     /// Returns the number of layers within the model.

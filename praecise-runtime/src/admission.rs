@@ -48,7 +48,7 @@
 //! The host owns locking, timers and the actual wait; this module is pure
 //! state and arithmetic so it can be tested with the numbers above.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 /// Which kind of caller is waiting, and therefore how long they will tolerate
@@ -345,12 +345,55 @@ pub enum Decision {
     Refuse(Refusal),
 }
 
+/// Who a request is for, as far as sharing the decoder fairly is concerned.
+///
+/// `id` tells callers apart: an API key's id, a lease, `"anonymous"` for
+/// everyone without one. `weight` is that caller's share relative to others:
+/// while both are waiting, a weight-2 caller is served about twice as much as
+/// a weight-1 caller. Zero is read as one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Client {
+    pub id: String,
+    pub weight: u32,
+}
+
+impl Client {
+    pub fn new(id: impl Into<String>, weight: u32) -> Self {
+        Self {
+            id: id.into(),
+            weight: weight.max(1),
+        }
+    }
+}
+
+/// Service units charged per prompt token. Prefill runs the prompt in parallel.
+const W_INPUT: u64 = 1;
+/// Service units charged per generated token. Decode is one step per token and
+/// costs the decoder about twice what a prompt token does.
+const W_OUTPUT: u64 = 2;
+/// Fixed-point scale, so dividing a charge by a caller's weight keeps precision.
+const SCALE: u64 = 1_000;
+
+/// A caller holding a place in the fair queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Waiter {
+    client: String,
+    class: Class,
+    arrived_ms: u64,
+}
+
 /// One request the decoder is currently serving, as the scheduler sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Running {
     shape: Shape,
     /// Milliseconds since the scheduler's epoch when service began.
     started_ms: u64,
+    /// Whose request this is, when the host said. `None` is admission that
+    /// named no caller, which is never charged.
+    client: Option<String>,
+    weight: u32,
+    /// Output tokens charged in advance, reconciled at `finish`.
+    charged_output: u64,
 }
 
 /// Slot accounting for one model.
@@ -365,6 +408,16 @@ pub struct Scheduler {
     running: BTreeMap<u64, Running>,
     next_id: u64,
     waiting: u32,
+    /// Callers queued by identity. Ranked on demand, never kept sorted, so a
+    /// counter changing while someone waits can reorder the line.
+    fair: BTreeMap<u64, Waiter>,
+    next_waiter: u64,
+    /// Service received per caller, in `SCALE`ths of a unit divided by the
+    /// caller's weight. The lowest counter is served next.
+    counters: HashMap<String, u64>,
+    /// Counter of the last caller to leave, for lifting a caller that arrives
+    /// when nobody else is active.
+    last_departed: u64,
 }
 
 impl Scheduler {
@@ -376,6 +429,10 @@ impl Scheduler {
             running: BTreeMap::new(),
             next_id: 1,
             waiting: 0,
+            fair: BTreeMap::new(),
+            next_waiter: 1,
+            counters: HashMap::new(),
+            last_departed: 0,
         }
     }
 
@@ -409,7 +466,7 @@ impl Scheduler {
     }
 
     pub fn waiting(&self) -> u32 {
-        self.waiting
+        self.waiting.saturating_add(self.fair.len() as u32)
     }
 
     /// Milliseconds until the `k`-th slot frees (0-indexed), from the remaining
@@ -474,6 +531,154 @@ impl Scheduler {
         Decision::Wait { eta: Duration::from_millis(eta_ms.max(50)), position }
     }
 
+    /// A charge of `tokens` at `per_token` units each, scaled and divided by the
+    /// caller's weight.
+    fn units(tokens: u64, per_token: u64, weight: u32) -> u64 {
+        tokens.saturating_mul(per_token).saturating_mul(SCALE) / u64::from(weight.max(1))
+    }
+
+    /// Output the cost model expects a request of this shape to produce: the
+    /// learned share of `max_tokens` callers actually use, with a floor so a
+    /// short history never prices a request at nothing.
+    fn expected_output(&self, shape: Shape) -> u64 {
+        let pct = self.cost.budget_use_pct().clamp(1, 100);
+        let learned = shape.max_output_tokens.saturating_mul(pct) / 100;
+        learned
+            .max(shape.max_output_tokens.min(32))
+            .min(shape.max_output_tokens)
+    }
+
+    fn counter(&self, client: &str) -> u64 {
+        self.counters.get(client).copied().unwrap_or(0)
+    }
+
+    fn is_active(&self, client: &str) -> bool {
+        self.fair.values().any(|w| w.client == client)
+            || self
+                .running
+                .values()
+                .any(|r| r.client.as_deref() == Some(client))
+    }
+
+    /// The lowest counter among callers with work queued or running.
+    fn active_min(&self) -> Option<u64> {
+        self.fair
+            .values()
+            .map(|w| w.client.as_str())
+            .chain(self.running.values().filter_map(|r| r.client.as_deref()))
+            .map(|c| self.counter(c))
+            .min()
+    }
+
+    /// Service a caller has received, as the fair queue counts it. For an
+    /// operator asking why one caller is waiting behind another.
+    pub fn service_of(&self, client: &str) -> u64 {
+        self.counter(client)
+    }
+
+    /// Join the fair queue as `client`.
+    ///
+    /// A caller with nothing queued or running has its counter lifted to the
+    /// least among callers that do, or, with nobody active, to the last one to
+    /// leave. Without the lift a caller idle for an hour would come back
+    /// holding an hour of unused credit and take every slot until it had spent
+    /// it. The lift only raises: stepping away cannot shed service already
+    /// received.
+    ///
+    /// Returns the handle for [`Scheduler::decide_waiter`] and
+    /// [`Scheduler::leave`]. Pair every join with a leave.
+    pub fn join(&mut self, client: &Client, class: Class, now_ms: u64) -> u64 {
+        if !self.is_active(&client.id) {
+            let floor = self.active_min().unwrap_or(self.last_departed);
+            let c = self.counters.entry(client.id.clone()).or_insert(0);
+            if *c < floor {
+                *c = floor;
+            }
+        }
+        let id = self.next_waiter;
+        self.next_waiter += 1;
+        self.fair.insert(
+            id,
+            Waiter {
+                client: client.id.clone(),
+                class,
+                arrived_ms: now_ms,
+            },
+        );
+        id
+    }
+
+    /// Give up a place in the fair queue: admitted, refused or gone.
+    pub fn leave(&mut self, waiter: u64) {
+        self.fair.remove(&waiter);
+    }
+
+    /// How many waiters are ahead of this one: interactive before batch, then
+    /// the least service received, then arrival.
+    fn rank(&self, waiter: u64) -> Option<u32> {
+        let key = |id: u64, w: &Waiter| {
+            let class = match w.class {
+                Class::Interactive => 0u8,
+                Class::Batch => 1u8,
+            };
+            (class, self.counter(&w.client), w.arrived_ms, id)
+        };
+        let mine = key(waiter, self.fair.get(&waiter)?);
+        Some(
+            self.fair
+                .iter()
+                .filter(|(id, w)| key(**id, w) < mine)
+                .count() as u32,
+        )
+    }
+
+    /// Decide for a waiter that has [`joined`](Scheduler::join).
+    ///
+    /// Admits when a slot is free and fewer waiters outrank this one than there
+    /// are free slots. A caller that has had little service goes ahead of one
+    /// that has had a lot, however long the heavy one has been queued, which is
+    /// what stops a single steady caller holding a one-slot model against
+    /// everyone else. ETA and refusal follow [`Scheduler::decide`], from this
+    /// waiter's rank.
+    pub fn decide_waiter(&self, waiter: u64, shape: Shape, now_ms: u64) -> Decision {
+        let (Some(me), Some(rank)) = (self.fair.get(&waiter), self.rank(waiter)) else {
+            return self.decide(Class::Interactive, shape, now_ms);
+        };
+        let free = self.slots.saturating_sub(self.running());
+        if rank < free {
+            return Decision::Admit;
+        }
+        if rank >= self.policy.max_queue_depth {
+            let conc = self.running.len() as u32;
+            let mean = self
+                .running
+                .values()
+                .map(|r| self.cost.predict(r.shape, conc).total_ms())
+                .sum::<u64>()
+                / u64::from(conc.max(1));
+            return Decision::Refuse(Refusal::QueueFull {
+                depth: self.fair.len() as u32,
+                limit: self.policy.max_queue_depth,
+                retry_after_ms: mean.max(1_000),
+            });
+        }
+        let eta_ms = self.eta_ms(rank - free, now_ms);
+        let budget_ms = self.policy.wait_budget(me.class).as_millis() as u64;
+        if eta_ms > budget_ms {
+            return Decision::Refuse(Refusal::WaitTooLong { eta_ms, budget_ms });
+        }
+        Decision::Wait {
+            eta: Duration::from_millis(eta_ms.max(50)),
+            position: rank,
+        }
+    }
+
+    fn note_departure(&mut self, client: &str) {
+        if !self.is_active(client) {
+            self.last_departed = self.counter(client);
+        }
+    }
+
     /// Record that a request has joined the queue. Pair with
     /// [`Scheduler::dequeue`] whether it is later admitted or abandoned.
     pub fn enqueue(&mut self) {
@@ -485,20 +690,87 @@ impl Scheduler {
     }
 
     /// Record that service began. Returns a ticket for [`Scheduler::finish`].
+    ///
+    /// Charged to nobody; see [`Scheduler::start_for`].
     pub fn start(&mut self, shape: Shape, now_ms: u64) -> u64 {
+        self.start_for(shape, None, now_ms)
+    }
+
+    /// Record that service began for `client`, and charge it.
+    ///
+    /// The prompt is charged in full and the output at what the cost model
+    /// expects this request to produce, reconciled at [`Scheduler::finish`]
+    /// against what it actually produced. Charging only at the end would let a
+    /// caller start any number of long requests before the first had cost it
+    /// anything.
+    pub fn start_for(&mut self, shape: Shape, client: Option<&Client>, now_ms: u64) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.running.insert(id, Running { shape, started_ms: now_ms });
+        let expected = self.expected_output(shape);
+        let (client_id, weight) = match client {
+            Some(c) => {
+                let w = c.weight.max(1);
+                let charge = Self::units(shape.prompt_tokens, W_INPUT, w)
+                    .saturating_add(Self::units(expected, W_OUTPUT, w));
+                let counter = self.counters.entry(c.id.clone()).or_insert(0);
+                *counter = counter.saturating_add(charge);
+                (Some(c.id.clone()), w)
+            }
+            None => (None, 1),
+        };
+        self.running.insert(
+            id,
+            Running {
+                shape,
+                started_ms: now_ms,
+                client: client_id,
+                weight,
+                charged_output: expected,
+            },
+        );
         id
+    }
+
+    /// Free a slot for a request that never ran, refunding what its caller was
+    /// charged. Teaches the cost model nothing.
+    pub fn abort(&mut self, ticket: u64) {
+        let Some(r) = self.running.remove(&ticket) else {
+            return;
+        };
+        if let Some(client) = r.client.as_deref() {
+            let refund = Self::units(r.shape.prompt_tokens, W_INPUT, r.weight)
+                .saturating_add(Self::units(r.charged_output, W_OUTPUT, r.weight));
+            let counter = self.counters.entry(client.to_string()).or_insert(0);
+            *counter = counter.saturating_sub(refund);
+            self.note_departure(client);
+        }
     }
 
     /// Record completion and teach the cost model. `generated_tokens == 0`
     /// frees the slot without learning anything (the request never ran).
+    ///
+    /// A caller is charged for what its request actually produced. When the
+    /// handler reported nothing, the advance charge stands: an unreported
+    /// request still held the slot, and refunding it would make not reporting
+    /// the cheapest way to use the model.
     pub fn finish(&mut self, ticket: u64, generated_tokens: u64, first_token_ms: Option<u64>, now_ms: u64) {
         let concurrency = self.running.len() as u32;
         let Some(r) = self.running.remove(&ticket) else {
             return;
         };
+        if let Some(client) = r.client.as_deref() {
+            if generated_tokens > 0 {
+                let counter = self.counters.entry(client.to_string()).or_insert(0);
+                if generated_tokens >= r.charged_output {
+                    let extra = Self::units(generated_tokens - r.charged_output, W_OUTPUT, r.weight);
+                    *counter = counter.saturating_add(extra);
+                } else {
+                    let unused = Self::units(r.charged_output - generated_tokens, W_OUTPUT, r.weight);
+                    *counter = counter.saturating_sub(unused);
+                }
+            }
+            self.note_departure(client);
+        }
         self.cost.observe(Observation {
             prompt_tokens: r.shape.prompt_tokens,
             generated_tokens,
@@ -514,7 +786,7 @@ impl Scheduler {
 mod tests {
     use super::*;
 
-    /// A slow decoder: 730 tok/s prefill, 31.6 tok/s decode.
+    /// A bandwidth-bound decoder: 730 tok/s prefill, 31.6 tok/s decode.
     fn slow_decoder() -> CostModel {
         CostModel::from_rates(730, 31)
     }
@@ -717,5 +989,125 @@ mod tests {
         assert_eq!(s.running(), 0);
         assert_eq!(s.cost().samples(), 1);
         assert!((29..=33).contains(&s.cost().decode_tok_per_s()));
+    }
+    fn caller(id: &str) -> Client {
+        Client::new(id, 1)
+    }
+
+    /// Serve whichever waiter the scheduler admits, to completion.
+    fn serve_one(s: &mut Scheduler, waiters: &mut Vec<(u64, Client)>, shape: Shape, now: u64) -> String {
+        let idx = waiters
+            .iter()
+            .position(|(w, _)| s.decide_waiter(*w, shape, now) == Decision::Admit)
+            .expect("a free slot admits someone");
+        let (w, c) = waiters.remove(idx);
+        s.leave(w);
+        let t = s.start_for(shape, Some(&c), now);
+        s.finish(t, shape.max_output_tokens, Some(10), now + 1_000);
+        c.id
+    }
+
+    /// The case this was written for: one caller sending steadily to a
+    /// one-slot model while another arrives. Under arrival order the newcomer
+    /// waits behind every queued request of the steady caller; here it is
+    /// served within two.
+    #[test]
+    fn a_steady_caller_does_not_hold_a_one_slot_model_against_a_newcomer() {
+        let mut s = Scheduler::new(1, Policy::default()).with_cost(slow_decoder());
+        let shape = Shape::new(200, 300);
+        let sweep = caller("key:sweep");
+        let issa = caller("key:issa");
+        let mut waiters: Vec<(u64, Client)> = Vec::new();
+        for i in 0..5 {
+            waiters.push((s.join(&sweep, Class::Interactive, i), sweep.clone()));
+        }
+        for t in 0..3 {
+            serve_one(&mut s, &mut waiters, shape, 10 + t);
+            waiters.push((s.join(&sweep, Class::Interactive, 20 + t), sweep.clone()));
+        }
+        waiters.push((s.join(&issa, Class::Interactive, 100), issa.clone()));
+        let first = serve_one(&mut s, &mut waiters, shape, 200);
+        let second = serve_one(&mut s, &mut waiters, shape, 300);
+        assert!(first == "key:issa" || second == "key:issa", "served {first} then {second}");
+    }
+
+    /// Weight 2 against weight 1, both always backlogged: service splits 2:1.
+    #[test]
+    fn a_heavier_weight_is_served_in_proportion() {
+        let mut s = Scheduler::new(1, Policy::default()).with_cost(slow_decoder());
+        let shape = Shape::new(100, 100);
+        let standard = Client::new("key:standard", 2);
+        let free = Client::new("key:free", 1);
+        let mut waiters = Vec::new();
+        for c in [&standard, &free, &standard, &free] {
+            waiters.push((s.join(c, Class::Batch, 0), c.clone()));
+        }
+        let mut served: HashMap<String, u32> = HashMap::new();
+        for t in 1..=300 {
+            let who = serve_one(&mut s, &mut waiters, shape, t);
+            *served.entry(who.clone()).or_default() += 1;
+            let c = if who == "key:standard" { standard.clone() } else { free.clone() };
+            waiters.push((s.join(&c, Class::Batch, t), c));
+        }
+        let ratio = f64::from(served["key:standard"]) / f64::from(served["key:free"]);
+        assert!((1.8..2.2).contains(&ratio), "ratio {ratio} from {served:?}");
+    }
+
+    /// A caller arriving after idling does not bring banked credit with it.
+    #[test]
+    fn a_caller_back_from_idle_brings_no_banked_credit() {
+        let mut s = Scheduler::new(1, Policy::default()).with_cost(slow_decoder());
+        let shape = Shape::new(100, 100);
+        let busy = caller("key:busy");
+        let mut waiters = vec![
+            (s.join(&busy, Class::Batch, 0), busy.clone()),
+            (s.join(&busy, Class::Batch, 0), busy.clone()),
+        ];
+        for t in 1..=20 {
+            serve_one(&mut s, &mut waiters, shape, t);
+            waiters.push((s.join(&busy, Class::Batch, t), busy.clone()));
+        }
+        s.join(&caller("key:idle"), Class::Batch, 100);
+        assert!(s.service_of("key:idle") >= s.service_of("key:busy"));
+    }
+
+    #[test]
+    fn interactive_callers_rank_ahead_of_batch() {
+        let mut s = Scheduler::new(1, Policy::default()).with_cost(slow_decoder());
+        let shape = Shape::new(10, 10);
+        let t = s.start(shape, 0);
+        let batch = s.join(&caller("key:batch"), Class::Batch, 0);
+        let chat = s.join(&caller("key:chat"), Class::Interactive, 5);
+        s.finish(t, 10, Some(5), 1_000);
+        assert_eq!(s.decide_waiter(chat, shape, 1_000), Decision::Admit);
+        assert!(matches!(s.decide_waiter(batch, shape, 1_000), Decision::Wait { .. }));
+    }
+
+    #[test]
+    fn a_request_that_never_ran_costs_its_caller_nothing() {
+        let mut s = Scheduler::new(1, Policy::default()).with_cost(slow_decoder());
+        let c = caller("key:x");
+        let t = s.start_for(Shape::new(500, 500), Some(&c), 0);
+        assert!(s.service_of("key:x") > 0);
+        s.abort(t);
+        assert_eq!(s.service_of("key:x"), 0);
+        assert_eq!(s.running(), 0);
+    }
+
+    #[test]
+    fn free_slots_admit_the_best_placed_waiters_only() {
+        let mut s = Scheduler::new(2, Policy::default()).with_cost(slow_decoder());
+        let shape = Shape::new(10, 10);
+        let a = s.join(&caller("a"), Class::Batch, 0);
+        let b = s.join(&caller("b"), Class::Batch, 1);
+        let c = s.join(&caller("c"), Class::Batch, 2);
+        assert_eq!(s.decide_waiter(a, shape, 3), Decision::Admit);
+        assert_eq!(s.decide_waiter(b, shape, 3), Decision::Admit);
+        assert!(!matches!(s.decide_waiter(c, shape, 3), Decision::Admit));
+        assert_eq!(s.waiting(), 3);
+        s.leave(a);
+        s.leave(b);
+        s.leave(c);
+        assert_eq!(s.waiting(), 0);
     }
 }

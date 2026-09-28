@@ -11,10 +11,11 @@
 //! ## Slot model
 //!
 //! The context is built with `n_seq_max = max_slots()` KV-cache sequence slots.
-//! Each in-flight request owns one slot (its `seq_id`); the number of admitted
-//! requests never exceeds the slot count, so a `seq_id` is always a valid slot
-//! index. When a request finishes its slot's KV is cleared so a waiting request
-//! can take it.
+//! Each in-flight request owns one slot, and its `seq_id` is that slot's index:
+//! `slots[i]` always holds the sequence decoding into KV sequence `i`. When a
+//! request finishes, its slot keeps the KV (and the checkpoints taken while it
+//! prefilled) for the next request that shares its prefix; see
+//! [`crate::prefix_cache`] for what can be reused on which kind of model.
 //!
 //! ## Scheduler loop
 //!
@@ -25,7 +26,7 @@
 //! samples each sequence from its own logits with its own sampler.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -42,9 +43,13 @@ use tracing::{info, warn};
 
 use crate::config::GenerationConfig;
 use crate::error::{Error, Result};
+use crate::prefix_cache::{
+    CheckpointBudget, CheckpointStore, MediaSpan, MemoryTraits, Namespace, PrefixId, Reuse, Rewind, TurnEnds,
+};
 use crate::prompt::render_chatml_prompt;
 use crate::result::{ChatMessage, InferenceResult, StopReason};
 use crate::stream::{ReasoningFrame, StopStream};
+use crate::toploc::{InferenceCommitment, StepRecord};
 use llama_cpp_2::context::params::LlamaContextType;
 use llama_cpp_2::speculative::{MtpSpeculativeParams, SpeculativeBatch};
 
@@ -55,7 +60,7 @@ use llama_cpp_2::speculative::{MtpSpeculativeParams, SpeculativeBatch};
 const MAX_SLOTS_DEFAULT: usize = 32;
 
 /// Most sequences generating at once for which the engine still drafts,
-/// overridable with `PRAECISE_BATCH_SPEC_MAX_ACTIVE` (0 turns drafting off).
+/// overridable with `BATCH_SPEC_MAX_ACTIVE` (0 turns drafting off).
 ///
 /// Speculation pays when a step's decode is bound by reading the weights and
 /// verifying extra tokens is nearly free. Batching many sequences spends that
@@ -69,13 +74,13 @@ const MAX_SLOTS_DEFAULT: usize = 32;
 /// * DFlash2 block drafter, 7 drafted: 32.8, 67.4, 102.5. Long accepted blocks
 ///   keep paying at sixteen, so a block drafter drafts at every width.
 pub fn spec_max_active(spec_type: i32) -> usize {
-    std::env::var("PRAECISE_BATCH_SPEC_MAX_ACTIVE")
+    std::env::var("BATCH_SPEC_MAX_ACTIVE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(if spec_type == 0 { 2 } else { usize::MAX })
 }
 
-/// Sequence slots, overridable with `PRAECISE_MAX_SLOTS`.
+/// Sequence slots, overridable with `BATCH_MAX_SLOTS`.
 ///
 /// This is `n_seq_max`. On a device that cannot afford `32 x` a useful window,
 /// fewer slots buy back per-request context. The host's admission layer must
@@ -84,7 +89,7 @@ pub fn spec_max_active(spec_type: i32) -> usize {
 pub fn max_slots() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("PRAECISE_MAX_SLOTS")
+        std::env::var("BATCH_MAX_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v > 0)
@@ -93,7 +98,7 @@ pub fn max_slots() -> usize {
 }
 
 /// Physical batch capacity for a single `llama_decode`, overridable with
-/// `PRAECISE_PHYSICAL_BATCH`. Sets `n_batch`/`n_ubatch`; the compute buffer
+/// `BATCH_PHYSICAL_BATCH`. Sets `n_batch`/`n_ubatch`; the compute buffer
 /// scales with it.
 const PHYSICAL_BATCH_DEFAULT: usize = 2048;
 
@@ -101,7 +106,7 @@ const PHYSICAL_BATCH_DEFAULT: usize = 2048;
 fn physical_batch() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("PRAECISE_PHYSICAL_BATCH")
+        std::env::var("BATCH_PHYSICAL_BATCH")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v >= 32)
@@ -142,6 +147,10 @@ pub struct BatchRequest {
     /// Per-token streaming sink. `None` for non-streaming callers; the final
     /// aggregate still returns via `result_tx`.
     pub token_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Streaming sink for the model's reasoning, delivered as it is produced
+    /// and kept apart from `token_tx`. `None` returns the reasoning only in
+    /// [`InferenceResult::thinking`].
+    pub reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Where the terminal [`InferenceResult`] (or error) is delivered.
     pub result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
     /// Images or audio, in the order their markers appear in the prompt. Empty
@@ -164,7 +173,7 @@ pub type Projector = ();
 /// submits to the same scheduler thread.
 #[derive(Clone)]
 pub struct BatchEngine {
-    tx: Sender<BatchRequest>,
+    tx: SyncSender<BatchRequest>,
     inner: Arc<EngineInner>,
 }
 
@@ -250,7 +259,27 @@ impl BatchEngine {
         projector: Option<Projector>,
         speculation: Option<BatchSpeculation>,
     ) -> Result<Self> {
-        let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
+        // This engine generates text a token at a time from a causal cache.
+        // A model that does something else is refused here, with the reason,
+        // rather than served into garbage or a decode error on every request.
+        let traits = memory_traits(&model, swa_full());
+        if traits.reuse() == Reuse::None {
+            return Err(Error::Other(format!(
+                "{} cannot be served by the batch engine: {}",
+                model_id,
+                if traits.diffusion {
+                    "it decodes by diffusion over the whole output, not one token at a time"
+                } else {
+                    "it is an embedding or reranking model (bidirectional or pooled), which \
+                     produces vectors, not text"
+                }
+            )));
+        }
+        // Bounded: each queued request holds its whole prompt and any media
+        // bytes, so a queue without a bound is memory without a bound. One
+        // slot's worth of requests may wait behind the running ones; past
+        // that, `submit` refuses and the caller's admission holds or sheds.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BatchRequest>(max_slots());
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
         let model_id_thread = model_id.clone();
@@ -265,6 +294,7 @@ impl BatchEngine {
                     enable_thinking,
                     projector,
                     speculation,
+                    traits,
                     &rx,
                     &shutdown_rx,
                 ) {
@@ -288,12 +318,20 @@ impl BatchEngine {
 
     /// Submit a request to the scheduler. Returns immediately; the caller awaits
     /// the request's `result_tx` (and drains `token_tx` if streaming).
+    ///
+    /// Never blocks: when as many requests as there are slots are already
+    /// queued behind the running ones, the request is refused with
+    /// [`Error::QueueFull`] for the caller to hold or shed.
     pub fn submit(&self, req: BatchRequest) -> Result<()> {
-        self.tx.send(req).map_err(|_| {
-            Error::Other(format!(
-                "batch engine for {} is no longer running",
-                self.inner.model_id
-            ))
+        self.tx.try_send(req).map_err(|e| match e {
+            TrySendError::Full(_) => Error::QueueFull {
+                model_id: self.inner.model_id.clone(),
+                waiting: max_slots(),
+                max: max_slots(),
+            },
+            TrySendError::Disconnected(_) => {
+                Error::Other(format!("batch engine for {} is no longer running", self.inner.model_id))
+            }
         })
     }
 
@@ -323,25 +361,221 @@ impl Drop for EngineInner {
 
 /// What a slot's KV cache still holds after its request finished.
 ///
-/// The whole point of prefix reuse: an agent's next turn repeats the system
-/// prompt, the tool schemas and the entire conversation so far, and re-reading
-/// those through the model is the single largest cost in an agent loop. Keeping
-/// the tokens that are already in KV lets the next request start where the last
-/// one diverged instead of at zero.
-#[derive(Default, Clone)]
+/// An agent's next turn repeats the system prompt, the tool schemas and the
+/// entire conversation so far, and re-reading those through the model is the
+/// largest avoidable cost in an agent loop. Keeping what is already in KV lets
+/// the next request start where the two diverge instead of at zero.
+#[derive(Default)]
 struct CachedPrefix {
-    /// Tokens resident in this sequence's KV, in order.
-    tokens: Vec<LlamaToken>,
+    /// Identity of every position resident in this sequence's KV, in order:
+    /// prompt, then what was generated.
+    ids: Vec<PrefixId>,
+    /// Media chunks among `ids`.
+    spans: Vec<MediaSpan>,
+    /// Snapshots of the parts of the sequence's memory that cannot be trimmed
+    /// (recurrent state, a sliding window), keyed by identity index.
+    checkpoints: CheckpointStore<llama_cpp_2::SeqState>,
+    /// Whose prompt filled this cache.
+    namespace: Namespace,
+    /// Scheduler tick of the last request served from this slot, for
+    /// evicting the least recently used idle prefix first.
+    last_used: u64,
 }
 
-/// Length of the shared prefix of two token runs.
-fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+impl CachedPrefix {
+    /// The slot's KV was dropped: nothing it recorded describes the cache now.
+    fn forget(&mut self) {
+        self.ids.clear();
+        self.spans.clear();
+        self.checkpoints.clear();
+    }
+
+    /// Keep only the first `n` identity positions (and what describes them).
+    fn truncate(&mut self, n: usize) {
+        self.ids.truncate(n);
+        self.spans.retain(|s| s.at + s.len <= n);
+        self.checkpoints.truncate_after(n);
+    }
+}
+
+/// How this engine reuses prefixes, fixed for its model at spawn.
+struct ReusePolicy {
+    kind: Reuse,
+    /// Tokens the chat template closes a turn with.
+    turn_ends: TurnEnds,
+    /// Checkpoints each slot may hold; 0 when the model needs none or memory
+    /// affords none.
+    per_slot: usize,
+}
+
+/// Fewest prompt tokens between two checkpoints at earlier turn starts: a
+/// turn shorter than this is cheaper to re-prefill than to keep a snapshot
+/// for. The last turn start and the prompt's end are always kept.
+const CHECKPOINT_MIN_SPACING: usize = 256;
+
+/// Most checkpoints per slot the operator allows, from
+/// `BATCH_PROMPT_CHECKPOINTS` (0 turns them off). Memory may allow fewer.
+fn checkpoint_cap() -> usize {
+    std::env::var("BATCH_PROMPT_CHECKPOINTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(crate::prefix_cache::MAX_CHECKPOINTS_PER_SLOT)
+}
+
+/// Whether a sliding-window model keeps every position of its window layers
+/// (`BATCH_SWA_FULL`, on unless set to 0). On, the window layers trim like
+/// full attention and need no checkpoints; off, they hold only the window,
+/// which costs far less memory per slot and is rewound through checkpoints.
+fn swa_full() -> bool {
+    std::env::var("BATCH_SWA_FULL").map_or(true, |v| v.trim() != "0")
+}
+
+/// Read what the loaded model's memory can do.
+fn memory_traits(model: &LlamaModel, swa_full: bool) -> MemoryTraits {
+    let arch = model.meta_val_str("general.architecture").unwrap_or_default();
+    let meta = |key: &str| model.meta_val_str(&format!("{arch}.{key}")).ok();
+    // An encoder attends both ways, and a pooled model is an embedder or a
+    // reranker whatever its attention: neither produces text a token at a time.
+    let bidirectional = meta("attention.causal").is_some_and(|v| v.trim() == "false");
+    let pooled = meta("pooling_type").is_some_and(|v| !matches!(v.trim(), "" | "0"));
+    MemoryTraits {
+        recurrent: model.is_recurrent(),
+        hybrid: model.is_hybrid(),
+        n_swa: model.n_swa(),
+        swa_full,
+        causal: !bidirectional && !pooled,
+        encoder_decoder: model.has_encoder() && model.has_decoder(),
+        diffusion: model.is_diffusion(),
+    }
+}
+
+/// Learn which tokens the model's chat template closes a turn with, by
+/// rendering a short probe conversation and reading the first control token
+/// after each message's content. The vocabulary's end-of-generation tokens are
+/// always included: a template closes the assistant's turn with one.
+fn probe_turn_ends(model: &LlamaModel) -> TurnEnds {
+    let mut ends: Vec<i32> = Vec::new();
+    let probes = ["turnprobeuser", "turnprobereply", "turnprobenext"];
+    let messages = vec![
+        ChatMessage::new("user", probes[0]),
+        ChatMessage::new("assistant", probes[1]),
+        ChatMessage::new("user", probes[2]),
+    ];
+    if let Ok(rendered) = render_prompt(model, &BatchPrompt::Chat(messages), false, None) {
+        for probe in &probes[..2] {
+            let Some(at) = rendered.find(probe) else { continue };
+            let after = &rendered[at + probe.len()..];
+            let Ok(tokens) = model.str_to_token(after, AddBos::Never) else { continue };
+            if let Some(t) = tokens.iter().find(|t| {
+                model.is_eog_token(**t) || model.token_attr(**t).contains(llama_cpp_2::token_type::LlamaTokenAttr::Control)
+            }) {
+                ends.push(t.0);
+            }
+        }
+    }
+    for id in 0..model.n_vocab() {
+        if model.is_eog_token(LlamaToken(id)) {
+            ends.push(id);
+        }
+    }
+    TurnEnds::new(ends)
+}
+
+/// What one checkpoint and one token of KV cost on this context.
+struct StateSizes {
+    /// Bytes of one checkpoint of a slot with a full window (or the fixed
+    /// recurrent state).
+    checkpoint: u64,
+    /// Bytes of KV each cached token takes across every layer.
+    kv_per_token: u64,
+}
+
+/// Measure [`StateSizes`] on the live context by decoding two tokens into
+/// slot 0, reading the serialized state sizes after each, and clearing the
+/// slot again. Measured rather than derived from metadata: the layouts differ
+/// by architecture (gated delta nets, Mamba, RWKV, sliding windows), and the
+/// context already knows what it allocated.
+fn measure_state_sizes(ctx: &mut llama_cpp_2::context::LlamaContext, model: &LlamaModel, kind: Reuse) -> StateSizes {
+    use llama_cpp_2::LlamaStateSeqFlags;
+    let mut sizes = [(0u64, 0u64); 2];
+    let mut batch = LlamaBatch::new(1, 1);
+    for (pos, size) in sizes.iter_mut().enumerate() {
+        batch.clear();
+        if batch.add(model.token_bos(), pos as i32, &[0], false).is_err() || ctx.decode(&mut batch).is_err() {
+            break;
+        }
+        *size = (
+            ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::PARTIAL_ONLY) as u64,
+            ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::empty()) as u64,
+        );
+    }
+    let _ = ctx.clear_kv_cache_seq(Some(0), None, None);
+    let [(partial1, full1), (partial2, full2)] = sizes;
+    let checkpoint = match kind {
+        // The window holds up to `n_swa` positions plus one batch in flight.
+        Reuse::Window { n_swa } => {
+            partial1 + (u64::from(n_swa) + physical_batch() as u64).saturating_mul(partial2.saturating_sub(partial1))
+        }
+        _ => partial2,
+    };
+    StateSizes {
+        checkpoint,
+        kv_per_token: full2.saturating_sub(full1),
+    }
+}
+
+/// The checkpoint budget this host affords, and whether checkpoints draw on
+/// the same memory as the KV cache.
+///
+/// Checkpoints are host memory. They share it with the KV cache when there is
+/// no accelerator (CPU serving) or the accelerator's memory is the host's
+/// (integrated GPUs, Apple silicon, GB10-class superchips whose GPU reports the
+/// host's memory as its own); there, room for checkpoints can be bought with
+/// context. On a discrete GPU the KV cache lives in device memory and
+/// checkpoints do not compete with it.
+///
+/// Both are read from the backend's device list at load. An operator can
+/// override either: `BATCH_CHECKPOINT_MEMORY` is the bytes checkpoints may use
+/// across every slot, and `BATCH_UNIFIED_MEMORY` (1 or 0) says whether they
+/// share memory with the KV cache.
+fn host_checkpoint_budget(checkpoint_bytes: u64) -> (CheckpointBudget, bool) {
+    use llama_cpp_2::LlamaBackendDeviceType as Kind;
+    let env = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let devices = llama_cpp_2::list_llama_ggml_backend_devices();
+    let host = devices.iter().find(|d| d.device_type == Kind::Cpu);
+    let (free, total) = host.map_or((0, 0), |d| (d.memory_free as u64, d.memory_total as u64));
+    let accelerators: Vec<_> = devices
+        .iter()
+        .filter(|d| matches!(d.device_type, Kind::Gpu | Kind::IntegratedGpu | Kind::Accelerator))
+        .collect();
+    let unified = env("BATCH_UNIFIED_MEMORY").map_or_else(
+        || {
+            accelerators.is_empty()
+                || accelerators.iter().any(|d| {
+                    d.device_type == Kind::IntegratedGpu
+                        || d.backend.starts_with("Metal")
+                        || d.backend.starts_with("MTL")
+                        || (total > 0 && d.memory_total as u64 >= total / 10 * 9)
+                })
+        },
+        |v| v != 0,
+    );
+    let budget = match env("BATCH_CHECKPOINT_MEMORY") {
+        Some(bytes) => crate::prefix_cache::budget_of(bytes, max_slots(), checkpoint_bytes),
+        None => crate::prefix_cache::checkpoint_budget(free, total, max_slots(), checkpoint_bytes),
+    };
+    (budget, unified)
+}
+
+/// Identity of a text-only prompt.
+fn text_ids(tokens: &[LlamaToken]) -> Vec<PrefixId> {
+    tokens.iter().map(|t| crate::prefix_cache::text_id(t.0)).collect()
 }
 
 /// A running sequence occupying one slot.
 struct Sequence {
-    /// KV-cache sequence id == slot index.
+    /// KV-cache sequence id, always the index of the slot holding this
+    /// sequence (asserted wherever a slot is read).
     seq_id: i32,
     sampler: LlamaSampler,
     token_tx: Option<tokio::sync::mpsc::Sender<String>>,
@@ -349,16 +583,36 @@ struct Sequence {
     decoder: encoding_rs::Decoder,
     /// Prompt tokens staged by `admit`, waiting for the scheduler to prefill
     /// them. `None` once the whole prompt has been committed to the KV cache.
+    /// A media chunk's positions hold a placeholder token; the media step
+    /// evaluates them, never the text prefill.
     pending_prompt: Option<Vec<LlamaToken>>,
-    /// How many tokens of `pending_prompt` are already committed.
+    /// How many positions of the prompt are already committed.
     prefill_cursor: usize,
     /// Next KV position for this sequence.
     n_past: i32,
     /// Every token committed to this sequence's KV — prompt then generated —
     /// so the next request on this slot can measure its shared prefix.
     resident: Vec<LlamaToken>,
+    /// Identity of the prompt, position for position.
+    prompt_ids: Vec<PrefixId>,
+    /// Media chunks in the prompt, in order.
+    media_spans: Vec<MediaSpan>,
+    /// Whose prompt this is.
+    namespace: Namespace,
+    /// Prompt positions at which to snapshot the sequence's memory, ascending.
+    cuts: Vec<usize>,
+    /// Prompt positions taken from the slot's cache instead of prefilled.
+    cached_tokens: u32,
+    /// Activation commitment being recorded, when the request asked for one.
+    commitment: Option<CommitmentLog>,
     input_tokens: u32,
+    /// Every token emitted after the prompt, sampled or forced: what the
+    /// sequence occupies in the cache and what the commitment records.
     output_tokens: u32,
+    /// Of those, the tokens the engine forced (a reasoning block's close
+    /// marker). They were never generated by the model, so they are not
+    /// reported as generated output.
+    forced_tokens: u32,
     /// Absolute position ceiling: `input_tokens + max_tokens`, capped at context.
     max_pos: i32,
     /// Accumulates decoded pieces, trims a configured stop sequence out of the
@@ -386,9 +640,61 @@ struct Sequence {
     forced: std::collections::VecDeque<LlamaToken>,
     /// Whether the budget has already closed the block once.
     budget_closed: bool,
-    /// Media prefill waiting for the scheduler.
+    /// Media chunks waiting for the scheduler's media step.
     #[cfg(feature = "mtmd")]
-    pending_media: Option<MtmdInputChunks>,
+    pending_media: Option<PendingMedia>,
+}
+
+/// A multimodal prompt's chunks, and which chunk each media span is.
+#[cfg(feature = "mtmd")]
+struct PendingMedia {
+    chunks: MtmdInputChunks,
+    /// Chunk index of each entry of the sequence's `media_spans`.
+    chunk_of_span: Vec<usize>,
+}
+
+/// The top-k logits recorded at every generated token, for a verifiable
+/// request.
+struct CommitmentLog {
+    k: usize,
+    steps: Vec<StepRecord>,
+    /// A step whose logits could not be read (a prompt that ended in a media
+    /// chunk leaves them only in llama.cpp's last row). Such a log cannot be
+    /// verified, so none is returned.
+    incomplete: bool,
+}
+
+impl CommitmentLog {
+    fn new(config: &GenerationConfig) -> Option<Self> {
+        config.commitment_k.map(|k| Self {
+            k: usize::from(crate::toploc::commitment_k_for(k)),
+            steps: Vec::new(),
+            incomplete: false,
+        })
+    }
+
+    /// Record the logits row a token is about to be sampled from.
+    fn top_k(&self, ctx: &llama_cpp_2::context::LlamaContext, logits_idx: i32) -> Option<Vec<crate::toploc::TopKEntry>> {
+        (logits_idx >= 0).then(|| crate::toploc::top_k_from_logits(ctx.get_logits_ith(logits_idx), self.k))
+    }
+
+    fn push(&mut self, token: LlamaToken, top_k: Option<Vec<crate::toploc::TopKEntry>>) {
+        match top_k {
+            Some(top_k) => self.steps.push(StepRecord {
+                token_id: token.0 as u32,
+                top_k,
+            }),
+            None => self.incomplete = true,
+        }
+    }
+
+    fn finish(self, prompt_tokens: u32) -> Option<InferenceCommitment> {
+        (!self.incomplete && !self.steps.is_empty()).then(|| InferenceCommitment {
+            k: self.k as u8,
+            prompt_tokens,
+            steps: self.steps,
+        })
+    }
 }
 
 /// One row of a step's batch, recorded so the step can be undone.
@@ -447,24 +753,27 @@ fn rollback_step(slots: &mut [Option<Sequence>], step: Vec<StepRow>) {
     }
 }
 
-/// Free the KV held by idle slots' cached prefixes. True when anything was
-/// freed. Reuse is an optimisation; a request that cannot run is not.
-fn evict_idle_prefixes(
+/// Free the KV held by the least recently used idle slot's cached prefix.
+/// True when one was freed. Called once per failed step, so under pressure
+/// the coldest conversations go one at a time until the step fits, and the
+/// warm ones survive. Reuse is an optimisation; a request that cannot run is
+/// not.
+fn evict_idle_prefix(
     ctx: &mut llama_cpp_2::context::LlamaContext,
     draft: &mut Option<llama_cpp_2::context::LlamaContext<'_>>,
     slots: &[Option<Sequence>],
     cached: &mut [CachedPrefix],
 ) -> bool {
-    let mut freed = false;
-    for (i, c) in cached.iter_mut().enumerate() {
-        if slots[i].is_none() && !c.tokens.is_empty() {
-            let _ = ctx.clear_kv_cache_seq(Some(i as u32), None, None);
-            draft_seq_rm(draft, i as i32, None);
-            c.tokens.clear();
-            freed = true;
-        }
-    }
-    freed
+    let Some(i) = (0..cached.len())
+        .filter(|&i| slots[i].is_none() && !cached[i].ids.is_empty())
+        .min_by_key(|&i| cached[i].last_used)
+    else {
+        return false;
+    };
+    let _ = ctx.clear_kv_cache_seq(Some(i as u32), None, None);
+    draft_seq_rm(draft, i as i32, None);
+    cached[i].forget();
+    true
 }
 
 /// Stop the running sequence holding the most of the shared pool, so the
@@ -488,7 +797,7 @@ fn fail_largest_sequence(
     if let Some(mut seq) = slots[idx].take() {
         let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
         draft_seq_rm(draft, seq.seq_id, None);
-        cached[idx].tokens.clear();
+        cached[idx].forget();
         warn!(
             "shared KV pool for {} is full: stopping the request holding {} positions so the others can continue",
             model_id, seq.n_past
@@ -514,11 +823,16 @@ fn sample_into(
     let Some(seq) = slots[slot_idx].as_mut() else {
         return false;
     };
+    debug_assert_eq!(seq.seq_id as usize, slot_idx, "a slot decodes only its own KV sequence");
+    let top_k = seq.commitment.as_ref().map(|c| c.top_k(ctx, logits_idx));
     let token = next_token(seq, ctx, logits_idx);
     seq.sampler.accept(token);
 
     if model.is_eog_token(token) {
         return true;
+    }
+    if let (Some(log), Some(top_k)) = (seq.commitment.as_mut(), top_k) {
+        log.push(token, top_k);
     }
     let mut free_slot = false;
     match model.token_to_piece(token, &mut seq.decoder, true, None) {
@@ -575,7 +889,10 @@ fn close_marker_tokens(model: &LlamaModel, frame: ReasoningFrame) -> Vec<LlamaTo
 /// reasoning block, otherwise a sample from its logits row.
 fn next_token(seq: &mut Sequence, ctx: &llama_cpp_2::context::LlamaContext, logits_idx: i32) -> LlamaToken {
     match seq.forced.pop_front() {
-        Some(token) => token,
+        Some(token) => {
+            seq.forced_tokens += 1;
+            token
+        }
         None => seq.sampler.sample(ctx, logits_idx),
     }
 }
@@ -623,12 +940,18 @@ fn sample_block_into(
     let Some(seq) = slots[slot_idx].as_mut() else {
         return (false, 0);
     };
+    debug_assert_eq!(seq.seq_id as usize, slot_idx, "a slot decodes only its own KV sequence");
     let mut accepted: u16 = 0;
     for i in 0..=drafts.len() {
-        let token = next_token(seq, ctx, first_idx + i as i32);
+        let row = first_idx + i as i32;
+        let top_k = seq.commitment.as_ref().map(|c| c.top_k(ctx, row));
+        let token = next_token(seq, ctx, row);
         seq.sampler.accept(token);
         if model.is_eog_token(token) {
             return (true, accepted);
+        }
+        if let (Some(log), Some(top_k)) = (seq.commitment.as_mut(), top_k) {
+            log.push(token, top_k);
         }
         let matched = i < drafts.len() && token == drafts[i];
         let mut finished = false;
@@ -663,8 +986,53 @@ fn sample_block_into(
     unreachable!("the row after the last draft never matches a draft")
 }
 
+/// A finished sequence whose streaming receiver has not taken every chunk
+/// yet. Its result is delivered once the stream is, so a caller that reads
+/// the stream to its end and then the result sees all of the text.
+struct Draining {
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
+    stream: StopStream,
+    result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
+    result: InferenceResult,
+    since: Instant,
+}
+
+/// How long a finished sequence's stream may take to drain before its
+/// receiver is given up on.
+const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The error a sequence ends with when its streaming receiver stops reading.
+fn stalled_stream() -> Error {
+    Error::Inference(
+        "the streaming client stopped reading; the request was ended so it no longer holds \
+         back other requests"
+            .into(),
+    )
+}
+
+/// Hand queued chunks to every draining receiver, and deliver each result
+/// whose stream has been fully taken, whose receiver is gone, or which has
+/// waited past [`STREAM_DRAIN_TIMEOUT`].
+fn drain_streams(draining: &mut Vec<Draining>) {
+    let mut i = 0;
+    while i < draining.len() {
+        let d = &mut draining[i];
+        // A receiver that is gone has nothing left to wait for.
+        let delivered = !d.stream.flush(d.tx.as_ref()) || d.stream.delivered();
+        if delivered || d.since.elapsed() >= STREAM_DRAIN_TIMEOUT {
+            let d = draining.swap_remove(i);
+            let _ = d.result_tx.send(if delivered { Ok(d.result) } else { Err(stalled_stream()) });
+        } else {
+            i += 1;
+        }
+    }
+}
+
 impl Sequence {
-    fn finish(mut self) {
+    /// Deliver the result, or, when the stream still has chunks the receiver
+    /// has not taken, hand the sequence's stream to the drain list and deliver
+    /// the result once it has.
+    fn finish(mut self) -> Option<Draining> {
         let elapsed = self.started.elapsed();
         let generation_time_ms = elapsed.as_millis() as u64;
         let tokens_per_second = if generation_time_ms > 0 {
@@ -683,19 +1051,35 @@ impl Sequence {
             StopReason::Eos
         };
         let token_tx = self.token_tx.take();
-        let (text, thinking) = self.stream.finish_parts(token_tx.as_ref());
-        if let Some(result_tx) = self.result_tx.take() {
-            let _ = result_tx.send(Ok(InferenceResult {
-                text,
-                thinking,
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                generation_time_ms,
-                tokens_per_second,
-                stop_reason,
-                commitment: None,
-            }));
+        let stalled = self.stream.stalled();
+        let (text, thinking) = self.stream.close(token_tx.as_ref());
+        let result_tx = self.result_tx.take()?;
+        if stalled {
+            let _ = result_tx.send(Err(stalled_stream()));
+            return None;
         }
+        let result = InferenceResult {
+            text,
+            thinking,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens - self.forced_tokens,
+            generation_time_ms,
+            tokens_per_second,
+            stop_reason,
+            commitment: self.commitment.take().and_then(|c| c.finish(self.input_tokens)),
+            cached_tokens: self.cached_tokens,
+        };
+        if self.stream.delivered() {
+            let _ = result_tx.send(Ok(result));
+            return None;
+        }
+        Some(Draining {
+            tx: token_tx,
+            stream: self.stream,
+            result_tx,
+            result,
+            since: Instant::now(),
+        })
     }
 
     fn fail(&mut self, err: Error) {
@@ -722,34 +1106,86 @@ fn scheduler_loop(
     enable_thinking: bool,
     projector: Option<Projector>,
     speculation: Option<BatchSpeculation>,
+    traits: MemoryTraits,
     rx: &Receiver<BatchRequest>,
     shutdown_rx: &Receiver<()>,
 ) -> Result<()> {
     use std::num::NonZeroU32;
 
     let n_ctx = NonZeroU32::new(context_length).unwrap_or(NonZeroU32::new(8192).unwrap());
+    let kind = traits.reuse();
 
     // One long-lived context with max_slots() sequence slots. n_batch/n_ubatch
     // cover the interleaved prefill+extend batch.
-    let mut ctx_params = LlamaContextParams::default()
-        .with_n_ctx(Some(n_ctx))
-        .with_n_seq_max(max_slots() as u32)
-        // One KV pool shared by every sequence. Without it `n_ctx` is split
-        // evenly, so each request is capped at `n_ctx / slots` however little
-        // the others use — at 32 slots a 131k model answers in 4k.
-        .with_kv_unified(true)
-        .with_n_batch(physical_batch() as u32)
-        .with_n_ubatch(physical_batch() as u32);
-    // Rejected drafts are rolled back out of the target's KV. A model whose
-    // layers carry recurrent state cannot rewind by position, so it keeps this
-    // many snapshots per sequence to roll back to.
-    if let Some(s) = speculation.as_ref() {
-        ctx_params = ctx_params.with_n_rs_seq(u32::from(s.n_max));
-    }
+    let context_params = |n_ctx: NonZeroU32| {
+        let mut params = LlamaContextParams::default()
+            .with_n_ctx(Some(n_ctx))
+            .with_n_seq_max(max_slots() as u32)
+            // One KV pool shared by every sequence. Without it `n_ctx` is split
+            // evenly, so each request is capped at `n_ctx / slots` however little
+            // the others use — at 32 slots a 131k model answers in 4k.
+            .with_kv_unified(true)
+            .with_swa_full(traits.swa_full)
+            .with_n_batch(physical_batch() as u32)
+            .with_n_ubatch(physical_batch() as u32);
+        // Rejected drafts are rolled back out of the target's KV. A model whose
+        // layers carry recurrent state cannot rewind by position, so it keeps this
+        // many snapshots per sequence to roll back to.
+        if let Some(s) = speculation.as_ref() {
+            params = params.with_n_rs_seq(u32::from(s.n_max));
+        }
+        params
+    };
 
     let mut ctx = model
-        .new_context(backend, ctx_params)
+        .new_context(backend, context_params(n_ctx))
         .map_err(|e| Error::Other(format!("batch context init failed: {}", e)))?;
+
+    // What prefix reuse costs and affords on this model and this host.
+    let mut per_slot = 0;
+    if kind.needs_checkpoints() && checkpoint_cap() > 0 {
+        let sizes = measure_state_sizes(&mut ctx, &model, kind);
+        let (mut budget, unified) = host_checkpoint_budget(sizes.checkpoint);
+        // Where checkpoints and the KV cache draw on the same memory, a
+        // context too large to leave room for the fewest useful checkpoints is
+        // shrunk until it does, never below a quarter of what was asked or 8K.
+        if unified
+            && let Some(release) = crate::prefix_cache::context_to_release(
+                budget,
+                max_slots(),
+                sizes.checkpoint,
+                sizes.kv_per_token,
+                ctx.n_ctx(),
+                (n_ctx.get() / 4).max(8192),
+            )
+        {
+            let smaller = NonZeroU32::new(ctx.n_ctx() - release).expect("above the floor");
+            drop(ctx);
+            ctx = model
+                .new_context(backend, context_params(smaller))
+                .map_err(|e| Error::Other(format!("batch context init failed: {}", e)))?;
+            budget = host_checkpoint_budget(sizes.checkpoint).0;
+            info!(
+                "batch engine for {}: context {} -> {} tokens, so every slot can keep its checkpoints",
+                model_id, n_ctx, smaller
+            );
+        }
+        per_slot = budget.per_slot.min(checkpoint_cap());
+        info!(
+            "batch engine for {}: {:?} memory, {} checkpoints per slot of {} bytes each ({} bytes budgeted{})",
+            model_id,
+            kind,
+            per_slot,
+            sizes.checkpoint,
+            budget.bytes,
+            if unified { ", shared with the KV cache" } else { "" },
+        );
+    }
+    let policy = ReusePolicy {
+        kind,
+        turn_ends: if per_slot > 0 { probe_turn_ends(&model) } else { TurnEnds::default() },
+        per_slot,
+    };
 
     let ctx_size = ctx.n_ctx() as i32;
 
@@ -832,11 +1268,36 @@ fn scheduler_loop(
     // What each slot's KV still holds between requests, so a follow-up turn can
     // start from the divergence instead of from zero.
     let mut cached: Vec<CachedPrefix> = (0..max_slots()).map(|_| CachedPrefix::default()).collect();
+    // Finished sequences whose streams are still being handed over.
+    let mut draining: Vec<Draining> = Vec::new();
+    // An encoder-decoder model keeps one encoder output in its context, so it
+    // decodes one request at a time; the others wait here, in order.
+    let mut waiting: std::collections::VecDeque<BatchRequest> = std::collections::VecDeque::new();
+    // The encoder input whose output the context currently holds.
+    let mut encoded: Option<(Namespace, Vec<LlamaToken>)> = None;
+    // Counts admissions, for least-recently-used eviction.
+    let mut tick: u64 = 0;
     let mut batch = LlamaBatch::new(physical_batch(), max_slots() as i32);
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
+        }
+
+        drain_streams(&mut draining);
+        // A receiver that fell behind gets what is queued for it now; one that
+        // has stalled ends its own sequence, and no one else's.
+        for slot_idx in 0..slots.len() {
+            let stalled = slots[slot_idx].as_mut().is_some_and(|s| {
+                s.stream.flush(s.token_tx.as_ref());
+                s.stream.stalled()
+            });
+            if stalled && let Some(mut seq) = slots[slot_idx].take() {
+                let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
+                draft_seq_rm(&mut draft_ctx, seq.seq_id, None);
+                cached[slot_idx].forget();
+                seq.fail(stalled_stream());
+            }
         }
 
         // Cancellation sweep: free any slot whose client is gone before more GPU
@@ -855,110 +1316,76 @@ fn scheduler_loop(
                 // it would promise the next request a prefix that is no longer
                 // resident, and it would prefill from a position the cache
                 // cannot satisfy.
-                cached[slot_idx].tokens.clear();
+                cached[slot_idx].forget();
             }
         }
 
+        // An encoder-decoder model decodes one request at a time.
+        let capacity = if policy.kind == Reuse::EncoderOutput { 1 } else { slots.len() };
         let active = slots.iter().filter(|s| s.is_some()).count();
 
         // Admit new requests into free slots. When idle, block (bounded) on the
         // first one so the thread parks instead of spinning; then drain the rest
         // non-blocking.
-        if active == 0 {
+        if active == 0 && waiting.is_empty() {
             match rx.recv_timeout(IDLE_POLL) {
-                Ok(req) => {
-                    if let Some(r) = admit(
-                        &model,
-                        ctx_size,
-                        &mut slots,
-                        &mut cached,
-                        req,
-                        enable_thinking,
-                        projector.as_ref(),
-                    ) {
-                        let reuse_slot = r.slot_idx;
-                        apply_prefix_reuse(&mut ctx, &mut slots, &mut cached, r);
-                        let held = cached[reuse_slot].tokens.len() as u32;
-                        draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held));
-                    }
-                }
+                Ok(req) => waiting.push_back(req),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         // Fill any remaining free slots without blocking.
-        while slots.iter().any(|s| s.is_none()) {
-            match rx.try_recv() {
-                Ok(req) => {
-                    if let Some(r) = admit(
-                        &model,
-                        ctx_size,
-                        &mut slots,
-                        &mut cached,
-                        req,
-                        enable_thinking,
-                        projector.as_ref(),
-                    ) {
-                        let reuse_slot = r.slot_idx;
-                        apply_prefix_reuse(&mut ctx, &mut slots, &mut cached, r);
-                        let held = cached[reuse_slot].tokens.len() as u32;
-                        draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held));
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+        while slots.iter().filter(|s| s.is_some()).count() < capacity {
+            let req = match waiting.pop_front() {
+                Some(req) => req,
+                None => match rx.try_recv() {
+                    Ok(req) => req,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                },
+            };
+            tick += 1;
+            if policy.kind == Reuse::EncoderOutput {
+                admit_encoder_decoder(&model, &mut ctx, ctx_size, &mut slots, &mut cached, req, enable_thinking, &mut encoded);
+                continue;
+            }
+            if let Some(r) = admit(
+                &model,
+                ctx_size,
+                &mut slots,
+                &mut cached,
+                &policy,
+                req,
+                enable_thinking,
+                projector.as_ref(),
+            ) {
+                let reuse_slot = r.slot_idx;
+                cached[reuse_slot].last_used = tick;
+                let held = apply_prefix_reuse(&mut ctx, &mut slots, &mut cached, &policy, r);
+                draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held as u32));
             }
         }
 
-        // Media prefill, at most one per step. `eval_chunks` encodes the media
-        // and decodes its embeddings for that one sequence on the shared
+        // Media prefill, at most one chunk per step. A media chunk is encoded
+        // and its embeddings decoded for that one sequence on the shared
         // context, switching to non-causal attention where the projector needs
         // it; that switch is context-wide, which is why media cannot share a
-        // batch with other sequences' tokens. One per step bounds how long
-        // decoding sequences wait behind an image.
+        // batch with other sequences' tokens. The text around it is prefilled
+        // in the ordinary batch, and a chunk the slot's cache already holds is
+        // never evaluated at all. One chunk per step bounds how long decoding
+        // sequences wait behind an image.
         #[cfg(feature = "mtmd")]
         if let Some(projector) = projector.as_ref() {
-            let next = slots
-                .iter()
-                .position(|s| s.as_ref().is_some_and(|q| q.pending_media.is_some()));
-            if let Some(slot_idx) = next {
-                let (chunks, n_past, seq_id) = {
-                    let seq = slots[slot_idx].as_mut().expect("found above");
-                    (
-                        seq.pending_media.take().expect("filtered above"),
-                        seq.n_past,
-                        seq.seq_id,
-                    )
-                };
-                let n_batch = ctx.n_batch() as i32;
-                match chunks.eval_chunks(projector, &ctx, n_past, seq_id, n_batch, true) {
-                    Ok(new_n_past) => {
-                        if let Some(seq) = slots[slot_idx].as_mut() {
-                            seq.n_past = new_n_past;
-                        }
-                        if sample_into(&model, &ctx, &mut slots, slot_idx, -1, model_id) {
-                            finalize_and_free(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, slot_idx);
-                        }
-                    }
-                    Err(e) => {
-                        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-                        draft_seq_rm(&mut draft_ctx, seq_id, None);
-                        if evict_idle_prefixes(&mut ctx, &mut draft_ctx, &slots, &mut cached) {
-                            // Room was made; try this request again next step.
-                            if let Some(seq) = slots[slot_idx].as_mut() {
-                                seq.n_past = 0;
-                                seq.pending_media = Some(chunks);
-                            }
-                        } else if let Some(mut seq) = slots[slot_idx].take() {
-                            cached[slot_idx].tokens.clear();
-                            seq.fail(Error::Inference(format!(
-                                "multimodal prefill failed: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-            }
+            media_step(
+                &model,
+                &mut ctx,
+                &mut draft_ctx,
+                projector,
+                &mut slots,
+                &mut cached,
+                policy.kind,
+                &mut draining,
+                model_id,
+            );
         }
 
         // Draft for every sequence that is generating. The drafter writes its
@@ -1058,8 +1485,18 @@ fn scheduler_loop(
                 .saturating_sub(batch.n_tokens() as usize)
                 .min(PREFILL_CHUNK);
             let start = seq.prefill_cursor;
-            let end = prompt.len().min(start + room);
+            // Stop at the next checkpoint cut, so the state after this step is
+            // the state at the cut, and before the next media chunk, which the
+            // media step evaluates on its own.
+            let next_cut = seq.cuts.iter().copied().find(|&c| c > start).unwrap_or(usize::MAX);
+            let next_media = seq.media_spans.iter().map(|s| s.at).find(|&a| a >= start).unwrap_or(usize::MAX);
+            let end = prompt.len().min(start + room).min(next_cut).min(next_media);
             let last = prompt.len() - 1;
+            if end <= start {
+                // Waiting on the media step.
+                seq.pending_prompt = Some(prompt);
+                continue;
+            }
 
             let mut cursor = start;
             while cursor < end {
@@ -1108,8 +1545,8 @@ fn scheduler_loop(
                 // idle to drop, stop the request holding the most of the pool
                 // rather than every request in the batch.
                 rollback_step(&mut slots, step);
-                if evict_idle_prefixes(&mut ctx, &mut draft_ctx, &slots, &mut cached) {
-                    info!("shared KV pool for {} was full: dropped idle cached prefixes", model_id);
+                if evict_idle_prefix(&mut ctx, &mut draft_ctx, &slots, &mut cached) {
+                    info!("shared KV pool for {} was full: dropped the least recently used idle prefix", model_id);
                 } else {
                     fail_largest_sequence(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, model_id);
                 }
@@ -1124,7 +1561,7 @@ fn scheduler_loop(
                     // not leave a cache record behind, or one decode failure
                     // becomes a permanent one for every later request on the
                     // slot.
-                    cached[*slot_idx].tokens.clear();
+                    cached[*slot_idx].forget();
                     seq.fail(Error::Inference(format!("decode failed: {}", e)));
                 }
             }
@@ -1164,6 +1601,27 @@ fn scheduler_loop(
             }
         }
 
+        // A prefill that stopped at a checkpoint cut leaves the sequence's
+        // memory exactly as it stands after the cut: nothing past it has been
+        // decoded yet. Keep the part that cannot be trimmed (recurrent state, a
+        // sliding window), so a later request on this slot that diverges past
+        // the cut can rewind here. Taken only after the decode succeeded: a
+        // step rolled back for want of KV room never reaches this point.
+        if policy.per_slot > 0 {
+            for row in &step {
+                let StepRow::PrefillPart { slot, .. } = row else { continue };
+                let Some(seq) = slots[*slot].as_ref() else { continue };
+                let at = seq.prefill_cursor;
+                if !seq.cuts.contains(&at) {
+                    continue;
+                }
+                match ctx.state_seq_get(seq.seq_id, llama_cpp_2::LlamaStateSeqFlags::PARTIAL_ONLY) {
+                    Ok(state) => cached[*slot].checkpoints.insert(at, state, policy.per_slot),
+                    Err(e) => warn!("checkpoint at {} for slot {} not taken: {}", at, slot, e),
+                }
+            }
+        }
+
         // Sample each sequence from its own logits index.
         for (logits_idx, slot_idx) in logits_slot {
             let block = std::mem::take(&mut drafts[slot_idx]);
@@ -1183,7 +1641,7 @@ fn scheduler_loop(
                 done
             };
             if done {
-                finalize_and_free(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, slot_idx);
+                finalize_and_free(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, policy.kind, slot_idx, &mut draining);
             }
         }
     }
@@ -1193,6 +1651,14 @@ fn scheduler_loop(
         if let Some(mut seq) = slot.take() {
             seq.fail(Error::Other("batch engine shutting down".into()));
         }
+    }
+    for req in waiting {
+        let _ = req.result_tx.send(Err(Error::Other("batch engine shutting down".into())));
+    }
+    // Finished results still waiting on their streams are delivered as they
+    // are: the engine will not flush them again.
+    for d in draining {
+        let _ = d.result_tx.send(Ok(d.result));
     }
 
     // The speculator points into both contexts, and the draft context into
@@ -1207,28 +1673,44 @@ fn scheduler_loop(
 }
 
 /// Finalize a finished sequence and free its slot, keeping its KV for reuse.
+#[allow(clippy::too_many_arguments)]
 fn finalize_and_free(
     ctx: &mut llama_cpp_2::context::LlamaContext,
     draft: &mut Option<llama_cpp_2::context::LlamaContext<'_>>,
     slots: &mut [Option<Sequence>],
     cached: &mut [CachedPrefix],
+    kind: Reuse,
     slot_idx: usize,
+    draining: &mut Vec<Draining>,
 ) {
-    if let Some(seq) = slots[slot_idx].take() {
-        if seq.multimodal {
-            // Media embeddings occupy positions no token list describes, so this
-            // KV is dropped rather than offered to the next request as a prefix.
-            let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
-            draft_seq_rm(draft, seq.seq_id, None);
-            cached[slot_idx].tokens.clear();
-        } else {
-            // Keep the KV. The next request on this slot is very often the same
-            // conversation one turn later, and re-decoding a prefix we already
-            // hold is the largest avoidable cost in an agent loop. `admit` trims
-            // whatever the next prompt diverges from.
-            cached[slot_idx].tokens = seq.resident.clone();
-        }
-        seq.finish();
+    let Some(seq) = slots[slot_idx].take() else {
+        return;
+    };
+    debug_assert_eq!(seq.seq_id as usize, slot_idx, "a slot decodes only its own KV sequence");
+    let c = &mut cached[slot_idx];
+    if kind.keeps_cache() {
+        // Keep the KV. The next request on this slot is very often the same
+        // conversation one turn later, and re-decoding a prefix already held is
+        // the largest avoidable cost in an agent loop. The next admission
+        // rewinds whatever its prompt diverges from. What the slot holds is the
+        // prompt exactly as it was prefilled (media included, by content), then
+        // every generated token that reached KV.
+        let prompt_len = seq.prompt_ids.len();
+        c.ids.clear();
+        c.ids.extend_from_slice(&seq.prompt_ids);
+        c.ids.extend(seq.resident.get(prompt_len..).unwrap_or_default().iter().map(|t| crate::prefix_cache::text_id(t.0)));
+        c.spans.clone_from(&seq.media_spans);
+        c.namespace = seq.namespace;
+        c.checkpoints.truncate_after(c.ids.len());
+    } else {
+        // An encoder-decoder's decoder cache depends on the encoder output,
+        // which the next request may replace; it is never offered as a prefix.
+        let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
+        draft_seq_rm(draft, seq.seq_id, None);
+        c.forget();
+    }
+    if let Some(d) = seq.finish() {
+        draining.push(d);
     }
 }
 
@@ -1238,99 +1720,126 @@ fn finalize_and_free(
 /// Order matters: the trim must happen before the scheduler decodes anything
 /// into this sequence, or the new tokens would be written on top of positions
 /// still holding the previous request's.
+///
+/// Returns the KV position prefill resumes from, which is also how much of
+/// the draft context still matches.
 fn apply_prefix_reuse(
     ctx: &mut llama_cpp_2::context::LlamaContext,
     slots: &mut [Option<Sequence>],
     cached: &mut [CachedPrefix],
+    policy: &ReusePolicy,
     r: PrefixReuse,
-) {
+) -> usize {
+    let slot = r.slot_idx;
+    let c = &mut cached[slot];
+    // Where a sliding window has moved to: positions below it are gone.
+    let pos_min = i64::from(ctx.kv_cache_seq_pos_min(slot as i32));
+    let planned =
+        crate::prefix_cache::plan_rewind(policy.kind, c.ids.len(), r.shared, &c.checkpoints.positions(), pos_min);
+
     // Everything from the divergence onward was computed under a different
-    // prefix, so it is wrong rather than merely old. `None` for the end means
-    // "to the end of the sequence".
-    let seq = r.slot_idx as u32;
-
-    // Nothing past the reused span means nothing to drop. This is the ordinary
-    // agent turn — the conversation grew, so the new prompt starts with the
-    // whole of the old one — and it is also the only case that works on a model
-    // whose layers carry recurrent state, because such a cache can be cleared
-    // but not rewound to an arbitrary position. Asking it to trim here would be
-    // refused and would cost us the reuse we already have.
-    if r.reused > 0 && r.reused == r.cached_len {
-        cached[r.slot_idx].tokens = r.prompt[..r.reused].to_vec();
-        tracing::info!(
-            slot = r.slot_idx,
-            reused_tokens = r.reused,
-            prompt_tokens = r.prompt.len(),
-            "prefix cache hit (extension, no trim needed)"
-        );
-        return;
-    }
-
-    let removed = ctx
-        .clear_kv_cache_seq(Some(seq), Some(r.reused as u32), None)
-        .unwrap_or(false);
-
-    // Trust the trim only after confirming it. `llama_memory_seq_rm` returns
-    // true without removing anything when a cache shares cells, and a cache
-    // that kept its old positions is not a slow path — on an M-RoPE model the
-    // next batch must start strictly beyond the highest cached position, so a
-    // stale entry makes the request unschedulable and it fails outright.
-    // Verify against the cache itself rather than the return value.
-    let stale = ctx.kv_cache_seq_pos_max(r.slot_idx as i32) >= r.reused as i32;
-
-    if !removed || stale {
-        // Could not trim to the divergence. Drop the sequence's KV entirely and
-        // prefill from zero: strictly slower, but correct, and self-healing
-        // because the slot starts clean on the next turn either way.
-        let _ = ctx.clear_kv_cache_seq(Some(seq), None, None);
-        cached[r.slot_idx].tokens.clear();
-        if let Some(s) = slots[r.slot_idx].as_mut() {
-            s.prefill_cursor = 0;
-            s.n_past = 0;
-            s.resident.clear();
+    // prefix, so it is wrong rather than merely old. Each rewind is trusted
+    // only once the cache confirms it: `llama_memory_seq_rm` returns true
+    // without removing anything when a cache shares cells, and a cache that
+    // kept its old positions is not a slow path — on an M-RoPE model the next
+    // batch must start strictly beyond the highest cached position, so a stale
+    // entry makes the request unschedulable and it fails outright.
+    let drop_from = |ctx: &mut llama_cpp_2::context::LlamaContext, pos: usize| {
+        ctx.clear_kv_cache_seq(Some(slot as u32), Some(pos as u32), None)
+            .unwrap_or(false)
+            && ctx.kv_cache_seq_pos_max(slot as i32) < pos as i32
+    };
+    let done = match planned {
+        // The prompt extends everything the slot holds: nothing to drop. On a
+        // model with recurrent state this is the one rewind that needs no
+        // checkpoint.
+        Rewind::Keep(_) | Rewind::Reset => true,
+        Rewind::Trim(n) => drop_from(ctx, crate::prefix_cache::kv_pos(&c.spans, n)),
+        // Restore the untrimmable part as it stood at the checkpoint, then
+        // drop attention from there on. In that order: with the recurrent
+        // state back at the checkpoint, the trim touches attention only, which
+        // is the part that can rewind.
+        Rewind::Restore(n) => {
+            c.checkpoints.get(n).is_some_and(|state| ctx.state_seq_set(state, slot as i32).is_ok())
+                && drop_from(ctx, crate::prefix_cache::kv_pos(&c.spans, n))
         }
-        tracing::info!(
-            slot = r.slot_idx,
-            wanted_reuse = r.reused,
-            removed,
-            "prefix trim refused by the KV cache; prefilling from zero"
-        );
-        return;
+    };
+    let rewind = if done { planned } else { Rewind::Reset };
+    if rewind == Rewind::Reset {
+        // Nothing reusable, or a rewind that did not take and left the
+        // sequence in an unknown state: clear it and prefill from zero.
+        let _ = ctx.clear_kv_cache_seq(Some(slot as u32), None, None);
+        c.forget();
     }
+    let reused = rewind.reused();
+    c.truncate(reused);
+    let kv = crate::prefix_cache::kv_pos(&c.spans, reused);
 
-    cached[r.slot_idx].tokens = r.prompt[..r.reused].to_vec();
-    if r.reused > 0 {
-        tracing::info!(
-            slot = r.slot_idx,
-            reused_tokens = r.reused,
-            prompt_tokens = r.prompt.len(),
-            "prefix cache hit"
+    let Some(s) = slots[slot].as_mut() else {
+        return kv;
+    };
+    debug_assert_eq!(s.seq_id as usize, slot, "a slot decodes only its own KV sequence");
+    let prompt = s.pending_prompt.as_deref().unwrap_or_default();
+    s.prefill_cursor = reused;
+    s.n_past = kv as i32;
+    s.resident = prompt[..reused.min(prompt.len())].to_vec();
+    s.cached_tokens = reused as u32;
+    if policy.per_slot > 0 {
+        let raw: Vec<i32> = prompt.iter().map(|t| t.0).collect();
+        s.cuts = crate::prefix_cache::checkpoint_cuts(
+            &policy.turn_ends.turn_starts(&raw),
+            reused,
+            prompt.len(),
+            policy.per_slot,
+            CHECKPOINT_MIN_SPACING,
         );
+        let spans = &s.media_spans;
+        s.cuts.retain(|&cut| crate::prefix_cache::snap_out_of_media(spans, cut) == cut);
     }
+    match (planned, rewind) {
+        (Rewind::Reset, _) if r.shared > 0 => tracing::info!(
+            slot,
+            shared = r.shared,
+            prompt_tokens = prompt.len(),
+            "prefix shared but not reachable (no checkpoint at or below the divergence); prefilling from zero"
+        ),
+        (_, Rewind::Reset) if planned != Rewind::Reset => tracing::warn!(
+            slot,
+            wanted_reuse = planned.reused(),
+            "prefix rewind refused by the cache; prefilling from zero"
+        ),
+        (_, Rewind::Reset) => {}
+        (_, rewind) => tracing::info!(
+            slot,
+            reused_tokens = reused,
+            prompt_tokens = prompt.len(),
+            how = match rewind {
+                Rewind::Keep(_) => "extension",
+                Rewind::Trim(_) => "trim",
+                _ => "checkpoint",
+            },
+            "prefix cache hit"
+        ),
+    }
+    kv
 }
 
-/// Tokenize an admitted request into the first free slot and stage its prompt
-/// for prefill.
-fn admit(
-    model: &LlamaModel,
-    ctx_size: i32,
-    slots: &mut [Option<Sequence>],
-    cached: &mut [CachedPrefix],
-    req: BatchRequest,
-    enable_thinking: bool,
-    projector: Option<&Projector>,
-) -> Option<PrefixReuse> {
-    let Some(slot_idx) = slots.iter().position(|s| s.is_none()) else {
-        // No free slot — reject rather than block. Caller sheds load.
-        let _ = req.result_tx.send(Err(Error::QueueFull {
-            model_id: "batched".into(),
-            waiting: slots.len(),
-            max: slots.len(),
-        }));
-        return None;
-    };
-    let seq_id = slot_idx as i32;
+/// A request's prompt, tokenized and ready to prefill.
+struct Staged {
+    /// One token per identity position; a media chunk's positions hold a
+    /// placeholder, since the media step evaluates them.
+    tokens: Vec<LlamaToken>,
+    ids: Vec<PrefixId>,
+    spans: Vec<MediaSpan>,
+    #[cfg(feature = "mtmd")]
+    media: Option<PendingMedia>,
+}
 
+/// The placeholder standing in for a media position among prompt tokens.
+const MEDIA_PLACEHOLDER: LlamaToken = LlamaToken(-1);
+
+/// Render the request's prompt with its thinking mode and effort level.
+fn render_request(model: &LlamaModel, req: &BatchRequest, enable_thinking: bool) -> Result<String> {
     // The engine's thinking mode is the default; a request may override it.
     // This is what lets one served model answer plainly to API callers and
     // show its reasoning to a client that asked to see it.
@@ -1347,7 +1856,87 @@ fn admit(
     } else {
         None
     };
-    let prompt = match render_prompt(model, &req.prompt, enable_thinking, reasoning) {
+    render_prompt(model, &req.prompt, enable_thinking, reasoning)
+}
+
+/// Tokenize a text prompt.
+fn stage_text(model: &LlamaModel, prompt: &str) -> Result<Staged> {
+    let tokens = model
+        .str_to_token(prompt, AddBos::Always)
+        .map_err(|e| Error::Other(format!("tokenization failed: {}", e)))?;
+    Ok(Staged {
+        ids: text_ids(&tokens),
+        tokens,
+        spans: Vec::new(),
+        #[cfg(feature = "mtmd")]
+        media: None,
+    })
+}
+
+/// The free slot to serve a prompt from.
+///
+/// The one whose cache can be rewound to the longest prefix of this prompt,
+/// counting only caches filled from the request's own namespace. With no
+/// reachable prefix anywhere, an empty slot, so no other conversation's cache
+/// is thrown away; failing that, the least recently used one.
+///
+/// Routing a conversation back to the slot that holds it matters: an agent's
+/// next turn repeats everything it has said so far, and on a busy node the
+/// first free slot is usually somebody else's. On a model with recurrent
+/// state a partial match is also worth nothing without a checkpoint below it,
+/// which is why reachability, not the raw match, decides.
+fn choose_slot(free: &[bool], cached: &[CachedPrefix], kind: Reuse, namespace: Namespace, ids: &[PrefixId], spans: &[MediaSpan]) -> Option<usize> {
+    let reach = |i: usize| {
+        let c = &cached[i];
+        if c.namespace != namespace || c.ids.is_empty() {
+            return 0;
+        }
+        let shared = crate::prefix_cache::snap_out_of_media(spans, crate::prefix_cache::shared_prefix(&c.ids, ids));
+        crate::prefix_cache::plan_rewind(kind, c.ids.len(), shared, &c.checkpoints.positions(), i64::MIN).reused()
+    };
+    let candidates = || (0..free.len()).filter(|&i| free[i]);
+    let best = candidates().max_by_key(|&i| (reach(i), std::cmp::Reverse(i)))?;
+    if reach(best) > 0 {
+        return Some(best);
+    }
+    candidates()
+        .find(|&i| cached[i].ids.is_empty())
+        .or_else(|| candidates().min_by_key(|&i| cached[i].last_used))
+}
+
+/// Put `seq` into `slots[slot_idx]`, as KV sequence `slot_idx`. The one place
+/// a sequence enters a slot, so a sequence can never decode into another
+/// slot's KV.
+fn install(slots: &mut [Option<Sequence>], slot_idx: usize, mut seq: Sequence) {
+    seq.seq_id = slot_idx as i32;
+    slots[slot_idx] = Some(seq);
+}
+
+/// Tokenize an admitted request, choose the slot whose cache serves it best,
+/// and stage its prompt for prefill. The slot's cache is rewound by
+/// [`apply_prefix_reuse`] once the returned plan reaches the scheduler.
+#[allow(clippy::too_many_arguments)]
+fn admit(
+    model: &LlamaModel,
+    ctx_size: i32,
+    slots: &mut [Option<Sequence>],
+    cached: &mut [CachedPrefix],
+    policy: &ReusePolicy,
+    req: BatchRequest,
+    enable_thinking: bool,
+    projector: Option<&Projector>,
+) -> Option<PrefixReuse> {
+    let free: Vec<bool> = slots.iter().map(Option::is_none).collect();
+    if !free.contains(&true) {
+        // No free slot — reject rather than block. Caller sheds load.
+        let _ = req.result_tx.send(Err(Error::QueueFull {
+            model_id: "batched".into(),
+            waiting: slots.len(),
+            max: slots.len(),
+        }));
+        return None;
+    }
+    let prompt = match render_request(model, &req, enable_thinking) {
         Ok(p) => p,
         Err(e) => {
             let _ = req.result_tx.send(Err(e));
@@ -1355,28 +1944,23 @@ fn admit(
         }
     };
     let frame = ReasoningFrame::for_prompt(&prompt);
-    let reasoning_budget = reasoning_budget(&req.config);
-    let close_tokens = close_marker_tokens(model, frame);
-
-    if !req.media.is_empty() {
-        return admit_media(model, ctx_size, slots, cached, req, prompt, projector, slot_idx);
-    }
-
-    let tokens = match model.str_to_token(&prompt, AddBos::Always) {
-        Ok(t) => t,
+    let staged = if req.media.is_empty() {
+        stage_text(model, &prompt)
+    } else {
+        stage_media(prompt, &req.media, projector)
+    };
+    let staged = match staged {
+        Ok(s) if s.ids.is_empty() => {
+            let _ = req.result_tx.send(Err(Error::Other("empty prompt".into())));
+            return None;
+        }
+        Ok(s) => s,
         Err(e) => {
-            let _ = req
-                .result_tx
-                .send(Err(Error::Other(format!("tokenization failed: {}", e))));
+            let _ = req.result_tx.send(Err(e));
             return None;
         }
     };
-    if tokens.is_empty() {
-        let _ = req.result_tx.send(Err(Error::Other("empty prompt".into())));
-        return None;
-    }
-
-    let input_tokens = tokens.len() as u32;
+    let input_tokens = staged.ids.len() as u32;
     // A prompt that alone fills the context leaves no room to generate.
     if input_tokens as i32 >= ctx_size {
         let _ = req.result_tx.send(Err(Error::Inference(format!(
@@ -1385,213 +1969,334 @@ fn admit(
         ))));
         return None;
     }
-    let max_pos = ctx_size.min(input_tokens as i32 + req.config.max_tokens as i32);
-
-    // Reuse whatever of this slot's KV already matches. The tokens are
-    // identical up to `reuse`, so those positions are already correct in the
-    // cache and only the divergent tail needs decoding. Everything at or past
-    // the divergence is dropped, because a KV entry computed under a different
-    // prefix is wrong, not merely stale.
-    let cached_len = cached[slot_idx].tokens.len();
-    let reuse = common_prefix_len(&cached[slot_idx].tokens, &tokens);
-    // A one-token overlap (the BOS) is not worth the bookkeeping, and reusing
-    // the entire prompt would leave nothing to decode and no logits to sample
-    // from — so always leave at least the final token to be processed.
-    let reuse = if reuse < 2 {
-        0
+    let namespace = Namespace::of(req.config.cache_salt.as_deref());
+    let slot_idx = choose_slot(&free, cached, policy.kind, namespace, &staged.ids, &staged.spans)?;
+    let shared = if cached[slot_idx].namespace == namespace {
+        crate::prefix_cache::snap_out_of_media(
+            &staged.spans,
+            crate::prefix_cache::shared_prefix(&cached[slot_idx].ids, &staged.ids),
+        )
     } else {
-        reuse.min(tokens.len() - 1)
+        0
     };
-
-    slots[slot_idx] = Some(Sequence {
-        seq_id,
-        sampler: build_sampler(&req.config, model.n_vocab()),
-        token_tx: req.token_tx,
-        result_tx: Some(req.result_tx),
-        decoder: encoding_rs::UTF_8.new_decoder(),
-        pending_prompt: Some(tokens.clone()),
-        // Prefill resumes at the divergence rather than at zero.
-        prefill_cursor: reuse,
-        n_past: reuse as i32,
-        // The reused prefix is already in KV, so it counts as resident.
-        resident: tokens[..reuse].to_vec(),
-        input_tokens,
-        output_tokens: 0,
-        max_pos,
-        stream: StopStream::new(req.config.stop).framed(frame),
-        started: Instant::now(),
-        speculate: false,
-        reasoning_tokens: 0,
-        reasoning_budget,
-        close_tokens,
-        forced: std::collections::VecDeque::new(),
-        budget_closed: false,
-        pending_token: None,
-        multimodal: false,
-        #[cfg(feature = "mtmd")]
-        pending_media: None,
-    });
-
-    Some(PrefixReuse {
-        slot_idx,
-        reused: reuse,
-        cached_len,
-        prompt: tokens,
-    })
+    let max_pos = ctx_size.min(input_tokens as i32 + req.config.max_tokens as i32);
+    let seq = Sequence::new(model, req.config, req.token_tx, req.reasoning_tx, req.result_tx, frame, staged, namespace, max_pos);
+    install(slots, slot_idx, seq);
+    Some(PrefixReuse { slot_idx, shared })
 }
 
-/// Admit a request that carries media into `slot_idx`.
+impl Sequence {
+    /// A sequence about to prefill `staged`, not yet placed in a slot (see
+    /// [`install`]) and not yet rewound (see [`apply_prefix_reuse`]).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        model: &LlamaModel,
+        config: GenerationConfig,
+        token_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
+        frame: ReasoningFrame,
+        staged: Staged,
+        namespace: Namespace,
+        max_pos: i32,
+    ) -> Self {
+        Sequence {
+            seq_id: -1,
+            sampler: build_sampler(&config, model.n_vocab()),
+            token_tx,
+            result_tx: Some(result_tx),
+            decoder: encoding_rs::UTF_8.new_decoder(),
+            prefill_cursor: 0,
+            n_past: 0,
+            resident: Vec::new(),
+            input_tokens: staged.ids.len() as u32,
+            prompt_ids: staged.ids,
+            multimodal: !staged.spans.is_empty(),
+            media_spans: staged.spans,
+            pending_prompt: Some(staged.tokens),
+            namespace,
+            cuts: Vec::new(),
+            cached_tokens: 0,
+            commitment: CommitmentLog::new(&config),
+            output_tokens: 0,
+            forced_tokens: 0,
+            max_pos,
+            reasoning_budget: reasoning_budget(&config),
+            close_tokens: close_marker_tokens(model, frame),
+            stream: StopStream::new(config.stop).framed(frame).nonblocking().with_reasoning(reasoning_tx),
+            started: Instant::now(),
+            speculate: false,
+            reasoning_tokens: 0,
+            forced: std::collections::VecDeque::new(),
+            budget_closed: false,
+            pending_token: None,
+            #[cfg(feature = "mtmd")]
+            pending_media: staged.media,
+        }
+    }
+}
+
+/// Admit a request to an encoder-decoder model into slot 0, and run its
+/// encoder, unless the context already holds the encoder output for exactly
+/// this input in this namespace; then the encoder pass is skipped and the
+/// request only decodes.
 ///
-/// The slot's KV is cleared rather than reused, and the prompt is tokenized by
-/// the projector into text and media chunks that the scheduler prefills on its
-/// own step.
-#[cfg(feature = "mtmd")]
+/// The context holds one encoder output at a time and the decoder's cache
+/// cross-attends to it, so an encoder-decoder model decodes one request at a
+/// time, and its decoder cache is never reused across requests.
 #[allow(clippy::too_many_arguments)]
-fn admit_media(
+fn admit_encoder_decoder(
     model: &LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext,
     ctx_size: i32,
     slots: &mut [Option<Sequence>],
     cached: &mut [CachedPrefix],
     req: BatchRequest,
-    prompt: String,
-    projector: Option<&Projector>,
-    slot_idx: usize,
-) -> Option<PrefixReuse> {
-    let frame = ReasoningFrame::for_prompt(&prompt);
-    let reasoning_budget = reasoning_budget(&req.config);
-    let close_tokens = close_marker_tokens(model, frame);
-    let Some(projector) = projector else {
+    enable_thinking: bool,
+    encoded: &mut Option<(Namespace, Vec<LlamaToken>)>,
+) {
+    if !req.media.is_empty() {
         let _ = req.result_tx.send(Err(Error::Inference(
+            "this encoder-decoder model takes text only".into(),
+        )));
+        return;
+    }
+    let prompt = match render_request(model, &req, enable_thinking).and_then(|p| stage_text(model, &p)) {
+        Ok(s) if !s.tokens.is_empty() => s.tokens,
+        Ok(_) => {
+            let _ = req.result_tx.send(Err(Error::Other("empty prompt".into())));
+            return;
+        }
+        Err(e) => {
+            let _ = req.result_tx.send(Err(e));
+            return;
+        }
+    };
+    if prompt.len() as i32 >= ctx_size {
+        let _ = req.result_tx.send(Err(Error::Inference(format!(
+            "prompt of {} tokens exceeds context window {}",
+            prompt.len(),
+            ctx_size
+        ))));
+        return;
+    }
+    let namespace = Namespace::of(req.config.cache_salt.as_deref());
+    let hit = encoded.as_ref().is_some_and(|(ns, tokens)| *ns == namespace && *tokens == prompt);
+    if !hit {
+        *encoded = None;
+        let mut batch = LlamaBatch::new(prompt.len(), 1);
+        let encoded_ok = batch.add_sequence(&prompt, 0, false).is_ok() && ctx.encode(&mut batch).is_ok();
+        if !encoded_ok {
+            let _ = req.result_tx.send(Err(Error::Inference("the encoder pass failed".into())));
+            return;
+        }
+        *encoded = Some((namespace, prompt.clone()));
+    }
+    let _ = ctx.clear_kv_cache_seq(Some(0), None, None);
+    cached[0].forget();
+    let start = match model.decode_start_token() {
+        t if t.0 >= 0 => t,
+        _ => model.token_bos(),
+    };
+    let frame = ReasoningFrame::default();
+    let staged = Staged {
+        ids: text_ids(&[start]),
+        tokens: vec![start],
+        spans: Vec::new(),
+        #[cfg(feature = "mtmd")]
+        media: None,
+    };
+    let max_pos = ctx_size.min(1 + req.config.max_tokens as i32);
+    let mut seq = Sequence::new(model, req.config, req.token_tx, req.reasoning_tx, req.result_tx, frame, staged, namespace, max_pos);
+    // Billed and reported against the encoder input, which is the prompt.
+    seq.input_tokens = prompt.len() as u32;
+    seq.max_pos = max_pos + seq.input_tokens as i32 - 1;
+    seq.cached_tokens = if hit { prompt.len() as u32 } else { 0 };
+    if hit {
+        tracing::info!(prompt_tokens = prompt.len(), "encoder output reused; encoder pass skipped");
+    }
+    install(slots, 0, seq);
+}
+
+/// Tokenize a prompt that carries media into text and media chunks.
+///
+/// Each attachment is identified by its content: its bitmap's id is the hash
+/// of its bytes, so its positions in the prompt's identity match another
+/// prompt's only where that prompt carries the same bytes there. That is what
+/// lets a conversation about an image reuse the image's embeddings on its next
+/// turn, and never reuse them for a different image.
+#[cfg(feature = "mtmd")]
+fn stage_media(prompt: String, media: &[Vec<u8>], projector: Option<&Projector>) -> Result<Staged> {
+    let Some(projector) = projector else {
+        return Err(Error::Inference(
             "this model is served text-only: it has no projector, so it cannot take image or \
              audio attachments"
                 .into(),
-        )));
-        return None;
+        ));
     };
-    let mut bitmaps = Vec::with_capacity(req.media.len());
-    for (i, bytes) in req.media.iter().enumerate() {
-        let bitmap = match MtmdBitmap::from_buffer(projector, bytes, false) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = req.result_tx.send(Err(Error::Inference(format!(
-                    "attachment {} could not be decoded: {}",
-                    i, e
-                ))));
-                return None;
-            }
-        };
+    let mut bitmaps = Vec::with_capacity(media.len());
+    for (i, bytes) in media.iter().enumerate() {
+        let mut bitmap = MtmdBitmap::from_buffer(projector, bytes, false)
+            .map_err(|e| Error::Inference(format!("attachment {} could not be decoded: {}", i, e)))?;
         let (kind, supported) = if bitmap.is_audio() {
             ("audio", projector.support_audio())
         } else {
             ("an image", projector.support_vision())
         };
         if !supported {
-            let _ = req.result_tx.send(Err(Error::Inference(format!(
+            return Err(Error::Inference(format!(
                 "attachment {} is {}, which this projector has no tower for",
                 i, kind
-            ))));
-            return None;
+            )));
         }
+        bitmap
+            .set_id(&hex::encode(crate::prefix_cache::media_hash(bytes)))
+            .map_err(|e| Error::Inference(format!("attachment {} could not be identified: {}", i, e)))?;
         bitmaps.push(bitmap);
     }
     let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
-    let chunks = match projector.tokenize(
-        MtmdInputText {
-            text: prompt,
-            add_special: true,
-            parse_special: true,
-        },
-        &refs,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = req
-                .result_tx
-                .send(Err(Error::Inference(format!("multimodal tokenization failed: {}", e))));
-            return None;
+    let chunks = projector
+        .tokenize(
+            MtmdInputText {
+                text: prompt,
+                add_special: true,
+                parse_special: true,
+            },
+            &refs,
+        )
+        .map_err(|e| Error::Inference(format!("multimodal tokenization failed: {}", e)))?;
+
+    let mut tokens = Vec::with_capacity(chunks.total_tokens());
+    let mut ids = Vec::with_capacity(chunks.total_tokens());
+    let mut spans = Vec::new();
+    let mut chunk_of_span = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for index in 0..chunks.len() {
+        let Some(chunk) = chunks.get(index) else { continue };
+        if chunk.chunk_type() == llama_cpp_2::mtmd::MtmdInputChunkType::Text {
+            let text = chunk.text_tokens().unwrap_or_default();
+            ids.extend(text.iter().map(|t| crate::prefix_cache::text_id(t.0)));
+            tokens.extend_from_slice(text);
+            continue;
         }
-    };
-    let input_tokens = chunks.total_tokens() as u32;
-    if input_tokens == 0 {
-        let _ = req.result_tx.send(Err(Error::Other("empty prompt".into())));
-        return None;
+        let len = chunk.n_tokens();
+        // One attachment may span several chunks (long audio); each chunk of
+        // it has its own identity.
+        let id = chunk.id().unwrap_or_default();
+        let ordinal = seen.entry(id.clone()).or_insert(0);
+        let content = crate::prefix_cache::media_hash(format!("{id}/{ordinal}").as_bytes());
+        *ordinal += 1;
+        spans.push(MediaSpan {
+            at: ids.len(),
+            len,
+            n_pos: usize::try_from(chunk.n_positions()).unwrap_or(len),
+        });
+        chunk_of_span.push(index);
+        ids.extend(crate::prefix_cache::media_ids(&content, len));
+        tokens.extend(std::iter::repeat_n(MEDIA_PLACEHOLDER, len));
     }
-    if input_tokens as i32 >= ctx_size {
-        let _ = req.result_tx.send(Err(Error::Inference(format!(
-            "prompt of {} tokens exceeds context window {}",
-            input_tokens, ctx_size
-        ))));
-        return None;
-    }
-    let max_pos = ctx_size.min(input_tokens as i32 + req.config.max_tokens as i32);
-    let cached_len = cached[slot_idx].tokens.len();
-    slots[slot_idx] = Some(Sequence {
-        seq_id: slot_idx as i32,
-        sampler: build_sampler(&req.config, model.n_vocab()),
-        token_tx: req.token_tx,
-        result_tx: Some(req.result_tx),
-        decoder: encoding_rs::UTF_8.new_decoder(),
-        pending_prompt: None,
-        prefill_cursor: 0,
-        n_past: 0,
-        resident: Vec::new(),
-        input_tokens,
-        output_tokens: 0,
-        max_pos,
-        stream: StopStream::new(req.config.stop).framed(frame),
-        started: Instant::now(),
-        speculate: false,
-        reasoning_tokens: 0,
-        reasoning_budget,
-        close_tokens,
-        forced: std::collections::VecDeque::new(),
-        budget_closed: false,
-        pending_token: None,
-        multimodal: true,
-        pending_media: Some(chunks),
-    });
-    // A reuse of zero clears the slot's KV and records it as holding nothing.
-    Some(PrefixReuse {
-        slot_idx,
-        reused: 0,
-        cached_len,
-        prompt: Vec::new(),
+    Ok(Staged {
+        tokens,
+        ids,
+        spans,
+        media: Some(PendingMedia { chunks, chunk_of_span }),
     })
 }
 
 /// Refuse media in a build without mtmd.
 #[cfg(not(feature = "mtmd"))]
+fn stage_media(_prompt: String, _media: &[Vec<u8>], _projector: Option<&Projector>) -> Result<Staged> {
+    Err(Error::Inference("this engine was built without multimodal support".into()))
+}
+
+/// Evaluate the next media chunk of at most one sequence: the first whose
+/// prefill has reached one. Text around media is prefilled in the ordinary
+/// batch; a media chunk the slot's cache already held was never staged here,
+/// because prefill resumes past it.
+#[cfg(feature = "mtmd")]
 #[allow(clippy::too_many_arguments)]
-fn admit_media(
-    _model: &LlamaModel,
-    _ctx_size: i32,
-    _slots: &mut [Option<Sequence>],
-    _cached: &mut [CachedPrefix],
-    req: BatchRequest,
-    _prompt: String,
-    _projector: Option<&Projector>,
-    _slot_idx: usize,
-) -> Option<PrefixReuse> {
-    let _ = req.result_tx.send(Err(Error::Inference(
-        "this engine was built without multimodal support".into(),
-    )));
-    None
+fn media_step(
+    model: &LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    draft: &mut Option<llama_cpp_2::context::LlamaContext<'_>>,
+    projector: &Projector,
+    slots: &mut [Option<Sequence>],
+    cached: &mut [CachedPrefix],
+    kind: Reuse,
+    draining: &mut Vec<Draining>,
+    model_id: &str,
+) {
+    let next = slots.iter().enumerate().find_map(|(i, s)| {
+        let q = s.as_ref()?;
+        q.pending_prompt.as_ref()?;
+        q.pending_media.as_ref()?;
+        let k = q.media_spans.iter().position(|sp| sp.at == q.prefill_cursor)?;
+        Some((i, k))
+    });
+    let Some((slot_idx, k)) = next else {
+        return;
+    };
+    let evaluated = {
+        let seq = slots[slot_idx].as_mut().expect("found above");
+        let span = seq.media_spans[k];
+        let prompt_len = seq.pending_prompt.as_ref().map_or(0, Vec::len);
+        // A prompt that ends in media takes its logits from the media chunk.
+        let last = span.at + span.len >= prompt_len;
+        let media = seq.pending_media.as_ref().expect("found above");
+        let n_batch = ctx.n_batch() as i32;
+        match media.chunks.eval_chunk(media.chunk_of_span[k], projector, ctx, seq.n_past, seq.seq_id, n_batch, last) {
+            Ok(n_past) => {
+                seq.n_past = n_past;
+                seq.prefill_cursor += span.len;
+                seq.resident.extend(std::iter::repeat_n(MEDIA_PLACEHOLDER, span.len));
+                if last {
+                    seq.pending_prompt = None;
+                    seq.pending_media = None;
+                }
+                Ok(last)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    match evaluated {
+        Ok(true) => {
+            if sample_into(model, ctx, slots, slot_idx, -1, model_id) {
+                finalize_and_free(ctx, draft, slots, cached, kind, slot_idx, draining);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            // The chunk may have written part of its positions: start this
+            // request over from nothing, after making room if there is any
+            // to make, or fail it.
+            let _ = ctx.clear_kv_cache_seq(Some(slot_idx as u32), None, None);
+            draft_seq_rm(draft, slot_idx as i32, None);
+            cached[slot_idx].forget();
+            if evict_idle_prefix(ctx, draft, slots, cached) {
+                if let Some(seq) = slots[slot_idx].as_mut() {
+                    seq.prefill_cursor = 0;
+                    seq.n_past = 0;
+                    seq.resident.clear();
+                    seq.cached_tokens = 0;
+                }
+            } else if let Some(mut seq) = slots[slot_idx].take() {
+                seq.fail(Error::Inference(format!("multimodal prefill failed: {}", e)));
+            }
+        }
+    }
 }
 
 /// What `admit` decided about an incoming request's prefix.
 ///
-/// Returned rather than acted on inside `admit`, because trimming the KV cache
-/// needs the context and `admit` deliberately does not take it — tokenizing
-/// must not be able to touch the cache.
+/// Returned rather than acted on inside `admit`, because rewinding the KV
+/// cache needs the context and `admit` deliberately does not take it —
+/// tokenizing must not be able to touch the cache.
 struct PrefixReuse {
     slot_idx: usize,
-    /// Tokens taken from cache instead of re-decoded.
-    reused: usize,
-    /// What the slot held before this request. When the whole of it is reused
-    /// the prompt merely extends the cache and nothing has to be dropped, which
-    /// is the difference between a trim we can skip and one that must succeed.
-    cached_len: usize,
-    prompt: Vec<LlamaToken>,
+    /// Identity positions the prompt shares with the slot's cache, never
+    /// splitting a media chunk. How much of it is reachable depends on the
+    /// model's memory, which [`apply_prefix_reuse`] decides.
+    shared: usize,
 }
 
 /// Render a [`BatchPrompt`] to the final prompt string fed to the tokenizer.
@@ -1684,100 +2389,137 @@ fn render_prompt(
 mod prefix_tests {
     use super::*;
 
-    fn toks(ids: &[i32]) -> Vec<LlamaToken> {
-        ids.iter().copied().map(LlamaToken).collect()
+    fn ids(v: &[i32]) -> Vec<PrefixId> {
+        v.iter().map(|t| crate::prefix_cache::text_id(*t)).collect()
     }
 
-    /// The decision `admit` makes, extracted so it can be tested without a
-    /// model, a context, or a GPU.
-    fn reuse_for(cached: &[LlamaToken], prompt: &[LlamaToken]) -> usize {
-        let r = common_prefix_len(cached, prompt);
-        if r < 2 { 0 } else { r.min(prompt.len() - 1) }
+    fn slot_with(v: &[i32], namespace: Namespace, last_used: u64) -> CachedPrefix {
+        CachedPrefix {
+            ids: ids(v),
+            namespace,
+            last_used,
+            ..Default::default()
+        }
     }
 
-    #[test]
-    fn a_follow_up_turn_reuses_the_conversation_so_far() {
-        // The agent case: turn two repeats turn one verbatim and appends.
-        let turn1 = toks(&[1, 2, 3, 4, 5]);
-        let turn2 = toks(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(
-            reuse_for(&turn1, &turn2),
-            5,
-            "the whole prior turn is already in KV"
-        );
+    fn pick(cached: &[CachedPrefix], free: &[bool], prompt: &[i32]) -> usize {
+        choose_slot(free, cached, Reuse::Trim, Namespace::default(), &ids(prompt), &[]).expect("a free slot")
     }
 
     #[test]
-    fn a_different_conversation_reuses_nothing() {
-        let cached = toks(&[1, 2, 3, 4]);
-        let other = toks(&[9, 8, 7, 6]);
-        assert_eq!(reuse_for(&cached, &other), 0);
-    }
-
-    /// Whether the cache has to be trimmed at all, which decides whether reuse
-    /// survives on a model whose state cannot be rewound.
-    fn needs_trim(cached: &[LlamaToken], prompt: &[LlamaToken]) -> bool {
-        let reuse = reuse_for(cached, prompt);
-        !(reuse > 0 && reuse == cached.len())
+    fn a_turn_goes_back_to_the_slot_holding_its_conversation() {
+        // Slot 0 is free and empty; slot 2 holds this conversation. Taking the
+        // first free slot would prefill the whole prompt from zero.
+        let ns = Namespace::default();
+        let cached = [slot_with(&[], ns, 0), slot_with(&[9, 9, 9], ns, 0), slot_with(&[1, 2, 3, 4, 5], ns, 0)];
+        assert_eq!(pick(&cached, &[true, false, true], &[1, 2, 3, 4, 5, 6, 7]), 2);
     }
 
     #[test]
-    fn extending_a_conversation_needs_no_trim() {
-        // Turn two repeats turn one verbatim and appends: everything cached is
-        // still a prefix, so there is nothing to drop and the reuse holds even
-        // where a partial trim would be refused.
-        let turn1 = toks(&[1, 2, 3, 4, 5]);
-        let turn2 = toks(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert!(!needs_trim(&turn1, &turn2));
+    fn a_busy_better_slot_is_not_stolen() {
+        let ns = Namespace::default();
+        let cached = [slot_with(&[], ns, 0), slot_with(&[1, 2, 3, 4, 5], ns, 0), slot_with(&[1, 2], ns, 0)];
+        assert_eq!(pick(&cached, &[true, false, true], &[1, 2, 3, 4, 5, 6]), 2, "the best FREE slot");
     }
 
     #[test]
-    fn diverging_from_the_cache_needs_a_trim() {
-        // The cached tail (4, 5) is not in the new prompt, so those entries are
-        // wrong rather than stale and cannot simply be kept.
-        let cached = toks(&[1, 2, 3, 4, 5]);
-        let prompt = toks(&[1, 2, 3, 9, 9, 9]);
-        assert!(needs_trim(&cached, &prompt));
+    fn with_nothing_reachable_an_empty_slot_is_taken_before_anyone_elses_cache() {
+        // Slot 0 holds another conversation, slot 2 nothing: taking slot 0
+        // would throw that conversation away for no gain.
+        let ns = Namespace::default();
+        let cached = [slot_with(&[8, 8], ns, 5), slot_with(&[7, 7], ns, 1), slot_with(&[], ns, 0)];
+        assert_eq!(pick(&cached, &[true, true, true], &[1, 2, 3]), 2);
+        // No empty slot: the least recently used cache goes.
+        let cached = [slot_with(&[8, 8], ns, 5), slot_with(&[7, 7], ns, 1)];
+        assert_eq!(pick(&cached, &[true, true], &[1, 2, 3]), 1);
     }
 
     #[test]
-    fn divergence_mid_prompt_stops_the_reuse_there() {
-        // Everything past the divergence was computed under a different prefix,
-        // so it is wrong rather than stale and must not be reused.
-        let cached = toks(&[1, 2, 3, 40, 50]);
-        let prompt = toks(&[1, 2, 3, 41, 51]);
-        assert_eq!(reuse_for(&cached, &prompt), 3);
+    fn a_recurrent_model_does_not_chase_a_match_it_cannot_reach() {
+        // Slot 0 shares 4 tokens but holds 6 and has no checkpoint at or below
+        // the divergence: on a recurrent model that is worth nothing, so the
+        // empty slot is taken and slot 0's conversation survives.
+        let ns = Namespace::default();
+        let cached = [slot_with(&[1, 2, 3, 4, 5, 6], ns, 0), slot_with(&[], ns, 0)];
+        let prompt = ids(&[1, 2, 3, 4, 50, 60]);
+        assert_eq!(choose_slot(&[true, true], &cached, Reuse::Recurrent, ns, &prompt, &[]), Some(1));
+        assert_eq!(choose_slot(&[true, true], &cached, Reuse::Trim, ns, &prompt, &[]), Some(0));
     }
 
     #[test]
-    fn an_identical_prompt_still_leaves_a_token_to_decode() {
-        // Reusing everything would leave no token to run through the model and
-        // so no logits to sample the reply from.
-        let same = toks(&[1, 2, 3, 4, 5]);
-        assert_eq!(reuse_for(&same, &same), 4, "must hold back the final token");
+    fn another_namespaces_cache_is_never_matched() {
+        // Slot 0 holds exactly this prompt, filled under another key. It is
+        // not reused, and the choice does not depend on it: the request lands
+        // on the empty slot exactly as it would if slot 0 held anything else.
+        let alice = Namespace::of(Some("alice"));
+        let bob = Namespace::of(Some("bob"));
+        let prompt = [1, 2, 3, 4, 5, 6];
+        let cached = [slot_with(&prompt, alice, 9), slot_with(&[], bob, 0)];
+        assert_eq!(choose_slot(&[true, true], &cached, Reuse::Trim, bob, &ids(&prompt), &[]), Some(1));
+        let unrelated = [slot_with(&[40, 41], alice, 9), slot_with(&[], bob, 0)];
+        assert_eq!(choose_slot(&[true, true], &unrelated, Reuse::Trim, bob, &ids(&prompt), &[]), Some(1));
+        // The owner does reuse it.
+        assert_eq!(choose_slot(&[true, true], &cached, Reuse::Trim, alice, &ids(&prompt), &[]), Some(0));
     }
 
     #[test]
-    fn a_bos_only_overlap_is_not_worth_reusing() {
-        let cached = toks(&[1, 77, 78]);
-        let prompt = toks(&[1, 90, 91]);
-        assert_eq!(reuse_for(&cached, &prompt), 0);
+    fn no_free_slot_is_no_choice() {
+        let cached = [slot_with(&[1, 2], Namespace::default(), 0)];
+        assert_eq!(choose_slot(&[false], &cached, Reuse::Trim, Namespace::default(), &ids(&[1, 2]), &[]), None);
+    }
+
+    /// A sequence with nothing staged, for placement tests.
+    fn bare_sequence(seq_id: i32) -> Sequence {
+        let (result_tx, _) = tokio::sync::oneshot::channel();
+        Sequence {
+            seq_id,
+            sampler: LlamaSampler::greedy(),
+            token_tx: None,
+            result_tx: Some(result_tx),
+            decoder: encoding_rs::UTF_8.new_decoder(),
+            pending_prompt: None,
+            prefill_cursor: 0,
+            n_past: 0,
+            resident: Vec::new(),
+            prompt_ids: Vec::new(),
+            media_spans: Vec::new(),
+            namespace: Namespace::default(),
+            cuts: Vec::new(),
+            cached_tokens: 0,
+            commitment: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            forced_tokens: 0,
+            max_pos: 0,
+            stream: StopStream::new(vec![]),
+            started: Instant::now(),
+            pending_token: None,
+            multimodal: false,
+            speculate: false,
+            reasoning_tokens: 0,
+            reasoning_budget: None,
+            close_tokens: Vec::new(),
+            forced: std::collections::VecDeque::new(),
+            budget_closed: false,
+            #[cfg(feature = "mtmd")]
+            pending_media: None,
+        }
     }
 
     #[test]
-    fn a_cold_slot_reuses_nothing() {
-        assert_eq!(reuse_for(&[], &toks(&[1, 2, 3])), 0);
-    }
-
-    #[test]
-    fn a_shorter_prompt_than_the_cache_is_bounded_by_the_prompt() {
-        // Cache holds a long conversation; the new prompt is a prefix of it.
-        let cached = toks(&[1, 2, 3, 4, 5, 6, 7]);
-        let prompt = toks(&[1, 2, 3]);
-        assert_eq!(
-            reuse_for(&cached, &prompt),
-            2,
-            "never past the prompt's own end"
-        );
+    fn the_chosen_slot_is_the_kv_sequence_the_request_decodes_into() {
+        // The request is routed to slot 2 while slot 0 is the first free one.
+        // Whatever sequence id it arrived with, it must decode into slot 2's
+        // KV, the one whose prefix was reused.
+        let ns = Namespace::default();
+        let cached = [slot_with(&[], ns, 0), slot_with(&[9, 9], ns, 0), slot_with(&[1, 2, 3, 4, 5], ns, 0)];
+        let free = [true, false, true];
+        let chosen = pick(&cached, &free, &[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(chosen, 2);
+        let mut slots: Vec<Option<Sequence>> = (0..3).map(|_| None).collect();
+        install(&mut slots, chosen, bare_sequence(0));
+        let seq = slots[chosen].as_ref().expect("installed");
+        assert_eq!(seq.seq_id as usize, chosen, "slots[pick].seq_id == pick");
+        assert!(slots[0].is_none(), "the first free slot is left free");
     }
 }

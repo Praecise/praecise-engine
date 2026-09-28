@@ -89,6 +89,14 @@ pub struct GenerationConfig {
     /// mix in the caller's output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+    /// Isolation key for the engine's prefix cache: an opaque salt chosen by
+    /// the caller. A request only ever reuses cache filled by a request with
+    /// the same salt, so a prompt under one key can neither be reused by nor
+    /// timed by a request under another. `None` shares one namespace among
+    /// every request that sets none. Local to this engine, so never sent on to
+    /// another provider.
+    #[serde(skip)]
+    pub cache_salt: Option<String>,
 }
 
 impl Default for GenerationConfig {
@@ -113,6 +121,7 @@ impl Default for GenerationConfig {
             reasoning_frame: None,
             response_format: None,
             enable_thinking: None,
+            cache_salt: None,
         }
     }
 }

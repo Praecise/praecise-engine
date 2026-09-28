@@ -1372,6 +1372,13 @@ fn main() {
                 .flag_if_supported("-std=c++17")
                 .warnings(false)
                 .pic(true);
+            // g++ compiles a .c file as C++ because of the driver; cl.exe picks the
+            // language from the extension and would read sha1.c as C, where its
+            // namespace is a syntax error. /TP forces C++ for the whole build, and
+            // hash.cpp is C++ already.
+            if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
+                hash_cpp.flag("/TP").flag("/std:c++17");
+            }
             hash_cpp.compile("vendor_hash_cpp");
         }
     }

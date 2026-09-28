@@ -112,6 +112,8 @@ pub fn generate_speculative(
     let mut stream =
         StopStream::new(config.stop.clone()).framed(config.reasoning_frame.unwrap_or_default());
     let max_pos = (n_ctx_target.get() as i32).min(input_tokens as i32 + config.max_tokens as i32);
+    let commitment_k = config.commitment_k.map(|k| usize::from(crate::toploc::commitment_k_for(k)));
+    let mut commitment_steps: Vec<crate::toploc::StepRecord> = Vec::new();
 
     // DFlash/MTP prefill: decode the prompt EXCEPT its last token, calling
     // `process()` after every target ubatch so the draft context mirrors the
@@ -154,7 +156,7 @@ pub fn generate_speculative(
 
     let mut prompt_so_far: Vec<llama_cpp_2::token::LlamaToken> = tokens_list.clone();
 
-    'genloop: while n_past < max_pos && !target_model.is_eog_token(id_last) {
+    'genloop: while n_past < max_pos && output_tokens < config.max_tokens && !target_model.is_eog_token(id_last) {
         // Client-gone: stop before more GPU work if the stream receiver dropped
         // or the caller flipped `cancel` on disconnect. Contexts drop at return.
         if token_tx.is_some_and(|tx| tx.is_closed())
@@ -162,8 +164,11 @@ pub fn generate_speculative(
         {
             break 'genloop;
         }
-        // 1. Ask the drafter for a block of candidates (may be empty).
-        let drafts = match spec.draft(n_past, id_last, &prompt_so_far) {
+        // 1. Ask the drafter for a block of candidates (may be empty). A step
+        // emits at most one token per draft plus one, so the block is cut to
+        // what `max_tokens` still allows, and to the positions left in the
+        // context: the verify batch writes `n_past ..= n_past + drafts`.
+        let mut drafts = match spec.draft(n_past, id_last, &prompt_so_far) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(
@@ -174,6 +179,10 @@ pub fn generate_speculative(
                 Vec::new()
             }
         };
+
+        let budget_left = config.max_tokens.saturating_sub(output_tokens) as usize;
+        let positions_left = (n_ctx_target.get() as i32 - 1 - n_past).max(0) as usize;
+        drafts.truncate(budget_left.saturating_sub(1).min(positions_left));
 
         // 2. Verify batch: id_last FIRST, then the drafts, logits everywhere.
         batch.clear();
@@ -205,6 +214,7 @@ pub fn generate_speculative(
         let mut idx: i32 = 0;
         let mut stop_now = false;
         loop {
+            let top_k = commitment_k.map(|k| crate::toploc::top_k_from_logits(spec.target_context_mut().get_logits_ith(idx), k));
             let sampled = sampler.sample(spec.target_context_mut(), idx);
             sampler.accept(sampled);
             id_last = sampled;
@@ -214,6 +224,12 @@ pub fn generate_speculative(
                 break;
             }
             output_tokens += 1;
+            if let Some(top_k) = top_k {
+                commitment_steps.push(crate::toploc::StepRecord { token_id: sampled.0 as u32, top_k });
+            }
+            if output_tokens >= config.max_tokens {
+                stop_now = true;
+            }
             if let Ok(piece) = target_model.token_to_piece(sampled, &mut decoder, true, None) {
                 if !(stream.push(&piece, token_tx) && !stream.hit_stop()) {
                     stop_now = true;
@@ -223,7 +239,7 @@ pub fn generate_speculative(
             if matched {
                 n_accepted += 1;
                 idx += 1;
-                if stop_now || output_tokens >= config.max_tokens {
+                if stop_now {
                     break;
                 }
             } else {
@@ -260,7 +276,11 @@ pub fn generate_speculative(
     } else {
         0.0
     };
-    let stop_reason = StopReason::from_loop(stream.hit_stop(), output_tokens, config.max_tokens);
+    // Running out of context is a length stop too, not an end of generation.
+    let stop_reason = match StopReason::from_loop(stream.hit_stop(), output_tokens, config.max_tokens) {
+        StopReason::Eos if n_past >= max_pos && !target_model.is_eog_token(id_last) => StopReason::Length,
+        reason => reason,
+    };
     let (text, thinking) = stream.finish_parts(token_tx);
     Ok(InferenceResult {
         text,
@@ -270,9 +290,11 @@ pub fn generate_speculative(
         generation_time_ms,
         tokens_per_second,
         stop_reason,
-        // Speculative decode does not record a commitment yet; the top-k
-        // capture lives in the standard decode loop that moves in with the
-        // orchestrator.
-        commitment: None,
+        commitment: commitment_k.filter(|_| !commitment_steps.is_empty()).map(|k| crate::toploc::InferenceCommitment {
+            k: k as u8,
+            prompt_tokens: input_tokens,
+            steps: commitment_steps,
+        }),
+        cached_tokens: 0,
     })
 }

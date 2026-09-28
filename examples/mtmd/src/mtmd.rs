@@ -118,7 +118,9 @@ impl<'a> MtmdCliContext<'a> {
             image_max_tokens: params.image_max_tokens,
         };
 
-        let mtmd_ctx = MtmdContext::init_from_file(&params.mmproj_path, model, &mtmd_params)?;
+        // SAFETY: `main` drops this context (inside `MtmdCliContext`) before
+        // the model it was built from.
+        let mtmd_ctx = unsafe { MtmdContext::init_from_file(&params.mmproj_path, model, &mtmd_params)? };
 
         let chat_template = model
             .chat_template(params.chat_template.as_deref())

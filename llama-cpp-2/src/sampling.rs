@@ -296,8 +296,14 @@ impl LlamaSampler {
     }
 
     /// Grammar sampler
+    ///
+    /// # Safety
+    ///
+    /// The sampler keeps a pointer to `model`'s vocabulary for as long as it
+    /// lives (llama.cpp re-reads it on reset and clone). The caller must drop
+    /// the sampler, and any chain holding it, before `model`.
     #[must_use]
-    pub fn grammar(
+    pub unsafe fn grammar(
         model: &LlamaModel,
         grammar_str: &str,
         grammar_root: &str,
@@ -332,9 +338,15 @@ impl LlamaSampler {
     /// Lazy grammar sampler, introduced in <https://github.com/ggerganov/llama.cpp/pull/9639>
     ///
     /// This sampler enforces grammar rules only when specific trigger words or tokens are encountered.
+    ///
+    /// # Safety
+    ///
+    /// The sampler keeps a pointer to `model`'s vocabulary for as long as it
+    /// lives (llama.cpp re-reads it on reset and clone). The caller must drop
+    /// the sampler, and any chain holding it, before `model`.
     #[cfg(feature = "common")]
     #[must_use]
-    pub fn grammar_lazy(
+    pub unsafe fn grammar_lazy(
         model: &LlamaModel,
         grammar_str: &str,
         grammar_root: &str,
@@ -378,8 +390,14 @@ impl LlamaSampler {
     /// invalid pattern aborts instead of returning
     /// [`GrammarError::NullGrammar`]. An unparseable grammar is reported with a
     /// null pointer either way.
+    ///
+    /// # Safety
+    ///
+    /// The sampler keeps a pointer to `model`'s vocabulary for as long as it
+    /// lives (llama.cpp re-reads it on reset and clone). The caller must drop
+    /// the sampler, and any chain holding it, before `model`.
     #[must_use]
-    pub fn grammar_lazy_patterns(
+    pub unsafe fn grammar_lazy_patterns(
         model: &LlamaModel,
         grammar_str: &str,
         grammar_root: &str,
@@ -642,10 +660,22 @@ impl LlamaSampler {
     /// ```
     #[must_use]
     pub fn logit_bias(n_vocab: i32, biases: &[LlamaLogitBias]) -> Self {
+        // llama.cpp indexes the candidate array by token id when it holds the
+        // whole vocabulary, so an id outside the vocabulary would write out of
+        // bounds. Such a bias can never apply to a real token; drop it.
+        let biases: Vec<LlamaLogitBias> = biases
+            .iter()
+            .filter(|b| (0..n_vocab).contains(&b.token().0))
+            .copied()
+            .collect();
         let data = biases.as_ptr().cast::<llama_cpp_sys_2::llama_logit_bias>();
 
         let sampler = unsafe {
-            llama_cpp_sys_2::llama_sampler_init_logit_bias(n_vocab, biases.len() as i32, data)
+            llama_cpp_sys_2::llama_sampler_init_logit_bias(
+                n_vocab,
+                i32::try_from(biases.len()).unwrap_or(i32::MAX),
+                data,
+            )
         };
 
         Self { sampler }
