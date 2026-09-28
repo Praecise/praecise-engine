@@ -109,8 +109,9 @@ pub fn generate_speculative(
     let mut sampler = build_sampler_chain(config, target_model.n_vocab());
     let mut output_tokens: u32 = 0;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut stream =
-        StopStream::new(config.stop.clone()).framed(config.reasoning_frame.unwrap_or_default());
+    let mut stream = StopStream::new(config.stop.clone())
+        .framed(config.reasoning_frame.unwrap_or_default())
+        .with_reasoning(config.reasoning_tx.clone());
     let max_pos = (n_ctx_target.get() as i32).min(input_tokens as i32 + config.max_tokens as i32);
     let commitment_k = config.commitment_k.map(|k| usize::from(crate::toploc::commitment_k_for(k)));
     let mut commitment_steps: Vec<crate::toploc::StepRecord> = Vec::new();
