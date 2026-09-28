@@ -121,11 +121,12 @@ ends its own request with an error, and a finished request's result is
 delivered once its stream has been fully taken, or after 60 s. One slow reader
 never holds back the scheduler thread.
 
-A request may also pass `BatchRequest::reasoning_tx`: the model's reasoning is
-then delivered there as it is produced, kept apart from the answer on
+A request may also set `GenerationConfig::reasoning_tx`: the model's reasoning
+is then delivered there as it is produced, kept apart from the answer on
 `token_tx`, instead of only in `InferenceResult::thinking` at the end. It is
 held and retried the same way, and a reasoning receiver that goes away ends
-only the reasoning stream.
+only the reasoning stream. The serial and speculative decode paths honour the
+same field.
 
 ## A bounded request queue
 
