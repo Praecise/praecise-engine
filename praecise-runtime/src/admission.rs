@@ -980,11 +980,21 @@ mod tests {
         let mut s = Scheduler::new(1, Policy::default());
         s.start(Shape::new(10, 10), 0);
         s.enqueue();
-        assert!(matches!(s.decide(Class::Batch, Shape::new(10, 10), 0), Decision::Wait { .. }));
-        s.set_policy(Policy { max_queue_depth: 1, ..Policy::default() });
         assert!(matches!(
             s.decide(Class::Batch, Shape::new(10, 10), 0),
-            Decision::Refuse(Refusal::QueueFull { depth: 1, limit: 1, .. })
+            Decision::Wait { .. }
+        ));
+        s.set_policy(Policy {
+            max_queue_depth: 1,
+            ..Policy::default()
+        });
+        assert!(matches!(
+            s.decide(Class::Batch, Shape::new(10, 10), 0),
+            Decision::Refuse(Refusal::QueueFull {
+                depth: 1,
+                limit: 1,
+                ..
+            })
         ));
     }
 
