@@ -1,0 +1,26 @@
+[package]
+name = "praecise-host"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine runtime hosts: engines run as confined child processes (namespaces, Landlock, seccomp) spoken to over a line-delimited JSON channel on their standard streams, with streamed events."
+
+[dependencies]
+libc = "0.2"
+parking_lot = "0.12"
+praecise-runtime = { path = "../praecise-runtime", default-features = false }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+
+[lints]
+workspace = true
+
+[[test]]
+name = "confinement"
+harness = false
+
+[[test]]
+name = "engines"
+harness = false

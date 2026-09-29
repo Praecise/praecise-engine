@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "praecise-runtime",
   "praecise-ffi",
+  "praecise-host",
   "llama-cpp-sys-2",
   "llama-cpp-2",
   "examples/embeddings",
