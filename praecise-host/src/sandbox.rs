@@ -226,19 +226,19 @@ mod linux {
             | libc::CLONE_NEWNET
             | libc::CLONE_NEWIPC
             | libc::CLONE_NEWPID;
+        // Under AppArmor's unprivileged user namespace restriction the unshare
+        // succeeds but the namespace has no capabilities, so the refusal shows
+        // up at the first write to the id maps.
+        const ALLOW: &str = "Allow unprivileged user namespaces for this executable: on Ubuntu install an \
+             AppArmor profile granting `userns` to it (or set kernel.apparmor_restrict_unprivileged_userns=0); \
+             elsewhere check user.max_user_namespaces > 0 and kernel.unprivileged_userns_clone = 1";
         if unsafe { libc::unshare(flags) } != 0 {
-            return Err(format!(
-                "the kernel refused new user namespaces ({}). Allow unprivileged user namespaces for \
-                 this executable: on Ubuntu install an AppArmor profile granting `userns` to it (or set \
-                 kernel.apparmor_restrict_unprivileged_userns=0); elsewhere check \
-                 user.max_user_namespaces > 0 and kernel.unprivileged_userns_clone = 1",
-                errno()
-            ));
+            return Err(format!("the kernel refused new user namespaces ({}). {ALLOW}", errno()));
         }
-        write_file("/proc/self/setgroups", "deny")?;
-        write_file("/proc/self/uid_map", &format!("{uid} {uid} 1"))
-            .map_err(|e| format!("{e}; the kernel refused the uid mapping (see kernel.apparmor_restrict_unprivileged_userns)"))?;
-        write_file("/proc/self/gid_map", &format!("{gid} {gid} 1"))?;
+        let refused = |e: String| format!("{e}; the kernel refused the user namespace's id mapping. {ALLOW}");
+        write_file("/proc/self/setgroups", "deny").map_err(refused)?;
+        write_file("/proc/self/uid_map", &format!("{uid} {uid} 1")).map_err(refused)?;
+        write_file("/proc/self/gid_map", &format!("{gid} {gid} 1")).map_err(refused)?;
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {

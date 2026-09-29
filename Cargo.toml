@@ -4,12 +4,14 @@ members = [
   "praecise-runtime",
   "praecise-ffi",
   "praecise-host",
+  "praecise-diffusion",
   "llama-cpp-sys-2",
   "llama-cpp-2",
   "examples/embeddings",
   "examples/simple",
   "examples/reranker",
   "examples/mtmd",
+  "examples/flux2",
 ]
 
 [workspace.dependencies]

@@ -1,7 +1,19 @@
 # Adding a diffusion family to Praecise Engine
 
-**Status:** design. Written after serving LTX-2.5 (22B video DiT) alongside
-Praecise Engine-accelerated LLMs on a GB10.
+**Status:** the first family is implemented as the `praecise-diffusion`
+crate: FLUX.2 [klein] (rectified-flow transformer, Qwen3 prompt encoder,
+KL autoencoder), text-to-image and reference-image conditioning, bf16 or
+load-time 8-bit weights, on the same ggml build, device and backend as the
+language-model family. On a host with GPU hardware it refuses to run on the
+CPU. It runs in the process: an application claims the model in
+`praecise_host::Engines` with `Flux2Klein::resident_bytes()` before loading
+it, so one model is served by exactly one engine within one GPU memory
+budget. `examples/flux2` generates and reports per-stage timings;
+`praecise-diffusion/tests/parity` checks every stage against the reference
+implementation on a small random checkpoint.
+
+The design notes below were written after serving LTX-2.5 (22B video DiT)
+alongside Praecise Engine-accelerated LLMs on a GB10.
 
 > **Naming.** *Praecise* is the family. **Praecise Engine** is the acceleration
 > layer — it makes a model faster. **praecise-harness** is the agentic

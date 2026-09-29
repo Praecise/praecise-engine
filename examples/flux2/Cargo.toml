@@ -1,0 +1,17 @@
+[package]
+name = "flux2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+praecise-diffusion = { path = "../../praecise-diffusion" }
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+cuda = ["praecise-diffusion/cuda"]
+
+[lints]
+workspace = true
