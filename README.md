@@ -20,8 +20,8 @@ is underneath. **llama.cpp is the first supported backend.**
      ┌─────────────┴───────────────┐
      ▼                             ▼
   llama.cpp                vLLM · SGLang
-  linked (FFI)             TensorRT-LLM · MLX
-                           served (HTTP)
+  linked (FFI)             TensorRT-LLM · transformers
+                           hosted (confined runtime host)
 ```
 
 Praecise Engine is the acceleration layer — not a model server on its own, and
@@ -74,42 +74,68 @@ what acceleration is available at all:
 | Backend | Integration | Engine-side speculation | Structured output |
 |---|---|---|---|
 | llama.cpp | linked (FFI) | yes — the engine drives the decode loop | yes |
-| vLLM | served (HTTP) | no — the runtime owns its decode loop | `structured_outputs` |
-| SGLang | served (HTTP) | no | `response_format` |
-| TensorRT-LLM | served (HTTP) | no | `response_format` |
-| MLX | served (HTTP) | no | **none** |
+| vLLM | hosted | no — the runtime owns its decode loop | no |
+| SGLang | hosted | no | no |
+| TensorRT-LLM | hosted | no | no |
+| transformers | hosted (CPU or GPU) | no | no |
 
 A *linked* backend is compiled in, so the engine can propose a draft block,
-verify it, and read per-position logits. A *served* backend is a separate
-process behind an OpenAI-compatible API: the engine can choose a model, sampling
-parameters and a schema, but there is no seam at which to interpose on
-token-by-token decoding. Speculation against a served backend is therefore not
-merely unimplemented — it is impossible by construction, and those runtimes do
-their own instead.
+verify it, and read per-position logits. A *hosted* backend runs in a runtime
+host: the engine chooses the model and the sampling parameters, but there is no
+seam at which to interpose on token-by-token decoding. Speculation against a
+hosted backend is therefore not merely unimplemented — it is impossible by
+construction, and those runtimes do their own instead.
 
 An unknown backend name is an error listing the valid ones, never a quiet
 fallback: a typo that silently ran on a different runtime would invalidate any
 measurement taken against it, with nothing in the output to show it.
 
-`praecise_runtime::served` builds and parses the HTTP requests; the caller
-supplies the client. That keeps the crate free of a networking dependency and
-lets a host reuse the connection pool, timeouts and tracing it already has.
+## Running several engines: `praecise-host`
 
-The four served runtimes are **not interchangeable**, and the differences are
-silent rather than loud — an unknown JSON key is dropped, not rejected:
+An application can serve several models at once, each on the engine that suits
+it: llama.cpp in its own process, and any hosted backend in a **runtime host**.
+`praecise_host::Engines` is the one place models are assigned to engines:
 
-- vLLM takes `top_k`/`min_p`/`repetition_penalty` **flat**; SGLang wants them
-  nested under `extra_body`. Sent the wrong way, generation proceeds with
-  different sampling than was asked for.
-- vLLM's `structured_outputs` accepts **exactly one** of json/regex/choice/
-  grammar — two is a hard validation error, not a preference. `guided_json` was
-  removed in v0.12.0.
-- **MLX never reads `response_format` at all**, so a schema-constrained request
-  returns free text with no error. `Backend::MlxLm.supports().structured_output`
-  is `false` so a caller can find out before sending rather than after.
-- MLX reads `max_completion_tokens` before `max_tokens`; ports differ
-  (8000/30000/8000/8080); SGLang's `/metrics` needs `--enable-metrics`, and MLX
-  has no metrics endpoint at all.
+- **One engine per model.** Every load claims the model id first; a claim held
+  by another engine, or a second host for the same model, is refused with
+  `Error::Conflict`. A model is never in memory twice.
+- **One memory budget.** Each claim reserves the model's memory from a `Budget`
+  shared by every engine: the application's own ledger, or a `FixedBudget`.
+- **Confined, not trusted.** A runtime host is a child process the application
+  starts by re-running its own executable as the confinement launcher (call
+  `praecise_host::sandbox::enter_if_requested()` first thing in `main`). It
+  gets new user, network, mount, IPC and PID namespaces, a Landlock ruleset
+  (read-only engine environment and model files, one scratch directory, the GPU
+  device nodes), a seccomp filter and resource limits. It has no network: no
+  interface but an optional loopback with no route out, and no internet socket
+  unless loopback is granted. It speaks to the application only over its
+  standard streams, one JSON object per line, with request ids so an engine that
+  batches sees every outstanding request.
+- **Pinned environments.** An `EngineEnv` is a directory holding the engine's
+  program, packages and protocol adapter, pinned by the SHA-256 of its whole
+  tree (`praecise_host::engine::digest`). The digest is checked before every
+  start; an environment that changed is refused, never run.
+- **Supervised.** A host that exits fails the requests it was serving and is
+  restarted in the background from the same verified environment, while every
+  other engine keeps serving. After three failures in a row it is left stopped
+  and reported, until the model is released and served again.
+- **GPU or refusal.** On a machine with a GPU, an engine that cannot use it
+  refuses to load rather than falling back to the CPU.
+
+The hosted backends are driven through their offline Python engine APIs (vLLM
+`AsyncLLM`, SGLang `Engine`, TensorRT-LLM `LLM`, transformers) by one adapter,
+`praecise-host/adapters/praecise_adapter.py`, which `engine::install_adapter`
+writes into a provisioned environment before it is pinned. No engine opens an
+HTTP server. `praecise_host::generation` maps `GenerationConfig` and
+`InferenceResult` onto the protocol, so a hosted engine answers with the same
+types, token counts and stop reasons as the linked one; a reply without token
+counts is refused rather than metered as free.
+
+A kernel that forbids unprivileged user namespaces (for example
+`kernel.apparmor_restrict_unprivileged_userns=1`) refuses the confinement, and
+the error names the setting; grant the application's executable `userns` in
+its AppArmor profile rather than lowering the setting for the whole machine.
+
 
 ## What the layer provides
 
@@ -187,6 +213,8 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `llama-cpp-sys-2` — low-level FFI; pulls the llama.cpp backend.
 - `llama-cpp-2` — safe Rust bindings, including the speculative-decode primitives.
 - `praecise-runtime` — the backend-agnostic acceleration runtime and inference API.
+- `praecise-host` — runtime hosts and the engine set: confined, supervised
+  engines, one per model, within one memory budget.
 
 ## Consuming Praecise Engine
 

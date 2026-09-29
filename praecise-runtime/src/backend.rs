@@ -14,24 +14,20 @@
 //!   called through FFI. The engine drives the decode loop itself, so it can
 //!   propose a draft block, verify it, and inspect per-position logits.
 //!   llama.cpp is linked.
-//! - **Served** ([`Integration::Served`]) — the runtime is a separate process
-//!   reached over HTTP. It owns its own decode loop. The engine can choose a
-//!   model, sampling parameters and a schema, but it cannot interpose on
-//!   token-by-token decoding, because there is no seam to interpose at. vLLM
-//!   and SGLang are served.
+//! - **Hosted** ([`Integration::Hosted`]) — the runtime runs in a runtime host:
+//!   a confined child process the application starts and supervises, spoken
+//!   to over its standard streams (the `praecise-host` crate). The runtime
+//!   owns its own decode loop. The engine chooses the model and the sampling
+//!   parameters, but it cannot interpose on token-by-token decoding. vLLM,
+//!   SGLang, TensorRT-LLM and transformers are hosted.
 //!
-//! That distinction is load-bearing. Against a served backend, this engine's
-//! speculation is **not** available — the remote runtime does its own, with its
-//! own drafters. Reporting a speculation plan for such a backend would be a
-//! lie the caller could not detect, so [`Backend::supports`] answers it up
-//! front and [`plan_for`] refuses rather than pretends.
+//! That distinction is load-bearing. Against a hosted backend, this engine's
+//! speculation is **not** available — the runtime does its own, with its own
+//! drafters. Reporting a speculation plan for such a backend would be a lie
+//! the caller could not detect, so [`Backend::supports`] answers it up front
+//! and [`plan_for`] refuses rather than pretends.
 //!
-//! ## What is actually implemented
-//!
-//! [`Backend::LlamaCpp`] works today. The served backends are **described but
-//! not implemented**: they are enumerated here so that selection, capability
-//! reporting and error messages are honest, and so adding one is filling in a
-//! function rather than reshaping the crate. A caller that selects one gets
+//! A backend that cannot run here is refused with
 //! [`Error::BackendUnavailable`] naming exactly what is missing — never a
 //! silent fallback to a different runtime, which would make a benchmark
 //! meaningless without any visible sign.
@@ -45,16 +41,16 @@ use crate::spec_policy::{self, LoadState, ModelProfile, SpecPlan, SpecPolicy};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Backend {
-    /// llama.cpp, linked and driven through FFI. The only backend implemented.
+    /// llama.cpp, linked and driven through FFI.
     LlamaCpp,
-    /// vLLM over its OpenAI-compatible HTTP API. Not implemented.
+    /// vLLM, hosted through its offline engine API.
     Vllm,
-    /// SGLang over its OpenAI-compatible HTTP API. Not implemented.
+    /// SGLang, hosted through its offline engine API.
     SgLang,
-    /// TensorRT-LLM via `trtllm-serve`, its OpenAI-compatible server.
+    /// TensorRT-LLM, hosted through its LLM API.
     TensorRtLlm,
-    /// MLX via `mlx_lm.server`. Apple Silicon.
-    MlxLm,
+    /// Hugging Face transformers, hosted; runs on the CPU as well as the GPU.
+    Transformers,
 }
 
 /// How the engine reaches a backend — see the module docs on why this decides
@@ -63,8 +59,9 @@ pub enum Backend {
 pub enum Integration {
     /// Compiled in and called through FFI; the engine owns the decode loop.
     Linked,
-    /// A separate process over HTTP; the runtime owns its own decode loop.
-    Served,
+    /// A confined child process the application supervises; the runtime owns
+    /// its own decode loop.
+    Hosted,
 }
 
 /// What a backend can and cannot do.
@@ -76,34 +73,34 @@ pub enum Integration {
 pub struct Capabilities {
     pub integration: Integration,
     /// Whether **this engine** can run its own speculative decoding here. False
-    /// for served backends — they speculate internally, which is not the same
+    /// for hosted backends — they speculate internally, which is not the same
     /// thing and must not be counted as ours.
     pub engine_speculation: bool,
     /// Whether per-position logits are visible, which speculation verification
-    /// requires and which nothing served exposes.
+    /// requires and which no hosted runtime exposes.
     pub logit_access: bool,
     /// Whether grammar-constrained decoding is available.
     pub structured_output: bool,
-    /// Whether the backend is implemented at all today.
+    /// Whether the backend can run in this build on this platform.
     pub implemented: bool,
 }
 
 impl Backend {
-    /// Every backend the engine knows about, implemented or not.
+    /// Every backend the engine knows about.
     #[must_use]
     pub fn all() -> &'static [Backend] {
-        &[Backend::LlamaCpp, Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::MlxLm]
+        &[Backend::LlamaCpp, Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::Transformers]
     }
 
-    /// Stable identifier used in configuration and logs.
+    /// Stable identifier used in configuration, logs and engine claims.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Backend::LlamaCpp => "llama.cpp",
             Backend::Vllm => "vllm",
             Backend::SgLang => "sglang",
             Backend::TensorRtLlm => "tensorrt-llm",
-            Backend::MlxLm => "mlx",
+            Backend::Transformers => "transformers",
         }
     }
 
@@ -118,7 +115,7 @@ impl Backend {
             "vllm" => Ok(Backend::Vllm),
             "sglang" | "sgl" => Ok(Backend::SgLang),
             "tensorrt.llm" | "tensorrtllm" | "trtllm" | "tensorrt" => Ok(Backend::TensorRtLlm),
-            "mlx" | "mlx.lm" | "mlxlm" => Ok(Backend::MlxLm),
+            "transformers" | "hf" => Ok(Backend::Transformers),
             _ => Err(Error::BackendUnknown {
                 name: s.to_string(),
                 known: Backend::all().iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", "),
@@ -137,28 +134,16 @@ impl Backend {
                 structured_output: true,
                 implemented: cfg!(feature = "bundled-llama"),
             },
-            // Both served backends expose an OpenAI-compatible API: a model,
-            // sampling parameters, and a JSON schema. None of that reaches
-            // inside their decode loop, so engine-side speculation is
-            // impossible by construction rather than merely unimplemented.
-            Backend::Vllm | Backend::SgLang | Backend::TensorRtLlm => Capabilities {
-                integration: Integration::Served,
-                engine_speculation: false,
-                logit_access: false,
-                structured_output: true,
-                implemented: true,
-            },
-            // MLX is the outlier and the reason `structured_output` is a
-            // capability rather than an assumption: `mlx_lm.server` never reads
-            // `response_format`, so a schema-constrained request degrades to
-            // free text with no error. Reporting that up front is the only way
-            // a caller finds out before the output is wrong.
-            Backend::MlxLm => Capabilities {
-                integration: Integration::Served,
+            // A hosted runtime receives a prompt and sampling parameters and
+            // streams text back. Nothing reaches inside its decode loop, so
+            // engine-side speculation is impossible by construction, and the
+            // host protocol carries no schema, so output is not constrained.
+            Backend::Vllm | Backend::SgLang | Backend::TensorRtLlm | Backend::Transformers => Capabilities {
+                integration: Integration::Hosted,
                 engine_speculation: false,
                 logit_access: false,
                 structured_output: false,
-                implemented: true,
+                implemented: cfg!(target_os = "linux"),
             },
         }
     }
@@ -173,21 +158,18 @@ impl Backend {
     ///
     /// # Errors
     /// [`Error::BackendUnavailable`] with the reason — a missing feature flag
-    /// reads differently from a backend nobody has written yet, and a caller
-    /// deserves to know which.
+    /// reads differently from a platform that cannot confine a runtime host,
+    /// and a caller deserves to know which.
     pub fn ensure_available(self) -> Result<()> {
         if self.is_available() {
             return Ok(());
         }
-        let reason = match self {
-            Backend::LlamaCpp => {
+        let reason = match self.supports().integration {
+            Integration::Linked => {
                 "the `bundled-llama` feature is not enabled; build with it, or pass in a \
                  backend the host application already links"
             }
-            Backend::Vllm | Backend::SgLang | Backend::TensorRtLlm | Backend::MlxLm => {
-                "served backends are reachable but need an endpoint; build one with \
-                 `served::Endpoint` and drive it with the caller's HTTP client"
-            }
+            Integration::Hosted => "runtime hosts need Linux namespaces, Landlock and seccomp",
         };
         Err(Error::BackendUnavailable { backend: self.as_str(), reason })
     }
@@ -200,8 +182,8 @@ impl fmt::Display for Backend {
 }
 
 impl Default for Backend {
-    /// llama.cpp: the only implemented backend, and the one whose linked
-    /// integration the acceleration paths are written against.
+    /// llama.cpp: the linked backend the acceleration paths are written
+    /// against.
     fn default() -> Self {
         Backend::LlamaCpp
     }
@@ -211,7 +193,7 @@ impl Default for Backend {
 ///
 /// Wraps [`spec_policy::plan`] with the one question that policy cannot answer
 /// on its own: whether this engine is even in a position to speculate here. A
-/// served backend runs its own decode loop, so the honest plan is
+/// hosted backend runs its own decode loop, so the honest plan is
 /// [`SpecMethod::None`](crate::spec_policy::SpecMethod::None) with a reason
 /// saying why — not a block size the caller would have no way to apply.
 #[must_use]
@@ -233,6 +215,8 @@ mod tests {
     use super::*;
     use crate::config::GenerationConfig;
 
+    const HOSTED: [Backend; 4] = [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::Transformers];
+
     #[test]
     fn names_round_trip() {
         for b in Backend::all() {
@@ -249,6 +233,8 @@ mod tests {
             ("  vLLM  ", Backend::Vllm),
             ("sglang", Backend::SgLang),
             ("SGL", Backend::SgLang),
+            ("trtllm", Backend::TensorRtLlm),
+            ("HF", Backend::Transformers),
         ] {
             assert_eq!(Backend::parse(s).unwrap(), want, "parsing {s:?}");
         }
@@ -258,8 +244,6 @@ mod tests {
     fn an_unknown_backend_is_refused_and_lists_the_known_ones() {
         // Never silently fall back to a default: a typo must be visible, not
         // quietly served by a different runtime than the caller asked for.
-        // "tensorrt" used to be the example here and is now a valid alias --
-        // pick something that is not a backend at all.
         let e = Backend::parse("gpt4all").unwrap_err();
         let msg = e.to_string();
         assert!(msg.contains("gpt4all"), "should name the bad input: {msg}");
@@ -267,35 +251,28 @@ mod tests {
     }
 
     #[test]
-    fn served_backends_do_not_offer_engine_speculation() {
-        for b in [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::MlxLm] {
+    fn hosted_backends_do_not_offer_engine_speculation() {
+        for b in HOSTED {
             let c = b.supports();
-            assert_eq!(c.integration, Integration::Served);
+            assert_eq!(c.integration, Integration::Hosted);
             assert!(!c.engine_speculation, "{b} must not claim our speculation");
-            assert!(!c.logit_access, "{b} cannot expose per-position logits over HTTP");
+            assert!(!c.logit_access, "{b} exposes no per-position logits through a host");
+            assert!(!c.structured_output, "the host protocol carries no schema");
         }
     }
 
     #[test]
-    fn served_backends_are_available() {
-        for b in [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::MlxLm] {
-            assert!(b.is_available(), "{b} has an adapter");
+    fn hosted_backends_run_where_hosts_can_be_confined() {
+        for b in HOSTED {
+            assert_eq!(b.is_available(), cfg!(target_os = "linux"), "{b}");
+            if !cfg!(target_os = "linux") {
+                assert!(b.ensure_available().unwrap_err().to_string().contains("Landlock"));
+            }
         }
     }
 
     #[test]
-    fn mlx_reports_that_it_cannot_constrain_output() {
-        // The trap this capability exists for: mlx_lm.server never reads
-        // `response_format`, so a schema-constrained request silently returns
-        // free text. A caller must be able to learn that before sending.
-        assert!(!Backend::MlxLm.supports().structured_output);
-        for b in [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm] {
-            assert!(b.supports().structured_output, "{b} does constrain output");
-        }
-    }
-
-    #[test]
-    fn planning_against_a_served_backend_never_speculates() {
+    fn planning_against_a_hosted_backend_never_speculates() {
         // The important case: policy alone would happily return a 4-token
         // block for an idle dense model. Against a backend we cannot interpose
         // on, that number is unusable and reporting it would be a lie.
@@ -331,20 +308,20 @@ mod tests {
     }
 
     #[test]
-    fn the_default_backend_is_the_implemented_one() {
+    fn the_default_backend_is_the_linked_one() {
         assert_eq!(Backend::default(), Backend::LlamaCpp);
     }
 
     #[test]
     fn every_backend_reports_its_integration_kind() {
-        // A backend added later must decide linked-vs-served deliberately,
+        // A backend added later must decide linked-vs-hosted deliberately,
         // because that is what determines whether acceleration applies at all.
         for b in Backend::all() {
             let c = b.supports();
             match c.integration {
                 Integration::Linked => assert!(c.logit_access, "{b}: linked implies logit access"),
-                Integration::Served => {
-                    assert!(!c.engine_speculation, "{b}: served cannot host our speculation");
+                Integration::Hosted => {
+                    assert!(!c.engine_speculation, "{b}: hosted cannot host our speculation");
                 }
             }
         }
