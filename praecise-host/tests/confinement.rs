@@ -34,6 +34,10 @@ fn main() {
         println!("confinement: confined (loopback only, home unreadable)");
     } else {
         assert!(stderr.contains("confinement refused"), "neither ran confined nor refused: {stderr}");
+        assert!(
+            stderr.contains("apparmor_restrict_unprivileged_userns") && stderr.contains("max_user_namespaces"),
+            "a refusal must name the settings that allow confinement: {stderr}"
+        );
         println!("confinement: refused as expected on this kernel: {}", stderr.trim());
     }
     let _ = std::fs::remove_dir_all(scratch);
