@@ -39,6 +39,10 @@ pub mod drafters;
 /// all, rather than how to draft them better. Backend-agnostic.
 pub mod entropy;
 pub mod error;
+/// Moving a live sequence's KV cache between engine instances of the same
+/// model: versioned, integrity-checked, incremental blobs. The format and its
+/// checks are backend-agnostic; export and import need a bundled backend.
+pub mod kv_migration;
 /// N-gram self-speculation. Backend-agnostic: it drafts from token history
 /// alone, so it compiles and is useful with or without a bundled backend.
 pub mod ngram;
@@ -61,6 +65,10 @@ pub mod shaping;
 /// Draft verification: acceptance relations, and multi-draft sampling without
 /// replacement. Backend-agnostic.
 pub mod verify;
+/// Standby weights: resident in host RAM without engine or device memory, and
+/// a fast activation into a serving model. Unix only.
+#[cfg(unix)]
+pub mod staging;
 pub mod stream;
 pub mod toploc;
 
@@ -97,6 +105,11 @@ pub use error::{Error, Result};
 pub use shaping::{group_by_class, BatchClass, Rewrite};
 pub use prax::{Allocation, Prax, Signals};
 pub use verify::{acceptance_rate, expected_tokens, MultiDraftSampling};
+pub use kv_migration::{ImportChain, KvBlob, ModelFingerprint, KV_BLOB_VERSION};
+#[cfg(feature = "bundled-llama")]
+pub use kv_migration::{SequenceExport, SequenceImport};
+#[cfg(unix)]
+pub use staging::StagedWeights;
 pub use ngram::NgramCache;
 pub use spec_policy::{plan as plan_speculation, LoadState, ModelProfile, SpecMethod, SpecPlan, SpecPolicy};
 pub use prompt::render_chatml_prompt;
