@@ -117,7 +117,9 @@ pub use result::{ChatMessage, InferenceResult, StopReason};
 pub use stream::{matched_stop_len, StopStream};
 
 #[cfg(feature = "bundled-llama")]
-pub use batching::{max_slots, BatchEngine, BatchPrompt, BatchRequest};
+pub use batching::{
+    max_slots, BatchEngine, BatchPrompt, BatchRequest, SequenceHandoff, SequenceResume, SequenceTicket,
+};
 #[cfg(feature = "bundled-llama")]
 pub use loaded::{LoadedDrafter, LoadedModel};
 #[cfg(feature = "bundled-llama")]

@@ -92,6 +92,11 @@ pub enum Error {
     #[error("KV sequence error: {0}")]
     KvSequence(String),
 
+    /// The request's sequence was handed off to another engine with
+    /// `BatchEngine::detach_sequence`; its generation continues there.
+    #[error("sequence handed off to another engine")]
+    SequenceHandedOff,
+
     /// Staging or activating host-resident weights failed.
     #[error("Weight staging error: {0}")]
     Staging(String),
