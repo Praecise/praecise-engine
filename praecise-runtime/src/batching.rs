@@ -24,6 +24,27 @@
 //! extends every running sequence by its last sampled token, spends the
 //! remaining batch capacity prefilling prompts, runs one `llama_decode`, then
 //! samples each sequence from its own logits with its own sampler.
+//!
+//! ## Moving a sequence between engines
+//!
+//! An engine spawned with [`BatchEngine::spawn_with_migration`] reserves one
+//! extra KV sequence id past the slots as a staging area, and can move a
+//! running sequence to another engine serving the same weights without the
+//! destination re-reading its prompt. A request submitted with
+//! [`BatchEngine::submit_tracked`] gets a [`SequenceTicket`];
+//! [`BatchEngine::export_sequence`] returns the positions its slot gained since
+//! the previous export as an encoded [`KvBlob`](crate::KvBlob) (the attention
+//! cells, and on a model with recurrent layers the recurrent state at the last
+//! position), and [`BatchEngine::detach_sequence`] exports the final delta and
+//! takes the sequence out of the engine. [`BatchEngine::resume`] rebuilds it in
+//! a free slot of the destination from the chain of blobs and continues
+//! decoding from the token it had sampled last.
+//!
+//! Exports are taken by the scheduler thread between two decode steps, when
+//! every slot's cache is consistent, and cost the other slots only the time to
+//! copy the new positions out. A sequence still prefilling its prompt, closing
+//! a reasoning block, or whose last speculative step was rolled back on a
+//! recurrent model is exported at the first step boundary where it is not.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError};
@@ -43,6 +64,7 @@ use tracing::{info, warn};
 
 use crate::config::GenerationConfig;
 use crate::error::{Error, Result};
+use crate::kv_migration::{ModelFingerprint, SequenceExport, SequenceImport};
 use crate::prefix_cache::{
     CheckpointBudget, CheckpointStore, MediaSpan, MemoryTraits, Namespace, PrefixId, Reuse, Rewind, TurnEnds,
 };
@@ -169,11 +191,97 @@ pub type Projector = MtmdContext;
 #[cfg(not(feature = "mtmd"))]
 pub type Projector = ();
 
+/// Names a sequence submitted with [`BatchEngine::submit_tracked`] or
+/// [`BatchEngine::resume`], so it can be exported while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SequenceTicket(u64);
+
+/// A running sequence taken out of its engine by
+/// [`BatchEngine::detach_sequence`], with what another engine needs to resume
+/// it. The source request's `result_tx` receives
+/// [`Error::SequenceHandedOff`].
+pub struct SequenceHandoff {
+    /// The final delta of the sequence's blob chain: every position not
+    /// carried by an earlier [`BatchEngine::export_sequence`] of it.
+    pub blob: Vec<u8>,
+    /// The token sampled last. Its text was already streamed; it is not yet in
+    /// the cache, and the destination decodes it first.
+    pub next_token: i32,
+    /// Tokens generated before the handoff, for the destination's budget.
+    pub generated_tokens: u32,
+    /// All visible text generated before the handoff.
+    pub text: String,
+    /// All reasoning generated before the handoff.
+    pub thinking: Option<String>,
+    /// The reasoning markers the sequence was split on, with
+    /// `open_at_start` set when it was inside a reasoning span.
+    pub reasoning: ReasoningFrame,
+}
+
+/// A sequence to rebuild from its blob chain and continue, for
+/// [`BatchEngine::resume`].
+pub struct SequenceResume {
+    /// Every encoded blob of the chain, in export order, starting at position 0.
+    pub blobs: Vec<Vec<u8>>,
+    /// [`SequenceHandoff::next_token`].
+    pub next_token: i32,
+    /// [`SequenceHandoff::reasoning`].
+    pub reasoning: ReasoningFrame,
+    /// Sampling for the continuation. `max_tokens` counts tokens generated
+    /// after the resume; the imported positions are the request's input.
+    pub config: GenerationConfig,
+    /// Per-token streaming sink for the continuation.
+    pub token_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Streaming sink for the continuation's reasoning.
+    pub reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Where the continuation's [`InferenceResult`] (or error) is delivered.
+    pub result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
+}
+
+/// A request on its way to the scheduler, with the ticket it was given.
+struct Queued {
+    req: BatchRequest,
+    ticket: Option<u64>,
+}
+
+/// Where an export's answer goes.
+enum ExportReply {
+    Delta(tokio::sync::oneshot::Sender<Result<Vec<u8>>>),
+    Handoff(tokio::sync::oneshot::Sender<Result<SequenceHandoff>>),
+}
+
+impl ExportReply {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Delta(tx) => tx.is_closed(),
+            Self::Handoff(tx) => tx.is_closed(),
+        }
+    }
+
+    fn fail(self, err: Error) {
+        match self {
+            Self::Delta(tx) => drop(tx.send(Err(err))),
+            Self::Handoff(tx) => drop(tx.send(Err(err))),
+        }
+    }
+}
+
+struct PendingExport {
+    ticket: u64,
+    reply: ExportReply,
+}
+
+/// Migration requests, served by the scheduler between decode steps.
+enum Control {
+    Export(PendingExport),
+    Resume(Box<SequenceResume>, u64),
+}
+
 /// Handle to a per-model continuous-batching engine. Cloneable; every clone
 /// submits to the same scheduler thread.
 #[derive(Clone)]
 pub struct BatchEngine {
-    tx: SyncSender<BatchRequest>,
+    tx: SyncSender<Queued>,
     inner: Arc<EngineInner>,
 }
 
@@ -182,6 +290,11 @@ struct EngineInner {
     handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// Closing this drops the scheduler's receiver, ending the loop.
     shutdown: Sender<()>,
+    /// Exports and resumes, for an engine spawned with migration.
+    control: Sender<Control>,
+    /// The weights this engine serves, when it can move sequences.
+    migration: Option<ModelFingerprint>,
+    next_ticket: std::sync::atomic::AtomicU64,
 }
 
 /// Speculative decoding for the batch engine.
@@ -214,7 +327,40 @@ impl BatchEngine {
         context_length: u32,
         enable_thinking: bool,
     ) -> Result<Self> {
-        Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, None, None)
+        Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, None, None, None)
+    }
+
+    /// Spawn an engine that can export its running sequences to, and resume
+    /// sequences from, other engines serving the same weights. `fingerprint`
+    /// identifies those weights (see [`ModelFingerprint::of_file`]); a blob
+    /// made from other weights is refused. The context reserves one KV
+    /// sequence id beyond [`max_slots`] to stage copies through, which on a
+    /// model with recurrent layers costs one more sequence's recurrent state.
+    ///
+    /// # Errors
+    /// As [`spawn`](Self::spawn), and for an encoder-decoder model, whose
+    /// decoder cache depends on an encoder output that is not exported.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_migration(
+        model_id: String,
+        model: LlamaModel,
+        backend: Arc<LlamaBackend>,
+        context_length: u32,
+        enable_thinking: bool,
+        projector: Option<Projector>,
+        speculation: Option<BatchSpeculation>,
+        fingerprint: ModelFingerprint,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            model_id,
+            model,
+            backend,
+            context_length,
+            enable_thinking,
+            projector,
+            speculation,
+            Some(fingerprint),
+        )
     }
 
     /// [`spawn`](Self::spawn), with the model's multimodal projector.
@@ -232,7 +378,7 @@ impl BatchEngine {
         enable_thinking: bool,
         projector: Option<MtmdContext>,
     ) -> Result<Self> {
-        Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, projector, None)
+        Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, projector, None, None)
     }
 
     /// [`spawn_with_projector`](Self::spawn_with_projector), drafting and
@@ -247,9 +393,10 @@ impl BatchEngine {
         projector: Option<MtmdContext>,
         speculation: Option<BatchSpeculation>,
     ) -> Result<Self> {
-        Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, projector, speculation)
+        Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, projector, speculation, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_inner(
         model_id: String,
         model: LlamaModel,
@@ -258,6 +405,7 @@ impl BatchEngine {
         enable_thinking: bool,
         projector: Option<Projector>,
         speculation: Option<BatchSpeculation>,
+        migration: Option<ModelFingerprint>,
     ) -> Result<Self> {
         // This engine generates text a token at a time from a causal cache.
         // A model that does something else is refused here, with the reason,
@@ -275,12 +423,19 @@ impl BatchEngine {
                 }
             )));
         }
+        if migration.is_some() && traits.reuse() == Reuse::EncoderOutput {
+            return Err(Error::Other(format!(
+                "{model_id} cannot move sequences between engines: an encoder-decoder's decoder cache \
+                 depends on an encoder output that is not exported"
+            )));
+        }
         // Bounded: each queued request holds its whole prompt and any media
         // bytes, so a queue without a bound is memory without a bound. One
         // slot's worth of requests may wait behind the running ones; past
         // that, `submit` refuses and the caller's admission holds or sheds.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<BatchRequest>(max_slots());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(max_slots());
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+        let (control_tx, control_rx) = std::sync::mpsc::channel::<Control>();
 
         let model_id_thread = model_id.clone();
         let handle = std::thread::Builder::new()
@@ -295,7 +450,9 @@ impl BatchEngine {
                     projector,
                     speculation,
                     traits,
+                    migration,
                     &rx,
+                    &control_rx,
                     &shutdown_rx,
                 ) {
                     warn!(
@@ -312,6 +469,9 @@ impl BatchEngine {
                 model_id,
                 handle: std::sync::Mutex::new(Some(handle)),
                 shutdown: shutdown_tx,
+                control: control_tx,
+                migration,
+                next_ticket: std::sync::atomic::AtomicU64::new(1),
             }),
         })
     }
@@ -323,7 +483,101 @@ impl BatchEngine {
     /// queued behind the running ones, the request is refused with
     /// [`Error::QueueFull`] for the caller to hold or shed.
     pub fn submit(&self, req: BatchRequest) -> Result<()> {
-        self.tx.try_send(req).map_err(|e| match e {
+        self.enqueue(Queued { req, ticket: None })
+    }
+
+    /// [`submit`](Self::submit), returning a ticket that names the sequence
+    /// for [`export_sequence`](Self::export_sequence) and
+    /// [`detach_sequence`](Self::detach_sequence).
+    ///
+    /// # Errors
+    /// As [`submit`](Self::submit), and when the engine was not spawned with
+    /// [`spawn_with_migration`](Self::spawn_with_migration).
+    pub fn submit_tracked(&self, req: BatchRequest) -> Result<SequenceTicket> {
+        self.migration()?;
+        let ticket = self.new_ticket();
+        self.enqueue(Queued { req, ticket: Some(ticket) })?;
+        Ok(SequenceTicket(ticket))
+    }
+
+    /// Export the positions the ticket's sequence gained since its previous
+    /// export (all of them the first time) as an encoded [`KvBlob`](crate::KvBlob).
+    /// The sequence keeps decoding. The blob is taken at the next step
+    /// boundary where the sequence is exportable (see the module docs), and
+    /// the other slots are not paused beyond the copy.
+    ///
+    /// # Errors
+    /// Immediately when the engine cannot migrate; through the receiver when
+    /// no running sequence holds the ticket (it finished, failed or was
+    /// detached), when it holds media positions, or when the backend refuses.
+    pub fn export_sequence(
+        &self,
+        ticket: SequenceTicket,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<u8>>>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.control(Control::Export(PendingExport { ticket: ticket.0, reply: ExportReply::Delta(tx) }))?;
+        Ok(rx)
+    }
+
+    /// Export the ticket's sequence's final delta and take it out of this
+    /// engine, freeing its slot. Its request's `result_tx` receives
+    /// [`Error::SequenceHandedOff`]; the returned handoff, with the earlier
+    /// blobs of the chain, resumes it elsewhere through [`resume`](Self::resume).
+    ///
+    /// # Errors
+    /// As [`export_sequence`](Self::export_sequence).
+    pub fn detach_sequence(
+        &self,
+        ticket: SequenceTicket,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<SequenceHandoff>>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.control(Control::Export(PendingExport { ticket: ticket.0, reply: ExportReply::Handoff(tx) }))?;
+        Ok(rx)
+    }
+
+    /// Rebuild a sequence exported by another engine of the same weights in a
+    /// free slot, and continue decoding it without re-reading its prompt. It
+    /// waits for a slot ahead of submitted requests. A continuation does not
+    /// draft speculatively: the drafter never saw its prefix.
+    ///
+    /// Refusals arrive on `resume.result_tx`: a corrupt blob, a blob of other
+    /// weights, a broken or empty chain, or a chain longer than the context.
+    ///
+    /// # Errors
+    /// When the engine was not spawned with migration, or has stopped.
+    pub fn resume(&self, resume: SequenceResume) -> Result<SequenceTicket> {
+        let ticket = self.new_ticket();
+        self.control(Control::Resume(Box::new(resume), ticket))?;
+        Ok(SequenceTicket(ticket))
+    }
+
+    /// The weights this engine serves, when it was spawned with migration.
+    pub fn fingerprint(&self) -> Option<ModelFingerprint> {
+        self.inner.migration
+    }
+
+    fn migration(&self) -> Result<ModelFingerprint> {
+        self.inner.migration.ok_or_else(|| {
+            Error::KvSequence(format!(
+                "the batch engine for {} was not spawned with migration",
+                self.inner.model_id
+            ))
+        })
+    }
+
+    fn new_ticket(&self) -> u64 {
+        self.inner.next_ticket.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn control(&self, c: Control) -> Result<()> {
+        self.migration()?;
+        self.inner.control.send(c).map_err(|_| {
+            Error::Other(format!("batch engine for {} is no longer running", self.inner.model_id))
+        })
+    }
+
+    fn enqueue(&self, q: Queued) -> Result<()> {
+        self.tx.try_send(q).map_err(|e| match e {
             TrySendError::Full(_) => Error::QueueFull {
                 model_id: self.inner.model_id.clone(),
                 waiting: max_slots(),
@@ -643,6 +897,44 @@ struct Sequence {
     /// Media chunks waiting for the scheduler's media step.
     #[cfg(feature = "mtmd")]
     pending_media: Option<PendingMedia>,
+    /// The name callers export this sequence by, when it has one.
+    ticket: Option<u64>,
+    /// How far this sequence's cache has been exported.
+    exporter: Option<SequenceExport>,
+    /// The last step rolled back rejected drafts on a model with recurrent
+    /// layers. The rollback selects an earlier recurrent snapshot that only the
+    /// next decode applies, so until then the state cannot be copied.
+    rollback_pending: bool,
+}
+
+impl Sequence {
+    /// Whether the cache holds exactly `resident` and nothing is half done:
+    /// the prompt is in, a sampled token waits, no forced tokens are queued,
+    /// and no recurrent rollback is waiting on the next decode.
+    fn exportable_now(&self) -> bool {
+        self.pending_prompt.is_none()
+            && self.pending_token.is_some()
+            && self.forced.is_empty()
+            && !self.rollback_pending
+            && self.n_past as usize == self.resident.len()
+    }
+
+    /// Close this sequence's stream for a handoff and tell its caller.
+    fn hand_off(mut self, blob: Vec<u8>) -> SequenceHandoff {
+        let reasoning = ReasoningFrame { open_at_start: self.stream.in_reasoning(), ..self.stream.frame() };
+        let token_tx = self.token_tx.take();
+        let (text, thinking) = self.stream.close(token_tx.as_ref());
+        let _ = self.stream.flush(token_tx.as_ref());
+        self.fail(Error::SequenceHandedOff);
+        SequenceHandoff {
+            blob,
+            next_token: self.pending_token.map_or(-1, |t| t.0),
+            generated_tokens: self.output_tokens - self.forced_tokens,
+            text,
+            thinking,
+            reasoning,
+        }
+    }
 }
 
 /// A multimodal prompt's chunks, and which chunk each media span is.
@@ -1107,20 +1399,29 @@ fn scheduler_loop(
     projector: Option<Projector>,
     speculation: Option<BatchSpeculation>,
     traits: MemoryTraits,
-    rx: &Receiver<BatchRequest>,
+    migration: Option<ModelFingerprint>,
+    rx: &Receiver<Queued>,
+    control_rx: &Receiver<Control>,
     shutdown_rx: &Receiver<()>,
 ) -> Result<()> {
     use std::num::NonZeroU32;
 
     let n_ctx = NonZeroU32::new(context_length).unwrap_or(NonZeroU32::new(8192).unwrap());
     let kind = traits.reuse();
+    // An engine that moves sequences stages copies through one sequence id
+    // past the slots, which no request ever decodes into.
+    let scratch = max_slots() as i32;
+    let seq_ids = max_slots() as u32 + u32::from(migration.is_some());
+    // Rolling back rejected drafts on a recurrent layer defers the restore to
+    // the next decode (see `Sequence::rollback_pending`).
+    let recurrent_state = model.is_recurrent() || model.is_hybrid();
 
     // One long-lived context with max_slots() sequence slots. n_batch/n_ubatch
     // cover the interleaved prefill+extend batch.
     let context_params = |n_ctx: NonZeroU32| {
         let mut params = LlamaContextParams::default()
             .with_n_ctx(Some(n_ctx))
-            .with_n_seq_max(max_slots() as u32)
+            .with_n_seq_max(seq_ids)
             // One KV pool shared by every sequence. Without it `n_ctx` is split
             // evenly, so each request is capped at `n_ctx / slots` however little
             // the others use — at 32 slots a 131k model answers in 4k.
@@ -1272,7 +1573,11 @@ fn scheduler_loop(
     let mut draining: Vec<Draining> = Vec::new();
     // An encoder-decoder model keeps one encoder output in its context, so it
     // decodes one request at a time; the others wait here, in order.
-    let mut waiting: std::collections::VecDeque<BatchRequest> = std::collections::VecDeque::new();
+    let mut waiting: std::collections::VecDeque<Queued> = std::collections::VecDeque::new();
+    // Exports waiting for their sequence to reach a step boundary it can be
+    // copied at, and sequences waiting for a slot to be rebuilt in.
+    let mut exports: Vec<PendingExport> = Vec::new();
+    let mut resumes: std::collections::VecDeque<(Box<SequenceResume>, u64)> = std::collections::VecDeque::new();
     // The encoder input whose output the context currently holds.
     let mut encoded: Option<(Namespace, Vec<LlamaToken>)> = None;
     // Counts admissions, for least-recently-used eviction.
@@ -1320,26 +1625,49 @@ fn scheduler_loop(
             }
         }
 
+        // Migration: take new exports and resumes, then answer every export
+        // whose sequence is at a consistent point. Between two decode steps
+        // nothing is in flight, so the copy sees one step's state throughout.
+        while let Ok(c) = control_rx.try_recv() {
+            match c {
+                Control::Export(e) => exports.push(e),
+                Control::Resume(r, ticket) => resumes.push_back((r, ticket)),
+            }
+        }
+        if let Some(fp) = migration {
+            serve_exports(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, &mut exports, fp, scratch);
+        }
+
         // An encoder-decoder model decodes one request at a time.
         let capacity = if policy.kind == Reuse::EncoderOutput { 1 } else { slots.len() };
+
+        // A moved sequence already holds a client mid-answer, so it takes a
+        // free slot ahead of requests that have not started.
+        if let Some(fp) = migration {
+            while slots.iter().filter(|s| s.is_some()).count() < capacity {
+                let Some((resume, ticket)) = resumes.pop_front() else { break };
+                tick += 1;
+                admit_resume(&model, &mut ctx, &mut draft_ctx, ctx_size, &mut slots, &mut cached, fp, scratch, *resume, ticket, tick);
+            }
+        }
         let active = slots.iter().filter(|s| s.is_some()).count();
 
         // Admit new requests into free slots. When idle, block (bounded) on the
         // first one so the thread parks instead of spinning; then drain the rest
         // non-blocking.
-        if active == 0 && waiting.is_empty() {
+        if active == 0 && waiting.is_empty() && resumes.is_empty() {
             match rx.recv_timeout(IDLE_POLL) {
-                Ok(req) => waiting.push_back(req),
+                Ok(q) => waiting.push_back(q),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         // Fill any remaining free slots without blocking.
         while slots.iter().filter(|s| s.is_some()).count() < capacity {
-            let req = match waiting.pop_front() {
-                Some(req) => req,
+            let Queued { req, ticket } = match waiting.pop_front() {
+                Some(q) => q,
                 None => match rx.try_recv() {
-                    Ok(req) => req,
+                    Ok(q) => q,
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 },
             };
@@ -1360,6 +1688,9 @@ fn scheduler_loop(
             ) {
                 let reuse_slot = r.slot_idx;
                 cached[reuse_slot].last_used = tick;
+                if let Some(seq) = slots[reuse_slot].as_mut() {
+                    seq.ticket = ticket;
+                }
                 let held = apply_prefix_reuse(&mut ctx, &mut slots, &mut cached, &policy, r);
                 draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held as u32));
             }
@@ -1624,15 +1955,20 @@ fn scheduler_loop(
 
         // Sample each sequence from its own logits index.
         for (logits_idx, slot_idx) in logits_slot {
+            // This decode applied any recurrent rollback still pending.
+            if let Some(seq) = slots[slot_idx].as_mut() {
+                seq.rollback_pending = false;
+            }
             let block = std::mem::take(&mut drafts[slot_idx]);
             let done = if block.is_empty() {
                 sample_into(&model, &ctx, &mut slots, slot_idx, logits_idx, model_id)
             } else {
                 let (done, accepted) =
                     sample_block_into(&model, &ctx, &mut slots, slot_idx, logits_idx, &block, model_id);
-                if let Some(seq) = slots[slot_idx].as_ref() {
+                if let Some(seq) = slots[slot_idx].as_mut() {
                     // Rejected drafts were written into both caches; take them out.
                     let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), Some(seq.n_past as u32), None);
+                    seq.rollback_pending = recurrent_state;
                     draft_seq_rm(&mut draft_ctx, seq.seq_id, Some(seq.n_past as u32));
                     if let Some(sp) = spec.as_mut() {
                         let _ = sp.accept(seq.seq_id, accepted);
@@ -1652,8 +1988,14 @@ fn scheduler_loop(
             seq.fail(Error::Other("batch engine shutting down".into()));
         }
     }
-    for req in waiting {
-        let _ = req.result_tx.send(Err(Error::Other("batch engine shutting down".into())));
+    for q in waiting {
+        let _ = q.req.result_tx.send(Err(Error::Other("batch engine shutting down".into())));
+    }
+    for (resume, _) in resumes {
+        let _ = resume.result_tx.send(Err(Error::Other("batch engine shutting down".into())));
+    }
+    for e in exports {
+        e.reply.fail(Error::Other("batch engine shutting down".into()));
     }
     // Finished results still waiting on their streams are delivered as they
     // are: the engine will not flush them again.
@@ -1712,6 +2054,150 @@ fn finalize_and_free(
     if let Some(d) = seq.finish() {
         draining.push(d);
     }
+}
+
+/// Answer every export whose sequence can be copied now; keep the rest for a
+/// later step boundary. Runs on the scheduler thread between decode steps.
+#[allow(clippy::too_many_arguments)]
+fn serve_exports(
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    draft: &mut Option<llama_cpp_2::context::LlamaContext<'_>>,
+    slots: &mut [Option<Sequence>],
+    cached: &mut [CachedPrefix],
+    exports: &mut Vec<PendingExport>,
+    fp: ModelFingerprint,
+    scratch: i32,
+) {
+    let mut i = 0;
+    while i < exports.len() {
+        if exports[i].reply.is_closed() {
+            exports.remove(i);
+            continue;
+        }
+        let ticket = exports[i].ticket;
+        let Some(slot_idx) = slots.iter().position(|s| s.as_ref().is_some_and(|s| s.ticket == Some(ticket))) else {
+            exports.remove(i).reply.fail(Error::KvSequence(format!(
+                "no running sequence holds ticket {ticket}: it finished, failed or was handed off"
+            )));
+            continue;
+        };
+        let seq = slots[slot_idx].as_mut().expect("slot found above");
+        if seq.multimodal {
+            exports.remove(i).reply.fail(Error::KvSequence(
+                "a sequence holding media positions cannot be exported".into(),
+            ));
+            continue;
+        }
+        if !seq.exportable_now() {
+            i += 1;
+            continue;
+        }
+        let seq_id = seq.seq_id;
+        let blob = seq
+            .exporter
+            .get_or_insert_with(|| SequenceExport::new(fp, seq_id, scratch))
+            .export(ctx, &seq.resident);
+        match (exports.remove(i).reply, blob) {
+            (ExportReply::Delta(tx), blob) => {
+                let _ = tx.send(blob);
+            }
+            (ExportReply::Handoff(tx), Err(e)) => {
+                let _ = tx.send(Err(e));
+            }
+            (ExportReply::Handoff(tx), Ok(blob)) => {
+                let seq = slots[slot_idx].take().expect("slot found above");
+                let _ = ctx.clear_kv_cache_seq(Some(slot_idx as u32), None, None);
+                draft_seq_rm(draft, slot_idx as i32, None);
+                cached[slot_idx].forget();
+                let _ = tx.send(Ok(seq.hand_off(blob)));
+            }
+        }
+    }
+}
+
+/// Rebuild a moved sequence in a free slot from its blob chain and set it to
+/// decode its last sampled token next. A refusal goes to the resume's
+/// `result_tx` and leaves the slot empty.
+#[allow(clippy::too_many_arguments)]
+fn admit_resume(
+    model: &LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    draft: &mut Option<llama_cpp_2::context::LlamaContext<'_>>,
+    ctx_size: i32,
+    slots: &mut [Option<Sequence>],
+    cached: &mut [CachedPrefix],
+    fp: ModelFingerprint,
+    scratch: i32,
+    resume: SequenceResume,
+    ticket: u64,
+    tick: u64,
+) {
+    // The free slot whose cached prefix is worth least: an empty one, else
+    // the one least recently used.
+    let Some(slot_idx) = (0..slots.len())
+        .filter(|&i| slots[i].is_none())
+        .min_by_key(|&i| (!cached[i].ids.is_empty(), cached[i].last_used))
+    else {
+        let _ = resume.result_tx.send(Err(Error::KvSequence("no free slot to resume into".into())));
+        return;
+    };
+    let _ = ctx.clear_kv_cache_seq(Some(slot_idx as u32), None, None);
+    draft_seq_rm(draft, slot_idx as i32, None);
+    cached[slot_idx].forget();
+
+    let refuse = |ctx: &mut llama_cpp_2::context::LlamaContext, tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>, e: Error| {
+        let _ = ctx.clear_kv_cache_seq(Some(slot_idx as u32), None, None);
+        let _ = tx.send(Err(e));
+    };
+    let mut importer = SequenceImport::new(fp, slot_idx as i32, scratch);
+    let mut tokens: Vec<LlamaToken> = Vec::new();
+    for encoded in &resume.blobs {
+        match importer.apply(ctx, encoded) {
+            Ok(blob) => tokens.extend(blob.tokens.into_iter().map(LlamaToken)),
+            Err(e) => return refuse(ctx, resume.result_tx, e),
+        }
+    }
+    if tokens.is_empty() {
+        return refuse(ctx, resume.result_tx, Error::KvSequence("the blob chain carries no positions".into()));
+    }
+    let n = tokens.len();
+    if n as i32 >= ctx_size {
+        return refuse(
+            ctx,
+            resume.result_tx,
+            Error::Inference(format!("resumed sequence of {n} positions exceeds context window {ctx_size}")),
+        );
+    }
+    let staged = Staged {
+        ids: text_ids(&tokens),
+        tokens: tokens.clone(),
+        spans: Vec::new(),
+        #[cfg(feature = "mtmd")]
+        media: None,
+    };
+    let namespace = Namespace::of(resume.config.cache_salt.as_deref());
+    let max_pos = ctx_size.min(n as i32 + resume.config.max_tokens as i32);
+    let mut seq = Sequence::new(
+        model,
+        resume.config,
+        resume.token_tx,
+        resume.reasoning_tx,
+        resume.result_tx,
+        resume.reasoning,
+        staged,
+        namespace,
+        max_pos,
+    );
+    // The cache already holds every position: nothing to prefill, and the
+    // first decode feeds the token the source sampled last.
+    seq.pending_prompt = None;
+    seq.resident = tokens;
+    seq.n_past = n as i32;
+    seq.cached_tokens = n as u32;
+    seq.pending_token = Some(LlamaToken(resume.next_token));
+    seq.ticket = Some(ticket);
+    cached[slot_idx].last_used = tick;
+    install(slots, slot_idx, seq);
 }
 
 /// Drop the part of a slot's KV cache that the new prompt diverges from, and
@@ -2032,6 +2518,9 @@ impl Sequence {
             pending_token: None,
             #[cfg(feature = "mtmd")]
             pending_media: staged.media,
+            ticket: None,
+            exporter: None,
+            rollback_pending: false,
         }
     }
 }
@@ -2503,6 +2992,9 @@ mod prefix_tests {
             budget_closed: false,
             #[cfg(feature = "mtmd")]
             pending_media: None,
+            ticket: None,
+            exporter: None,
+            rollback_pending: false,
         }
     }
 

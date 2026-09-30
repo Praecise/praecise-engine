@@ -35,9 +35,18 @@
 //! is a metadata update rather than a buffer copy. Both are checked at run
 //! time and refused rather than assumed.
 //!
-//! Models whose memory is not an append-only attention cache (recurrent and
-//! hybrid-recurrent models) are refused: their state at position `n` is not
-//! the concatenation of per-position deltas.
+//! ## Recurrent and hybrid models
+//!
+//! A recurrent layer (Mamba, RWKV, Gated Delta Net and the like) keeps one
+//! fixed-size state per sequence that every new position overwrites, so it is
+//! not the concatenation of per-position deltas. For a model with recurrent
+//! layers, every blob carries its attention cells for the new positions as
+//! usual, plus the recurrent state as it stands after the blob's last position.
+//! Applying a blob replaces the destination's recurrent state with it, which
+//! is correct precisely because chain order is enforced: the state in the last
+//! applied blob is the state at the position the sequence is rebuilt to. A
+//! purely recurrent model has no attention cells, and its blobs carry the state
+//! alone.
 
 use sha2::{Digest, Sha256};
 
@@ -290,6 +299,21 @@ mod backend {
         Error::KvSequence(m.into())
     }
 
+    /// Whether the model keeps recurrent state beside (or instead of) an
+    /// attention cache.
+    fn has_recurrent_state(ctx: &LlamaContext<'_>) -> bool {
+        ctx.model.is_recurrent() || ctx.model.is_hybrid()
+    }
+
+    /// Position range `(min, max)` a sequence reports once it holds cells for
+    /// `p0 .. n`. A recurrent state reports only its last position, and a
+    /// hybrid memory reports the intersection of its parts, so with recurrent
+    /// state both ends are `n - 1`.
+    fn held_range(ctx: &LlamaContext<'_>, p0: u32, n: u32) -> (i32, i32) {
+        let last = n as i32 - 1;
+        if has_recurrent_state(ctx) { (last, last) } else { (p0 as i32, last) }
+    }
+
     /// Number of positions a sequence holds, requiring them to be `0..n`.
     fn seq_len(ctx: &LlamaContext<'_>, seq: i32) -> Result<u32> {
         let max = ctx.kv_cache_seq_pos_max(seq);
@@ -297,7 +321,9 @@ mod backend {
             return Ok(0);
         }
         let min = ctx.kv_cache_seq_pos_min(seq);
-        if min != 0 {
+        // With recurrent state the reported minimum is the state's position,
+        // the last one; the attention part cannot be asked on its own.
+        if !has_recurrent_state(ctx) && min != 0 {
             return Err(seq_err(format!(
                 "sequence {seq} starts at position {min}, not 0; only a full prefix can be migrated"
             )));
@@ -319,11 +345,6 @@ mod backend {
 
     /// Refuse contexts the scratch-sequence technique is not safe on.
     fn check_context(ctx: &LlamaContext<'_>, seq: i32, scratch: i32) -> Result<()> {
-        if ctx.model.is_recurrent() || ctx.model.is_hybrid() {
-            return Err(seq_err(
-                "model memory is recurrent or hybrid, not an append-only attention cache",
-            ));
-        }
         if seq == scratch || seq < 0 || scratch < 0 {
             return Err(seq_err("sequence and scratch ids must be distinct and non-negative"));
         }
@@ -336,10 +357,14 @@ mod backend {
         if ctx.kv_cache_seq_pos_max(scratch) >= 0 {
             return Err(seq_err(format!("scratch sequence {scratch} is not empty")));
         }
+        // A purely recurrent model has no attention cells to copy by range.
+        if ctx.model.is_recurrent() {
+            return Ok(());
+        }
         // An empty sequence's state is a magic and the sequence id, then the
-        // cache's stream count and an empty cell count per stream. A unified
-        // buffer has exactly one stream; per-sequence streams cannot copy a
-        // partial range between sequences (the backend aborts).
+        // attention cache's stream count and an empty cell count per stream. A
+        // unified buffer has exactly one stream; per-sequence streams cannot
+        // copy a partial range between sequences (the backend aborts).
         let bytes = seq_state(ctx, scratch)?;
         if bytes.len() < 12 || u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) != 1 {
             return Err(seq_err("context KV buffer is not unified (build it with kv_unified = true)"));
@@ -405,7 +430,7 @@ mod backend {
                 let got = (ctx.kv_cache_seq_pos_min(self.scratch), ctx.kv_cache_seq_pos_max(self.scratch));
                 let state = seq_state(ctx, self.scratch);
                 let _ = ctx.clear_kv_cache_seq(Some(self.scratch as u32), None, None);
-                if got != (p0 as i32, n as i32 - 1) {
+                if got != held_range(ctx, p0, n) {
                     return Err(seq_err(format!(
                         "staged range {got:?} does not match positions {p0}..{n}"
                     )));
@@ -472,7 +497,7 @@ mod backend {
                     ctx.state_seq_set_data_ext(&blob.payload, self.scratch, LlamaStateSeqFlags::empty())
                 };
                 let got = (ctx.kv_cache_seq_pos_min(self.scratch), ctx.kv_cache_seq_pos_max(self.scratch));
-                let want = (blob.base_pos as i32, blob.end_pos() as i32 - 1);
+                let want = held_range(ctx, blob.base_pos, blob.end_pos());
                 if !ok || got != want {
                     let _ = ctx.clear_kv_cache_seq(Some(self.scratch as u32), None, None);
                     return Err(seq_err(format!(
