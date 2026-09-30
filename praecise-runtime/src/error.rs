@@ -73,6 +73,29 @@ pub enum Error {
         reason: String,
     },
 
+    /// A KV-cache blob is malformed, truncated, of an unknown version or fails
+    /// its integrity digest.
+    #[error("KV blob rejected: {0}")]
+    KvBlob(String),
+
+    /// A KV-cache blob or engine state was made with different weights.
+    #[error("Model mismatch: expected weights {expected}, found {found}")]
+    ModelMismatch {
+        /// Fingerprint of the weights on this side.
+        expected: String,
+        /// Fingerprint the other side claims.
+        found: String,
+    },
+
+    /// A sequence cannot be exported or imported in its current state (out of
+    /// order, rewound, or a context that cannot stage a range).
+    #[error("KV sequence error: {0}")]
+    KvSequence(String),
+
+    /// Staging or activating host-resident weights failed.
+    #[error("Weight staging error: {0}")]
+    Staging(String),
+
     /// JSON serialization error.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

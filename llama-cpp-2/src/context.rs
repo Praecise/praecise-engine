@@ -89,6 +89,12 @@ impl<'model> LlamaContext<'model> {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
     }
 
+    /// Gets the maximum number of distinct sequences the context holds.
+    #[must_use]
+    pub fn n_seq_max(&self) -> u32 {
+        unsafe { llama_cpp_sys_2::llama_n_seq_max(self.context.as_ptr()) }
+    }
+
     /// Decodes the batch.
     ///
     /// # Errors
