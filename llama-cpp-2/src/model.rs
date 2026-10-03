@@ -470,6 +470,24 @@ impl LlamaModel {
         unsafe { llama_cpp_sys_2::llama_model_n_embd_out(self.model.as_ptr()) }
     }
 
+    /// Whether tokenizing an input prepends the beginning-of-sequence token.
+    #[must_use]
+    pub fn vocab_adds_bos(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_vocab_get_add_bos(self.vocab_ptr()) }
+    }
+
+    /// Whether tokenizing an input appends the end-of-sequence token.
+    #[must_use]
+    pub fn vocab_adds_eos(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_vocab_get_add_eos(self.vocab_ptr()) }
+    }
+
+    /// Whether tokenizing an input appends the separator token.
+    #[must_use]
+    pub fn vocab_adds_sep(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_vocab_get_add_sep(self.vocab_ptr()) }
+    }
+
     /// The model's classification output width (`n_cls_out`, default 1) — the
     /// width of a RANK-pooled embeddings read (llama.h:1029).
     #[must_use]

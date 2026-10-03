@@ -93,6 +93,14 @@ pub mod ngram_decode;
 #[cfg(feature = "bundled-llama")]
 pub mod speculative;
 
+/// Cross-encoder reranking. Compiled only with a bundled backend.
+#[cfg(feature = "bundled-llama")]
+pub mod rerank;
+
+/// Speech synthesis through an audio projector. Compiled only with `mtmd`.
+#[cfg(feature = "mtmd")]
+pub mod speech;
+
 pub use admission::{
     Class as AdmissionClass, Client as AdmissionClient, CostModel, Decision as AdmissionDecision, Estimate, Observation,
     Policy as AdmissionPolicy, Refusal as AdmissionRefusal, Scheduler, Shape,

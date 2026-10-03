@@ -1065,3 +1065,219 @@ pub enum MtmdEvalError {
     #[error("Eval failed with code: {0}")]
     EvalFailure(i32),
 }
+
+/// The kind of audio a multimodal projector generates, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtmdGenAudioType {
+    /// The projector does not generate audio.
+    None,
+    /// Qwen3-TTS: discrete speech codes decoded to a waveform.
+    Qwen3Tts,
+    /// Pocket TTS: continuous latents decoded to a waveform.
+    PocketTts,
+}
+
+impl MtmdContext {
+    /// The kind of audio this projector generates.
+    ///
+    /// # Errors
+    ///
+    /// When the backend reports a kind this wrapper does not know.
+    pub fn gen_audio_type(&self) -> Result<MtmdGenAudioType, MtmdGenAudioError> {
+        let info = unsafe { llama_cpp_sys_2::mtmd_gen_audio_get_info(self.context.as_ptr()) };
+        match info.type_ {
+            llama_cpp_sys_2::MTMD_GEN_AUDIO_TYPE_NONE => Ok(MtmdGenAudioType::None),
+            llama_cpp_sys_2::MTMD_GEN_AUDIO_TYPE_QWEN3TTS => Ok(MtmdGenAudioType::Qwen3Tts),
+            llama_cpp_sys_2::MTMD_GEN_AUDIO_TYPE_POCKETTTS => Ok(MtmdGenAudioType::PocketTts),
+            other => Err(MtmdGenAudioError::UnknownType(i64::from(other))),
+        }
+    }
+}
+
+/// What to speak.
+#[derive(Debug)]
+pub struct MtmdGenAudioInput<'a> {
+    /// The text.
+    pub text: &'a str,
+    /// Reference audio of the voice to speak in, where the model takes one.
+    pub speaker_reference: Option<&'a MtmdBitmap>,
+    /// Language, where the model takes one.
+    pub language: Option<&'a str>,
+    /// Top-k for the projector's own sampling.
+    pub top_k: i32,
+    /// Top-p for the projector's own sampling.
+    pub top_p: f32,
+    /// Seed for the projector's own sampling.
+    pub seed: u32,
+}
+
+/// One frame step's result.
+#[derive(Debug, Clone, Copy)]
+pub struct MtmdGenAudioStep {
+    /// The hidden state to feed the next step; `None` when no frame was made.
+    pub h_state: Option<*const f32>,
+    /// The model reached the end of speech.
+    pub stop: bool,
+}
+
+/// Audio generation over a language-model context and its projector: the
+/// prompt is read, then each step turns the backbone's hidden state into one
+/// frame of audio features, which are decoded to a waveform in chunks.
+///
+/// The generator holds raw pointers into the language-model context and the
+/// projector; both must outlive it, and the language-model context must not
+/// be used for anything else while it runs.
+#[derive(Debug)]
+pub struct MtmdGenAudio {
+    ptr: NonNull<llama_cpp_sys_2::mtmd_helper_gen_audio>,
+    // Inputs the backend reads while a generation runs.
+    text: CString,
+    language: Option<CString>,
+}
+
+impl MtmdGenAudio {
+    /// A generator over `ctx` (its embeddings output enabled) and `mtmd`.
+    ///
+    /// # Errors
+    ///
+    /// When the backend refuses the pair.
+    pub fn new(ctx: &mut LlamaContext<'_>, mtmd: &MtmdContext) -> Result<Self, MtmdGenAudioError> {
+        let ptr = unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_init(ctx.context.as_ptr(), mtmd.context.as_ptr()) };
+        let ptr = NonNull::new(ptr).ok_or(MtmdGenAudioError::Init)?;
+        Ok(Self {
+            ptr,
+            text: CString::default(),
+            language: None,
+        })
+    }
+
+    /// Start a new generation for `input`, dropping any audio made before.
+    ///
+    /// # Errors
+    ///
+    /// When the text holds a NUL byte or the backend refuses the input.
+    pub fn set_input(&mut self, input: &MtmdGenAudioInput<'_>) -> Result<(), MtmdGenAudioError> {
+        unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_reset(self.ptr.as_ptr()) };
+        self.text = CString::new(input.text)?;
+        self.language = input.language.map(CString::new).transpose()?;
+        let inp = llama_cpp_sys_2::mtmd_helper_gen_audio_inp {
+            seq_id: 0,
+            prompt: self.text.as_ptr(),
+            prompt_len: input.text.len(),
+            speaker_ref: input.speaker_reference.map_or(std::ptr::null_mut(), |b| b.bitmap.as_ptr()),
+            lang: self.language.as_ref().map_or(std::ptr::null(), |l| l.as_ptr()),
+            top_k: input.top_k,
+            top_p: input.top_p,
+            seed: input.seed,
+            out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
+        };
+        match unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_set_input(self.ptr.as_ptr(), &raw const inp) } {
+            0 => Ok(()),
+            code => Err(MtmdGenAudioError::Step(code)),
+        }
+    }
+
+    /// Read at most `n_batch` prompt tokens; returns how many remain.
+    ///
+    /// # Errors
+    ///
+    /// When the backend fails to decode.
+    pub fn step_prompt(&mut self, n_batch: i32) -> Result<usize, MtmdGenAudioError> {
+        let left = unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_step_prompt(self.ptr.as_ptr(), n_batch) };
+        usize::try_from(left).map_err(|_| MtmdGenAudioError::Step(left))
+    }
+
+    /// Make one frame from the backbone's `sampled` token (if the pipeline
+    /// has one) and its hidden state.
+    ///
+    /// # Errors
+    ///
+    /// When the backend fails.
+    ///
+    /// # Safety
+    ///
+    /// `h_state` must point at a hidden state of the backbone's width that
+    /// stays valid for the call: the last output row of the context, or the
+    /// state a previous step returned.
+    pub unsafe fn step_gen(
+        &mut self,
+        sampled: Option<LlamaToken>,
+        h_state: *const f32,
+    ) -> Result<MtmdGenAudioStep, MtmdGenAudioError> {
+        let mut out: *const f32 = std::ptr::null();
+        let mut stop = false;
+        let code = unsafe {
+            llama_cpp_sys_2::mtmd_helper_gen_audio_step_gen(
+                self.ptr.as_ptr(),
+                sampled.map_or(-1, |t| t.0),
+                h_state,
+                &raw mut out,
+                &raw mut stop,
+            )
+        };
+        if code != 0 {
+            return Err(MtmdGenAudioError::Step(code));
+        }
+        Ok(MtmdGenAudioStep {
+            h_state: (!out.is_null()).then_some(out),
+            stop,
+        })
+    }
+
+    /// The waveform made so far: its sample rate and its mono samples in
+    /// [-1, 1].
+    ///
+    /// # Errors
+    ///
+    /// When the backend fails to decode the pending frames.
+    pub fn pcm(&mut self) -> Result<(u32, &[f32]), MtmdGenAudioError> {
+        let mut rate = 0i32;
+        let mut data: *const std::os::raw::c_char = std::ptr::null();
+        let mut len = 0usize;
+        let mut n = 0i64;
+        let code = unsafe {
+            llama_cpp_sys_2::mtmd_helper_gen_audio_get_output(
+                self.ptr.as_ptr(),
+                &raw mut rate,
+                &raw mut data,
+                &raw mut len,
+                &raw mut n,
+            )
+        };
+        if code != 0 {
+            return Err(MtmdGenAudioError::Step(code));
+        }
+        let rate = u32::try_from(rate).map_err(|_| MtmdGenAudioError::Step(rate))?;
+        if data.is_null() || n <= 0 {
+            return Ok((rate, &[]));
+        }
+        // The PCM output is the backend's `std::vector<float>` storage handed
+        // out as bytes, so it is aligned for `f32`.
+        #[allow(clippy::cast_ptr_alignment)]
+        let samples = unsafe { slice::from_raw_parts(data.cast::<f32>(), usize::try_from(n).unwrap_or(0)) };
+        Ok((rate, samples))
+    }
+}
+
+impl Drop for MtmdGenAudio {
+    fn drop(&mut self) {
+        unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_free(self.ptr.as_ptr()) }
+    }
+}
+
+/// Errors of audio generation.
+#[derive(thiserror::Error, Debug)]
+pub enum MtmdGenAudioError {
+    /// The backend refused to create a generator.
+    #[error("audio generation could not start")]
+    Init,
+    /// A step failed with the backend's code.
+    #[error("audio generation step failed with code {0}")]
+    Step(i32),
+    /// The backend reported an audio kind this wrapper does not know.
+    #[error("unknown generated-audio kind {0}")]
+    UnknownType(i64),
+    /// Text or language held a NUL byte.
+    #[error("text holds a NUL byte: {0}")]
+    Nul(#[from] std::ffi::NulError),
+}
