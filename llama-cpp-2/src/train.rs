@@ -239,6 +239,20 @@ impl LlamaContext<'_> {
     pub fn grad_reset(&mut self) {
         unsafe { llama_cpp_sys_2::llama_opt_grad_reset(self.context.as_ptr()) }
     }
+
+    /// Distinct op names of the graph the last [`Self::grad_sequence`] evaluated, forward and
+    /// backward, in ascending order.
+    #[must_use]
+    pub fn grad_graph_ops(&self) -> Vec<String> {
+        let ctx = self.context.as_ptr();
+        let n = unsafe { llama_cpp_sys_2::llama_opt_grad_n_ops(ctx) };
+        (0..n)
+            .filter_map(|i| {
+                let p = unsafe { llama_cpp_sys_2::llama_opt_grad_op(ctx, i) };
+                (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+            })
+            .collect()
+    }
 }
 
 impl LlamaModel {

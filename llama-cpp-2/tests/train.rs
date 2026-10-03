@@ -117,6 +117,9 @@ fn lora_gradients_match_finite_differences() {
     let mut logits = vec![0.0f32; tokens.len() * N_VOCAB];
     ctx.grad_sequence(&tokens, Some(&targets), Some(&mut logits)).unwrap();
 
+    let ops = ctx.grad_graph_ops();
+    assert!(ops.iter().any(|o| o == "OUT_PROD") && ops.windows(2).all(|w| w[0] < w[1]));
+
     // the base weight is frozen: it has no gradient
     assert!(ctx.grad(&model.tensor("blk.0.attn_q.weight").unwrap()).is_none());
 

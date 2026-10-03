@@ -160,6 +160,8 @@ pub fn resolve_device(
 /// result. `CROSS_ENTROPY_LOSS` sums per-thread partials, but only its value
 /// depends on that order and the value never reaches the state: its backward
 /// is per row. The step reports the loss from its own fixed-order reduction.
+/// `ARGMAX` is per row with ties to the lowest index, and `COUNT_EQUAL` adds
+/// integers, which is exact in any order.
 ///
 /// GPU kernel sets are not yet audited; until they are, deterministic mode
 /// refuses every op on them rather than claiming reproducibility it has not
@@ -188,6 +190,8 @@ const CPU_DETERMINISTIC: &[&str] = &[
     "COS",
     "SUM",
     "SUM_ROWS",
+    "ARGMAX",
+    "COUNT_EQUAL",
     "MEAN",
     "REPEAT",
     "REPEAT_BACK",

@@ -19,7 +19,7 @@ use llama_cpp_2::train::{GgufMetadata, write_lora_gguf};
 use praecise_train::Error;
 use praecise_train::engine::{EngineConfig, LoraSft, SftExample, init_lora_weights, log_softmax_at};
 use praecise_train::hash::sha256;
-use praecise_train::kernel_class::KernelClass;
+use praecise_train::kernel_class::{Backend, KernelClass};
 use praecise_train::recipe::{AdapterSpec, Objective, OptimizerSpec, Precision, Recipe};
 use praecise_train::steplog::{StepLog, StepSpec};
 
@@ -117,7 +117,7 @@ const PROBE: [i32; 8] = [1, 4, 7, 1, 4, 7, 1, 4];
 fn trainer(threads: i32, opt: OptimizerSpec) -> LoraSft<'static> {
     let r = recipe(opt);
     let path = adapter_file(&r, 11);
-    LoraSft::new(backend(), model(), &path, r, EngineConfig { n_ctx: N_CTX, n_threads: threads }).unwrap()
+    LoraSft::new(backend(), model(), &path, r, EngineConfig { n_ctx: N_CTX, n_threads: threads, deterministic: Some(Backend::Cpu) }).unwrap()
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn refusals() {
     let mut r = recipe(adamw());
     r.objective = Objective::Dpo { beta: 0.1 };
     let path = adapter_file(&recipe(adamw()), 1);
-    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 2 };
+    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: None };
     assert!(matches!(LoraSft::new(backend(), model(), &path, r, cfg), Err(Error::Refused(_))));
     let mut r = recipe(adamw());
     r.optimizer = OptimizerSpec::Muon { lr: 0.01, momentum: 0.9, ns_steps: 5, weight_decay: 0.0 };
@@ -197,6 +197,17 @@ fn refusals() {
     let mut t = trainer(2, adamw());
     let empty = vec![SftExample { tokens: vec![1, 2, 3], target_mask: vec![false, false, false] }];
     assert!(matches!(t.step(&empty), Err(Error::Refused(_))));
+    // deterministic mode on a backend whose kernel set is not audited refuses the step and
+    // leaves the state unchanged
+    let r = recipe(adamw());
+    let path = adapter_file(&r, 1);
+    let gpu = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: Some(Backend::Cuda) };
+    let mut t = LoraSft::new(backend(), model(), &path, r, gpu).unwrap();
+    let before = t.state().unwrap().state_root();
+    assert!(matches!(t.step(&batch(0)), Err(Error::Refused(m)) if m.contains("deterministic")));
+    assert_eq!(t.state().unwrap().state_root(), before);
+    assert_eq!(t.steps_taken(), 0);
+
     let mut spec = recipe(adamw()).adapter.unwrap();
     spec.targets = vec!["nothing.weight".into()];
     assert!(init_lora_weights(model(), &spec, 1).is_err());

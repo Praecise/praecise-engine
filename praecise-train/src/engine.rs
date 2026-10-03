@@ -18,6 +18,7 @@ use llama_cpp_2::train::{LoraWeight, TrainTensor, write_lora_gguf};
 use crate::Error;
 use crate::checkpoint::{Tensor, TrainState};
 use crate::hash::{Digest, domain_hash, sha256};
+use crate::kernel_class::{Backend, check_deterministic};
 use crate::philox::{Philox, normal_f64};
 use crate::recipe::{AdapterSpec, Objective, OptimizerSpec, Recipe};
 use crate::steplog::{StepResult, StepSpec};
@@ -101,6 +102,10 @@ pub struct EngineConfig {
     pub n_ctx: u32,
     /// CPU threads.
     pub n_threads: i32,
+    /// Deterministic mode on the backend the model runs on: every op of every training graph
+    /// must be in that backend's deterministic kernel set, or the step is refused before its
+    /// update. `None` turns the check off.
+    pub deterministic: Option<Backend>,
 }
 
 /// `LoRA` SFT on one model.
@@ -115,6 +120,7 @@ pub struct LoraSft<'m> {
     step: u64,
     recipe: Recipe,
     n_vocab: usize,
+    deterministic: Option<Backend>,
 }
 
 impl<'m> LoraSft<'m> {
@@ -161,7 +167,7 @@ impl<'m> LoraSft<'m> {
         let m = params.iter().map(|(_, t)| vec![0.0; t.n_elements()]).collect();
         let v = params.iter().map(|(_, t)| vec![0.0; t.n_elements()]).collect();
         let n_vocab = usize::try_from(model.n_vocab()).map_err(engine)?;
-        Ok(Self { ctx, _adapter: adapter, params, m, v, step: 0, recipe, n_vocab })
+        Ok(Self { ctx, _adapter: adapter, params, m, v, step: 0, recipe, n_vocab, deterministic: config.deterministic })
     }
 
     /// Optimizer steps taken.
@@ -184,8 +190,9 @@ impl<'m> LoraSft<'m> {
     /// One optimizer step on `batch`.
     ///
     /// # Errors
-    /// [`Error::Refused`] for an empty batch, a batch without targets, a malformed example or an
-    /// engine refusal.
+    /// [`Error::Refused`] for an empty batch, a batch without targets, a malformed example, an op
+    /// outside the deterministic kernel set in deterministic mode, or an engine refusal; a refused
+    /// step leaves the parameters unchanged.
     pub fn step(&mut self, batch: &[SftExample]) -> Result<StepOutcome, Error> {
         let n_targets: usize = batch.iter().map(SftExample::n_targets).sum();
         if n_targets == 0 {
@@ -218,6 +225,10 @@ impl<'m> LoraSft<'m> {
             }
             let mut logits = vec![0.0f32; n * n_vocab];
             self.ctx.grad_sequence(&toks, Some(&targets), Some(&mut logits)).map_err(engine)?;
+            if let Some(backend) = self.deterministic {
+                let ops = self.ctx.grad_graph_ops();
+                check_deterministic(backend, ops.iter().map(String::as_str))?;
+            }
             for i in 0..n {
                 if ex.target_mask[i + 1] {
                     let row = &logits[i * n_vocab..(i + 1) * n_vocab];
