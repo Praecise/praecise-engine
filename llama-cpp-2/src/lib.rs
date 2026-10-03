@@ -41,6 +41,7 @@ pub mod speculative;
 pub mod timing;
 pub mod token;
 pub mod token_type;
+pub mod train;
 
 pub use crate::context::session::{LlamaStateSeqFlags, SeqState};
 
