@@ -74,7 +74,7 @@ impl Qwen3Config {
     ///
     /// # Errors
     /// When `last` exceeds the layer count.
-    pub fn weight_specs(&self, last: usize, linear: WType) -> Result<Vec<WeightSpec>> {
+    pub fn weight_specs(&self, layout: Layout, last: usize, linear: WType) -> Result<Vec<WeightSpec>> {
         if last == 0 || last > self.num_hidden_layers {
             return Err(Error::Config(format!("hidden-state layer {last} outside 1..={}", self.num_hidden_layers)));
         }
@@ -83,9 +83,16 @@ impl Qwen3Config {
         let q = self.num_attention_heads * hd;
         let kv = self.num_key_value_heads * hd;
         let ff = self.intermediate_size;
-        let mut v = vec![WeightSpec::new("model.embed_tokens.weight", &[self.vocab_size, d], WType::F16)];
+        let pre = layout.prefix;
+        let mut v = vec![WeightSpec::new(format!("{pre}embed_tokens.weight"), &[self.vocab_size, d], WType::F16)];
+        if layout.final_norm {
+            if last != self.num_hidden_layers {
+                return Err(Error::Config("the final norm applies only after the last layer".into()));
+            }
+            v.push(WeightSpec::new(format!("{pre}norm.weight"), &[d], WType::F32));
+        }
         for i in 0..last {
-            let p = format!("model.layers.{i}");
+            let p = format!("{pre}layers.{i}");
             v.push(WeightSpec::new(format!("{p}.input_layernorm.weight"), &[d], WType::F32));
             v.push(WeightSpec::new(format!("{p}.post_attention_layernorm.weight"), &[d], WType::F32));
             v.push(WeightSpec::new(format!("{p}.self_attn.q_proj.weight"), &[q, d], linear));
@@ -100,6 +107,24 @@ impl Qwen3Config {
         }
         Ok(v)
     }
+}
+
+/// Where a checkpoint keeps the decoder's tensors and whether its output is
+/// the final normalised hidden state.
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    /// Prefix of every tensor name (`"model."` in a causal-LM checkpoint,
+    /// empty in a bare decoder).
+    pub prefix: &'static str,
+    /// Apply the final RMS norm to the last layer's output.
+    pub final_norm: bool,
+}
+
+impl Layout {
+    /// A causal-LM checkpoint read for intermediate hidden states.
+    pub const CAUSAL_LM: Self = Self { prefix: "model.", final_norm: false };
+    /// A bare decoder read for its last, normalised hidden state.
+    pub const LAST_HIDDEN: Self = Self { prefix: "", final_norm: true };
 }
 
 /// Graph inputs and output of one encode.
@@ -117,9 +142,20 @@ pub struct Qwen3Io {
 
 /// Build an encode of `n` tokens returning the hidden states after each layer
 /// in `layers` (1-based), concatenated per token in the order given. `theta`
-/// is the rotary base from [`Qwen3Config::theta`].
+/// is the rotary base from [`Qwen3Config::theta`]; `exact` computes attention
+/// entirely in float32 instead of with half-precision keys and values.
 #[must_use]
-pub fn build(g: &mut Graph, cfg: &Qwen3Config, w: &Weights, n: i64, layers: &[usize], theta: f32) -> Qwen3Io {
+#[allow(clippy::too_many_arguments)]
+pub fn build(
+    g: &mut Graph,
+    cfg: &Qwen3Config,
+    w: &Weights,
+    layout: Layout,
+    n: i64,
+    layers: &[usize],
+    theta: f32,
+    exact: bool,
+) -> Qwen3Io {
     let hd = cfg.head_dim as i64;
     let nh = cfg.num_attention_heads as i64;
     let nkv = cfg.num_key_value_heads as i64;
@@ -130,10 +166,11 @@ pub fn build(g: &mut Graph, cfg: &Qwen3Config, w: &Weights, n: i64, layers: &[us
     let positions = g.input(sys::GGML_TYPE_I32, &[n]);
     let mask = g.input(sys::GGML_TYPE_F16, &[n, n]);
 
-    let mut x = g.get_rows(w.get("model.embed_tokens.weight"), tokens);
+    let pre = layout.prefix;
+    let mut x = g.get_rows(w.get(&format!("{pre}embed_tokens.weight")), tokens);
     let mut captured: Vec<(usize, Tn)> = Vec::new();
     for i in 0..last {
-        let p = format!("model.layers.{i}");
+        let p = format!("{pre}layers.{i}");
         let wn = |s: &str| w.get(&format!("{p}.{s}"));
         let h = g.rms_norm(x, eps);
         let h = g.mul(h, wn("input_layernorm.weight"));
@@ -152,9 +189,14 @@ pub fn build(g: &mut Graph, cfg: &Qwen3Config, w: &Weights, n: i64, layers: &[us
         let q = g.permute(q, [0, 2, 1, 3]);
         let k = g.permute(k, [0, 2, 1, 3]);
         let v = g.permute(v, [0, 2, 1, 3]);
-        let k = g.cast(k, sys::GGML_TYPE_F16);
-        let v = g.cast(v, sys::GGML_TYPE_F16);
-        let o = g.attention(q, k, v, Some(mask), 1.0 / (hd as f32).sqrt(), true);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let o = if exact {
+            g.attention_exact(q, k, v, Some(mask), scale)
+        } else {
+            let k = g.cast(k, sys::GGML_TYPE_F16);
+            let v = g.cast(v, sys::GGML_TYPE_F16);
+            g.attention(q, k, v, Some(mask), scale, true)
+        };
         let o = g.reshape(o, &[hd * nh, n]);
         let o = g.linear(wn("self_attn.o_proj.weight"), o);
         x = g.add(x, o);
@@ -166,7 +208,13 @@ pub fn build(g: &mut Graph, cfg: &Qwen3Config, w: &Weights, n: i64, layers: &[us
         let m = g.linear(wn("mlp.down_proj.weight"), m);
         x = g.add(x, m);
         if layers.contains(&(i + 1)) {
-            captured.push((i + 1, x));
+            let out = if layout.final_norm {
+                let h = g.rms_norm(x, eps);
+                g.mul(h, w.get(&format!("{pre}norm.weight")))
+            } else {
+                x
+            };
+            captured.push((i + 1, out));
         }
     }
     let mut out: Option<Tn> = None;

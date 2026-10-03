@@ -40,7 +40,7 @@ pub enum Precision {
 }
 
 impl Precision {
-    fn wtype(self) -> WType {
+    pub(crate) fn wtype(self) -> WType {
         match self {
             Self::Bf16 => WType::Bf16,
             Self::Q8_0 => WType::Q8_0,
@@ -130,7 +130,7 @@ pub struct Image {
 /// Paths of one checkpoint in the diffusers directory layout.
 #[derive(Debug, Clone)]
 pub struct CheckpointFiles {
-    root: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 impl CheckpointFiles {
@@ -140,13 +140,13 @@ impl CheckpointFiles {
         Self { root: root.into() }
     }
 
-    fn json(&self, rel: &str) -> Result<Value> {
+    pub(crate) fn json(&self, rel: &str) -> Result<Value> {
         let p = self.root.join(rel);
         let bytes = std::fs::read(&p).map_err(|e| Error::Config(format!("{}: {e}", p.display())))?;
         serde_json::from_slice(&bytes).map_err(|e| Error::Config(format!("{}: {e}", p.display())))
     }
 
-    fn weights(&self, dir: &str) -> Result<Vec<PathBuf>> {
+    pub(crate) fn weights(&self, dir: &str) -> Result<Vec<PathBuf>> {
         let d = self.root.join(dir);
         let mut files: Vec<PathBuf> = std::fs::read_dir(&d)
             .map_err(|e| Error::Weights(format!("{}: {e}", d.display())))?
@@ -187,7 +187,7 @@ impl std::fmt::Debug for Flux2Klein {
     }
 }
 
-fn parse<T: for<'de> Deserialize<'de>>(v: Value, what: &str) -> Result<T> {
+pub(crate) fn parse<T: for<'de> Deserialize<'de>>(v: Value, what: &str) -> Result<T> {
     serde_json::from_value(v).map_err(|e| Error::Config(format!("{what}: {e}")))
 }
 
@@ -238,7 +238,7 @@ impl Flux2Klein {
 
         let last = *PROMPT_LAYERS.iter().max().expect("non-empty");
         let te_files = SafeTensors::open(&files.weights("text_encoder")?)?;
-        let te = Weights::load(&backend, &te_files, &te_cfg.weight_specs(last, linear)?)?;
+        let te = Weights::load(&backend, &te_files, &te_cfg.weight_specs(qwen3::Layout::CAUSAL_LM, last, linear)?)?;
         drop(te_files);
 
         let vae_files = SafeTensors::open(&files.weights("vae")?)?;
@@ -288,7 +288,7 @@ impl Flux2Klein {
         let (ids, real) = self.tokens(prompt)?;
         let n = ids.len();
         let mut g = Graph::new(&self.backend)?;
-        let io = qwen3::build(&mut g, &self.te_cfg, &self.te, n as i64, &PROMPT_LAYERS, self.te_theta);
+        let io = qwen3::build(&mut g, &self.te_cfg, &self.te, qwen3::Layout::CAUSAL_LM, n as i64, &PROMPT_LAYERS, self.te_theta, false);
         g.finish(&[io.out])?;
         g.set_i32(io.tokens, &ids);
         let pos: Vec<i32> = (0..n as i32).collect();

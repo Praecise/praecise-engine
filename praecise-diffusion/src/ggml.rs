@@ -299,6 +299,19 @@ impl WeightSpec {
     }
 }
 
+/// A weight computed on the host, uploaded by [`Weights::from_host`].
+#[derive(Debug, Clone)]
+pub struct HostTensor {
+    /// Name the graph builders look it up by.
+    pub name: String,
+    /// Shape, outermost dimension first.
+    pub shape: Vec<u64>,
+    /// Device storage type.
+    pub ty: WType,
+    /// Values in row-major order.
+    pub data: Vec<f32>,
+}
+
 /// Weights resident on a backend.
 pub struct Weights {
     ctx: *mut sys::ggml_context,
@@ -370,29 +383,7 @@ impl Weights {
                 return Err(Error::Weights(format!("{} rows are not a multiple of 32", s.name)));
             }
         }
-        let params = sys::ggml_init_params {
-            mem_size: unsafe { sys::ggml_tensor_overhead() } * (specs.len() + 1),
-            mem_buffer: ptr::null_mut(),
-            no_alloc: true,
-        };
-        let ctx = unsafe { sys::ggml_init(params) };
-        if ctx.is_null() {
-            return Err(Error::Backend("ggml_init failed for weights".into()));
-        }
-        let mut tensors = HashMap::with_capacity(specs.len());
-        for s in specs {
-            let ne = ne_of(&s.shape);
-            let t = unsafe { sys::ggml_new_tensor_4d(ctx, s.ty.ggml(), ne[0], ne[1], ne[2], ne[3]) };
-            let cname = CString::new(s.name.as_str()).map_err(|_| Error::Weights("NUL in tensor name".into()))?;
-            unsafe { sys::ggml_set_name(t, cname.as_ptr()) };
-            tensors.insert(s.name.clone(), t);
-        }
-        let buffer = unsafe { sys::ggml_backend_alloc_ctx_tensors(ctx, backend.raw) };
-        if buffer.is_null() {
-            unsafe { sys::ggml_free(ctx) };
-            return Err(Error::Backend(format!("allocating weights on {} failed", backend.name)));
-        }
-        let mut out = Self { ctx, buffer, tensors, bytes: 0 };
+        let mut out = Self::alloc(backend, specs)?;
         for s in specs {
             let stacked;
             let view = if s.parts.is_empty() {
@@ -418,6 +409,59 @@ impl Weights {
             out.bytes += data.len();
         }
         Ok(out)
+    }
+
+    /// Upload tensors computed on the host (weights derived from the files
+    /// at load, such as a fused weight normalisation or a re-laid-out
+    /// convolution kernel), each converted to its storage type.
+    ///
+    /// # Errors
+    /// A size that disagrees with the shape, or an allocation failure.
+    pub fn from_host(backend: &Backend, tensors: &[HostTensor]) -> Result<Self> {
+        let specs: Vec<WeightSpec> = tensors.iter().map(|t| WeightSpec::new(t.name.clone(), &t.shape, t.ty)).collect();
+        for (t, s) in tensors.iter().zip(&specs) {
+            if t.data.len() as u64 != t.shape.iter().product::<u64>() {
+                return Err(Error::Weights(format!("{}: {} values for shape {:?}", t.name, t.data.len(), t.shape)));
+            }
+            if s.ty == WType::Q8_0 && s.shape.last().copied().unwrap_or(0) % 32 != 0 {
+                return Err(Error::Weights(format!("{} rows are not a multiple of 32", s.name)));
+            }
+        }
+        let mut out = Self::alloc(backend, &specs)?;
+        for (t, s) in tensors.iter().zip(&specs) {
+            let bytes: Vec<u8> = t.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let view = TensorView { dtype: Dtype::F32, shape: &s.shape, bytes: &bytes };
+            let data = convert(&view, s)?;
+            unsafe { sys::ggml_backend_tensor_set(out.tensors[&s.name], data.as_ptr().cast(), 0, data.len()) };
+            out.bytes += data.len();
+        }
+        Ok(out)
+    }
+
+    fn alloc(backend: &Backend, specs: &[WeightSpec]) -> Result<Self> {
+        let params = sys::ggml_init_params {
+            mem_size: unsafe { sys::ggml_tensor_overhead() } * (specs.len() + 1),
+            mem_buffer: ptr::null_mut(),
+            no_alloc: true,
+        };
+        let ctx = unsafe { sys::ggml_init(params) };
+        if ctx.is_null() {
+            return Err(Error::Backend("ggml_init failed for weights".into()));
+        }
+        let mut tensors = HashMap::with_capacity(specs.len());
+        for s in specs {
+            let ne = ne_of(&s.shape);
+            let t = unsafe { sys::ggml_new_tensor_4d(ctx, s.ty.ggml(), ne[0], ne[1], ne[2], ne[3]) };
+            let cname = CString::new(s.name.as_str()).map_err(|_| Error::Weights("NUL in tensor name".into()))?;
+            unsafe { sys::ggml_set_name(t, cname.as_ptr()) };
+            tensors.insert(s.name.clone(), t);
+        }
+        let buffer = unsafe { sys::ggml_backend_alloc_ctx_tensors(ctx, backend.raw) };
+        if buffer.is_null() {
+            unsafe { sys::ggml_free(ctx) };
+            return Err(Error::Backend(format!("allocating weights on {} failed", backend.name)));
+        }
+        Ok(Self { ctx, buffer, tensors, bytes: 0 })
     }
 
     /// A resident tensor by name.
@@ -783,6 +827,19 @@ impl Graph {
             )
         })
     }
+    /// Attention with the same operands and output layout as
+    /// [`Graph::attention`] (`q` `[d, n, heads]`, `k`/`v` `[d, m, kv heads]`,
+    /// output `[d, heads, n]`), computed unfused and entirely in float32.
+    pub fn attention_exact(&mut self, q: Tn, k: Tn, v: Tn, mask: Option<Tn>, scale: f32) -> Tn {
+        let m = mask.map_or(ptr::null_mut(), |m| m.0);
+        let kq = self.linear(k, q);
+        let kq = Tn(unsafe { sys::ggml_soft_max_ext(self.ctx, kq.0, m, scale, 0.0) });
+        let vt = self.permute(v, [1, 0, 2, 3]);
+        let vt = self.cont(vt);
+        let o = self.linear(vt, kq);
+        let o = self.permute(o, [0, 2, 1, 3]);
+        self.cont(o)
+    }
     /// Softmax over dimension 0 of `scale * a`.
     pub fn soft_max(&mut self, a: Tn, scale: f32) -> Tn {
         Tn(unsafe { sys::ggml_soft_max_ext(self.ctx, a.0, ptr::null_mut(), scale, 0.0) })
@@ -809,6 +866,18 @@ impl Graph {
     /// Nearest-neighbour upscale of dimensions 0 and 1.
     pub fn upscale_nearest(&mut self, a: Tn, factor: i32) -> Tn {
         Tn(unsafe { sys::ggml_upscale(self.ctx, a.0, factor, sys::GGML_SCALE_MODE_NEAREST) })
+    }
+    /// Element-wise sine.
+    pub fn sin(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_sin(self.ctx, a.0) })
+    }
+    /// Element-wise square.
+    pub fn sqr(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_sqr(self.ctx, a.0) })
+    }
+    /// Rotate along each dimension by the given amounts, wrapping around.
+    pub fn roll(&mut self, a: Tn, s0: i32, s1: i32) -> Tn {
+        Tn(unsafe { sys::ggml_roll(self.ctx, a.0, s0, s1, 0, 0) })
     }
     /// Row lookup (token embedding).
     pub fn get_rows(&mut self, table: Tn, ids: Tn) -> Tn {

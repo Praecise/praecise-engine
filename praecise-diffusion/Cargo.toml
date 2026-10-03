@@ -20,6 +20,7 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 [features]
 default = []
 cuda = ["llama-cpp-sys-2/cuda"]
+metal = ["llama-cpp-sys-2/metal"]
 
 [lints]
 workspace = true
