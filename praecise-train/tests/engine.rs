@@ -3,12 +3,13 @@
 //! log-probs the trainer computes.
 
 #![cfg(feature = "engine")]
-#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::float_cmp, clippy::case_sensitive_file_extension_comparisons)]
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -17,8 +18,12 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::train::{GgufMetadata, write_lora_gguf};
 use praecise_train::Error;
-use praecise_train::engine::{EngineConfig, LoraSft, SftExample, init_lora_weights, log_softmax_at};
+use praecise_train::engine::{
+    DistillExample, EngineConfig, LoraTrainer, PreferencePair, Rollout, RolloutGroup, SftExample, StepBatch, init_lora_weights,
+    log_softmax_at, sequence_logprobs,
+};
 use praecise_train::hash::sha256;
+use praecise_train::philox::{Philox, uniform_f64};
 use praecise_train::kernel_class::{Backend, KernelClass};
 use praecise_train::recipe::{AdapterSpec, Objective, OptimizerSpec, Precision, Recipe};
 use praecise_train::steplog::{StepLog, StepSpec};
@@ -33,7 +38,17 @@ fn backend() -> &'static LlamaBackend {
 
 fn model() -> &'static LlamaModel {
     static M: OnceLock<LlamaModel> = OnceLock::new();
-    M.get_or_init(|| {
+    M.get_or_init(|| build_model(5))
+}
+
+/// A second model on the same vocabulary, used as a distillation teacher.
+fn teacher() -> &'static LlamaModel {
+    static M: OnceLock<LlamaModel> = OnceLock::new();
+    M.get_or_init(|| build_model(17))
+}
+
+fn build_model(seed: u64) -> LlamaModel {
+    {
         let mut meta = GgufMetadata::new();
         meta.set_str("general.architecture", "llama")
             .set_u32("llama.vocab_size", N_VOCAB as u32)
@@ -47,7 +62,7 @@ fn model() -> &'static LlamaModel {
             .set_u32("llama.rope.dimension_count", 8)
             .set_f32("llama.rope.freq_base", 10000.0)
             .set_str("tokenizer.ggml.model", "no_vocab");
-        let mut seed = 5u64;
+        let mut seed = seed;
         LlamaModel::from_metadata(
             backend(),
             &meta,
@@ -63,7 +78,7 @@ fn model() -> &'static LlamaModel {
             &LlamaModelParams::default(),
         )
         .unwrap()
-    })
+    }
 }
 
 fn recipe(optimizer: OptimizerSpec) -> Recipe {
@@ -103,7 +118,11 @@ fn adapter_file(recipe: &Recipe, seed: u64) -> PathBuf {
 }
 
 /// A periodic sequence the base model cannot predict and an adapter can learn.
-fn batch(step: u64) -> Vec<SftExample> {
+fn batch(step: u64) -> StepBatch {
+    StepBatch::Sft(sft(step))
+}
+
+fn sft(step: u64) -> Vec<SftExample> {
     (0..2u64)
         .map(|r| {
             let off = (step * 2 + r) as i32;
@@ -114,10 +133,10 @@ fn batch(step: u64) -> Vec<SftExample> {
 
 const PROBE: [i32; 8] = [1, 4, 7, 1, 4, 7, 1, 4];
 
-fn trainer(threads: i32, opt: OptimizerSpec) -> LoraSft<'static> {
+fn trainer(threads: i32, opt: OptimizerSpec) -> LoraTrainer<'static> {
     let r = recipe(opt);
     let path = adapter_file(&r, 11);
-    LoraSft::new(backend(), model(), &path, r, EngineConfig { n_ctx: N_CTX, n_threads: threads, deterministic: Some(Backend::Cpu) }).unwrap()
+    LoraTrainer::new(backend(), model(), &path, r, EngineConfig { n_ctx: N_CTX, n_threads: threads, deterministic: Some(Backend::Cpu) }).unwrap()
 }
 
 #[test]
@@ -187,22 +206,23 @@ fn steps_are_bitwise_reproducible() {
 #[test]
 fn refusals() {
     let mut r = recipe(adamw());
-    r.objective = Objective::Dpo { beta: 0.1 };
+    r.objective = Objective::InfoNce { temperature: 0.05 };
     let path = adapter_file(&recipe(adamw()), 1);
     let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: None };
-    assert!(matches!(LoraSft::new(backend(), model(), &path, r, cfg), Err(Error::Refused(_))));
+    assert!(matches!(LoraTrainer::new(backend(), model(), &path, r, cfg), Err(Error::Refused(_))));
     let mut r = recipe(adamw());
-    r.optimizer = OptimizerSpec::Muon { lr: 0.01, momentum: 0.9, ns_steps: 5, weight_decay: 0.0 };
-    assert!(matches!(LoraSft::new(backend(), model(), &path, r, cfg), Err(Error::Refused(_))));
+    r.adapter = None;
+    assert!(matches!(LoraTrainer::new(backend(), model(), &path, r, cfg), Err(Error::Refused(_))));
     let mut t = trainer(2, adamw());
-    let empty = vec![SftExample { tokens: vec![1, 2, 3], target_mask: vec![false, false, false] }];
+    let empty = StepBatch::Sft(vec![SftExample { tokens: vec![1, 2, 3], target_mask: vec![false, false, false] }]);
     assert!(matches!(t.step(&empty), Err(Error::Refused(_))));
+    assert!(matches!(t.step(&StepBatch::Dpo(vec![])), Err(Error::Refused(m)) if m.contains("objective")));
     // deterministic mode on a backend whose kernel set is not audited refuses the step and
     // leaves the state unchanged
     let r = recipe(adamw());
     let path = adapter_file(&r, 1);
     let gpu = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: Some(Backend::Cuda) };
-    let mut t = LoraSft::new(backend(), model(), &path, r, gpu).unwrap();
+    let mut t = LoraTrainer::new(backend(), model(), &path, r, gpu).unwrap();
     let before = t.state().unwrap().state_root();
     assert!(matches!(t.step(&batch(0)), Err(Error::Refused(m)) if m.contains("deterministic")));
     assert_eq!(t.state().unwrap().state_root(), before);
@@ -251,4 +271,168 @@ fn exported_adapter_serves_the_trainer_logprobs() {
         max_diff = max_diff.max((log_softmax_at(served, t) - log_softmax_at(row, t)).abs());
     }
     assert!(max_diff == 0.0, "served log-probs differ from the trainer by up to {max_diff}");
+}
+
+fn recipe_for(objective: Objective, optimizer: OptimizerSpec) -> Recipe {
+    let mut r = recipe(optimizer);
+    r.objective = objective;
+    r
+}
+
+fn trainer_for(objective: Objective, optimizer: OptimizerSpec) -> LoraTrainer<'static> {
+    let r = recipe_for(objective, optimizer);
+    let path = adapter_file(&r, 23);
+    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 4, deterministic: Some(Backend::Cpu) };
+    LoraTrainer::new(backend(), model(), &path, r, cfg).unwrap()
+}
+
+/// A serving context of `m` without adapters: the reference policy, or a teacher.
+fn serving(m: &'static LlamaModel) -> LlamaContext<'static> {
+    let params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(N_CTX))
+        .with_n_batch(N_CTX)
+        .with_n_ubatch(N_CTX)
+        .with_n_threads(4)
+        .with_n_threads_batch(4)
+        .with_type_k(KvCacheType::F32)
+        .with_type_v(KvCacheType::F32)
+        .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED);
+    m.new_context(backend(), params).unwrap()
+}
+
+/// Samples `n` completion tokens after `prompt` from the trainer's current policy, keyed by
+/// `(seed, stream)`; returns the sequence and the sampler's log-probs of the completion.
+fn sample(t: &mut LoraTrainer<'_>, prompt: &[i32], n: usize, seed: u64, stream: u32) -> (Vec<i32>, Vec<f64>) {
+    let rng = Philox::new(seed);
+    let mut seq = prompt.to_vec();
+    let mut lps = Vec::new();
+    for k in 0..n {
+        let logits = t.logits(&seq).unwrap();
+        let row = &logits[(seq.len() - 1) * N_VOCAB..];
+        let u = uniform_f64(rng.word(stream, 0, 2 * k as u64), rng.word(stream, 0, 2 * k as u64 + 1));
+        let lp: Vec<f64> = (0..N_VOCAB).map(|j| log_softmax_at(row, j)).collect();
+        let mut acc = 0.0;
+        let mut tok = N_VOCAB - 1;
+        for (j, l) in lp.iter().enumerate() {
+            acc += l.exp();
+            if u < acc {
+                tok = j;
+                break;
+            }
+        }
+        seq.push(tok as i32);
+        lps.push(lp[tok]);
+    }
+    (seq, lps)
+}
+
+fn completion_logprobs(ctx: &mut LlamaContext<'_>, tokens: &[i32], prompt_len: usize) -> Vec<f64> {
+    sequence_logprobs(ctx, tokens).unwrap()[prompt_len - 1..].to_vec()
+}
+
+#[test]
+fn muon_loss_falls() {
+    let mut t = trainer(4, OptimizerSpec::Muon { lr: 0.05, momentum: 0.9, ns_steps: 5, weight_decay: 0.0 });
+    let first = t.step(&batch(0)).unwrap().loss;
+    let mut last = first;
+    for s in 1..40 {
+        last = t.step(&batch(s % 4)).unwrap().loss;
+    }
+    assert!(last < 0.7 * first, "muon loss {first} -> {last}");
+    assert!(t.state().unwrap().iter().any(|(n, _)| n.ends_with(".m")));
+}
+
+#[test]
+fn dpo_raises_the_preference_margin() {
+    let mut reference = serving(model());
+    let mut pairs = Vec::new();
+    for prompt in [[1, 2, 3], [2, 3, 1]] {
+        let chosen: Vec<i32> = prompt.iter().copied().chain([4, 4, 4]).collect();
+        let rejected: Vec<i32> = prompt.iter().copied().chain([5, 5, 5]).collect();
+        let ref_chosen = completion_logprobs(&mut reference, &chosen, 3).iter().sum();
+        let ref_rejected = completion_logprobs(&mut reference, &rejected, 3).iter().sum();
+        pairs.push(PreferencePair { prompt_len: 3, chosen, rejected, ref_chosen, ref_rejected });
+    }
+    let mut t = trainer_for(Objective::Dpo { beta: 0.5 }, adamw());
+    let margin = |t: &mut LoraTrainer<'_>| -> f64 {
+        pairs.iter().map(|p| {
+            let c: f64 = t.token_logprobs(&p.chosen).unwrap()[2..].iter().sum();
+            let r: f64 = t.token_logprobs(&p.rejected).unwrap()[2..].iter().sum();
+            c - r
+        }).sum()
+    };
+    let m0 = margin(&mut t);
+    let batch = StepBatch::Dpo(pairs.clone());
+    // the adapter starts as the identity, so the policy equals the reference exactly
+    let first = t.step(&batch).unwrap().loss;
+    assert_eq!(first, std::f64::consts::LN_2, "initial loss {first}");
+    let mut last = first;
+    for _ in 1..20 {
+        last = t.step(&batch).unwrap().loss;
+    }
+    let m1 = margin(&mut t);
+    assert!(m1 > m0 + 1.0 && last < 0.5 * first, "margin {m0} -> {m1}, loss {first} -> {last}");
+}
+
+#[test]
+fn grpo_raises_a_verifiable_reward() {
+    let mut reference = serving(model());
+    let mut t = trainer_for(Objective::Grpo { clip: 0.2, kl_weight: 0.01 }, adamw());
+    let prompt = [1, 2];
+    let reward = |seq: &[i32]| seq[2..].iter().filter(|&&x| x == 7).count() as f64 / (seq.len() - 2) as f64;
+    let mut means = Vec::new();
+    for step in 0..30u64 {
+        let mut rollouts = Vec::new();
+        for r in 0..8u32 {
+            let (seq, sampler_logprobs) = sample(&mut t, &prompt, 6, 1000 + step, r);
+            // the trainer's log-probs of a sampled sequence equal the sampler's exactly
+            let lp = t.token_logprobs(&seq).unwrap();
+            assert_eq!(&lp[1..], &sampler_logprobs[..], "sampler and trainer log-probs differ");
+            let ref_logprobs = completion_logprobs(&mut reference, &seq, 2);
+            rollouts.push(Rollout { reward: reward(&seq), tokens: seq, sampler_logprobs, ref_logprobs });
+        }
+        means.push(rollouts.iter().map(|r| r.reward).sum::<f64>() / 8.0);
+        t.step(&StepBatch::Grpo(vec![RolloutGroup { prompt_len: 2, rollouts }])).unwrap();
+    }
+    let early: f64 = means[..5].iter().sum::<f64>() / 5.0;
+    let late: f64 = means[25..].iter().sum::<f64>() / 5.0;
+    assert!(late > early + 0.2, "mean reward {early} -> {late}");
+}
+
+/// Exact reverse KL(student || teacher) over the vocabulary at the last position of `prefix`.
+fn exact_kl(t: &mut LoraTrainer<'_>, teacher: &mut LlamaContext<'_>, prefix: &[i32]) -> f64 {
+    let s = t.logits(prefix).unwrap();
+    let srow = &s[(prefix.len() - 1) * N_VOCAB..];
+    let mut ext = prefix.to_vec();
+    ext.push(0);
+    sequence_logprobs(teacher, &ext).unwrap();
+    let trow = teacher.get_logits_ith(prefix.len() as i32 - 1).to_vec();
+    (0..N_VOCAB)
+        .map(|j| {
+            let (ls, lt) = (log_softmax_at(srow, j), log_softmax_at(&trow, j));
+            ls.exp() * (ls - lt)
+        })
+        .sum()
+}
+
+#[test]
+fn distillation_pulls_the_student_to_the_teacher() {
+    let mut teach = serving(teacher());
+    let mut t = trainer_for(Objective::Distill, adamw());
+    let prefixes: [&[i32]; 3] = [&[1, 2], &[3], &[5, 6, 7]];
+    let kl = |t: &mut LoraTrainer<'_>, teach: &mut LlamaContext<'_>| -> f64 {
+        prefixes.iter().map(|p| exact_kl(t, teach, p)).sum()
+    };
+    let kl0 = kl(&mut t, &mut teach);
+    for step in 0..30u64 {
+        let mut batch = Vec::new();
+        for (r, p) in prefixes.iter().enumerate() {
+            let (tokens, _) = sample(&mut t, p, 4, 500 + step, r as u32);
+            let teacher_logprobs = completion_logprobs(&mut teach, &tokens, p.len());
+            batch.push(DistillExample { prompt_len: p.len(), tokens, teacher_logprobs });
+        }
+        t.step(&StepBatch::Distill(batch)).unwrap();
+    }
+    let kl1 = kl(&mut t, &mut teach);
+    assert!(kl1 < 0.7 * kl0, "reverse KL {kl0} -> {kl1}");
 }

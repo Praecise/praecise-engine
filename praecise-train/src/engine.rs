@@ -1,34 +1,43 @@
-//! `LoRA` supervised fine-tuning on the serving graph.
+//! `LoRA` training on the serving graph.
 //!
-//! [`LoraSft`] owns a context with a `LoRA` adapter whose tensors are the only trainable
-//! parameters. A step zeroes the gradients, runs every sequence of the batch forward and backward
-//! on the engine, reduces the loss and the global gradient norm in a fixed order, clips, and
-//! applies the optimizer element by element in a fixed order, so a step is a pure function of
-//! the starting state, the batch and the recipe on one kernel class.
+//! [`LoraTrainer`] owns a context with a `LoRA` adapter whose tensors are the only trainable
+//! parameters. A step zeroes the gradients, runs the batch forward and backward on the engine,
+//! reduces the loss and the global gradient norm in a fixed order, clips, and applies the
+//! optimizer element by element in a fixed order, so a step is a pure function of the starting
+//! state, the batch and the recipe on one kernel class.
+//!
+//! Supervised fine-tuning differentiates the cross entropy inside the graph. Preference,
+//! group-relative policy and distillation objectives are computed from the forward log-probs
+//! (see [`crate::objective`]) and their gradient with respect to the logits is fed back through
+//! the engine's weighted-sum pass.
 
 use std::path::Path;
 
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{LlamaLoraAdapter, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::train::{LoraWeight, TrainTensor, write_lora_gguf};
+use llama_cpp_2::train::{GradLoss, LoraWeight, TrainTensor, write_lora_gguf};
 
 use crate::Error;
 use crate::checkpoint::{Tensor, TrainState};
 use crate::hash::{Digest, domain_hash, sha256};
 use crate::kernel_class::{Backend, check_deterministic};
+use crate::objective::{dlogits, distill_token, dpo, group_advantages, grpo_token, newton_schulz, token_logprobs};
 use crate::philox::{Philox, normal_f64};
 use crate::recipe::{AdapterSpec, Objective, OptimizerSpec, Recipe};
 use crate::steplog::{StepResult, StepSpec};
 use crate::update::{OPT_PREFIX, PARAM_PREFIX};
 
+pub use crate::objective::log_softmax_at;
+
 fn engine(e: impl std::fmt::Display) -> Error {
     Error::Refused(format!("engine: {e}"))
 }
 
-/// One training sequence: `tokens[i]` is a target exactly when `target_mask[i]`; position 0 is
+/// One supervised sequence: `tokens[i]` is a target exactly when `target_mask[i]`; position 0 is
 /// never a target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SftExample {
@@ -49,6 +58,68 @@ impl SftExample {
     fn n_targets(&self) -> usize {
         self.target_mask.iter().skip(1).filter(|&&m| m).count()
     }
+}
+
+/// A preference pair: two sequences sharing a prompt of `prompt_len` tokens, with the reference
+/// policy's summed log-probs of each completion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreferencePair {
+    /// Prompt length; completion tokens are `prompt_len..`.
+    pub prompt_len: usize,
+    /// Prompt and preferred completion.
+    pub chosen: Vec<i32>,
+    /// Prompt and dispreferred completion.
+    pub rejected: Vec<i32>,
+    /// Reference log-prob of the chosen completion.
+    pub ref_chosen: f64,
+    /// Reference log-prob of the rejected completion.
+    pub ref_rejected: f64,
+}
+
+/// One sampled completion with its reward and per-completion-token log-probs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rollout {
+    /// Prompt and completion.
+    pub tokens: Vec<i32>,
+    /// Scalar reward.
+    pub reward: f64,
+    /// Log-probs of the completion tokens under the policy that sampled them.
+    pub sampler_logprobs: Vec<f64>,
+    /// Log-probs of the completion tokens under the reference policy.
+    pub ref_logprobs: Vec<f64>,
+}
+
+/// Completions of one prompt; advantages are relative within the group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolloutGroup {
+    /// Prompt length shared by the rollouts.
+    pub prompt_len: usize,
+    /// The rollouts.
+    pub rollouts: Vec<Rollout>,
+}
+
+/// A completion the student sampled, with the teacher's log-probs of its tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistillExample {
+    /// Prompt length; completion tokens are `prompt_len..`.
+    pub prompt_len: usize,
+    /// Prompt and completion.
+    pub tokens: Vec<i32>,
+    /// Teacher log-probs of the completion tokens.
+    pub teacher_logprobs: Vec<f64>,
+}
+
+/// The batch of one step, matching the recipe's objective.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepBatch {
+    /// Supervised sequences.
+    Sft(Vec<SftExample>),
+    /// Preference pairs.
+    Dpo(Vec<PreferencePair>),
+    /// Rollout groups.
+    Grpo(Vec<RolloutGroup>),
+    /// Student samples with teacher log-probs.
+    Distill(Vec<DistillExample>),
 }
 
 /// Initial adapter weights: `A` from a seeded normal scaled by `1/sqrt(n_in)`, `B` zero, so the
@@ -86,10 +157,30 @@ pub fn init_lora_weights(model: &LlamaModel, spec: &AdapterSpec, seed: u64) -> R
     Ok(out)
 }
 
+/// Per-token log-probs of `tokens[1..]` under a serving context (any model, any adapters set on
+/// it), from one forward pass at positions `0..tokens.len()` on a cleared memory.
+///
+/// # Errors
+/// Engine refusals.
+pub fn sequence_logprobs(ctx: &mut LlamaContext<'_>, tokens: &[i32]) -> Result<Vec<f64>, Error> {
+    ctx.clear_kv_cache();
+    let mut batch = LlamaBatch::new(tokens.len(), 1);
+    for (i, &t) in tokens.iter().enumerate() {
+        batch.add(LlamaToken(t), i32::try_from(i).map_err(engine)?, &[0], i + 1 < tokens.len()).map_err(engine)?;
+    }
+    ctx.decode(&mut batch).map_err(engine)?;
+    (0..tokens.len() - 1)
+        .map(|i| {
+            let row = ctx.get_logits_ith(i32::try_from(i).map_err(engine)?);
+            Ok(log_softmax_at(row, usize::try_from(tokens[i + 1]).map_err(engine)?))
+        })
+        .collect()
+}
+
 /// What one step measured.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepOutcome {
-    /// Mean token cross-entropy over the batch's targets, before the update.
+    /// The objective over the batch, before the update.
     pub loss: f64,
     /// Global gradient norm before clipping.
     pub grad_norm: f64,
@@ -108,9 +199,9 @@ pub struct EngineConfig {
     pub deterministic: Option<Backend>,
 }
 
-/// `LoRA` SFT on one model.
+/// `LoRA` training of one model.
 #[derive(Debug)]
-pub struct LoraSft<'m> {
+pub struct LoraTrainer<'m> {
     // the context refers to the adapter, so it is declared (and dropped) first
     ctx: LlamaContext<'m>,
     _adapter: LlamaLoraAdapter,
@@ -123,13 +214,13 @@ pub struct LoraSft<'m> {
     deterministic: Option<Backend>,
 }
 
-impl<'m> LoraSft<'m> {
+impl<'m> LoraTrainer<'m> {
     /// Loads the adapter at `adapter_path` (see [`write_lora_gguf`]) onto a new context of
     /// `model` and makes its tensors the trainable parameters.
     ///
     /// # Errors
-    /// [`Error::Refused`] for a recipe this trainer does not run (not SFT, no adapter, Muon) and
-    /// for any engine refusal.
+    /// [`Error::Refused`] for a recipe without an adapter, an objective this trainer does not run
+    /// on token log-probs (embedding, reranking and quantile objectives), and engine refusals.
     pub fn new(
         backend: &LlamaBackend,
         model: &'m LlamaModel,
@@ -137,15 +228,14 @@ impl<'m> LoraSft<'m> {
         recipe: Recipe,
         config: EngineConfig,
     ) -> Result<Self, Error> {
-        if recipe.objective != Objective::Sft {
-            return Err(Error::Refused("LoraSft runs the SFT objective only".into()));
-        }
         if recipe.adapter.is_none() {
-            return Err(Error::Refused("LoraSft needs an adapter in the recipe".into()));
+            return Err(Error::Refused("the recipe has no adapter".into()));
         }
-        if matches!(recipe.optimizer, OptimizerSpec::Muon { .. }) {
-            return Err(Error::Refused("LoraSft supports AdamW and SGD".into()));
-        }
+        let loss = match recipe.objective {
+            Objective::Sft => GradLoss::CrossEntropy,
+            Objective::Dpo { .. } | Objective::Grpo { .. } | Objective::Distill => GradLoss::WeightedSum,
+            _ => return Err(Error::Refused(format!("objective {:?} is not a token objective", recipe.objective))),
+        };
         let mut adapter = model.lora_adapter_init(adapter_path).map_err(engine)?;
         let params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(config.n_ctx))
@@ -158,9 +248,8 @@ impl<'m> LoraSft<'m> {
             .with_type_v(KvCacheType::F32)
             .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED);
         let mut ctx = model.new_context(backend, params).map_err(engine)?;
-        let scale = 1.0;
-        ctx.lora_adapter_set(&mut adapter, scale).map_err(engine)?;
-        ctx.grad_init(|name| name.ends_with(".lora_a") || name.ends_with(".lora_b")).map_err(engine)?;
+        ctx.lora_adapter_set(&mut adapter, 1.0).map_err(engine)?;
+        ctx.grad_init(loss, |name| name.ends_with(".lora_a") || name.ends_with(".lora_b")).map_err(engine)?;
 
         let mut params: Vec<(String, TrainTensor)> = adapter.tensors().into_iter().map(|t| (t.name(), t)).collect();
         params.sort_by(|a, b| a.0.cmp(&b.0));
@@ -187,59 +276,197 @@ impl<'m> LoraSft<'m> {
         Ok(logits)
     }
 
-    /// One optimizer step on `batch`.
+    /// Log-probs of `tokens[1..]` with the current parameters.
     ///
     /// # Errors
-    /// [`Error::Refused`] for an empty batch, a batch without targets, a malformed example, an op
+    /// Engine refusals and tokens outside the vocabulary.
+    pub fn token_logprobs(&mut self, tokens: &[i32]) -> Result<Vec<f64>, Error> {
+        self.check_tokens(tokens)?;
+        let logits = self.logits(&tokens[..tokens.len() - 1])?;
+        Ok(token_logprobs(&logits, self.n_vocab, tokens))
+    }
+
+    fn check_tokens(&self, tokens: &[i32]) -> Result<(), Error> {
+        if tokens.len() < 2 {
+            return Err(Error::Refused("a sequence needs at least two tokens".into()));
+        }
+        if let Some(t) = tokens.iter().find(|&&t| usize::try_from(t).map_or(true, |t| t >= self.n_vocab)) {
+            return Err(Error::Refused(format!("token {t} outside the vocabulary")));
+        }
+        Ok(())
+    }
+
+    /// One backward pass, then the deterministic-mode check of the graph it ran.
+    fn backward(&mut self, inputs: &[i32], targets: &[f32], logits: Option<&mut [f32]>) -> Result<(), Error> {
+        let toks: Vec<LlamaToken> = inputs.iter().map(|&t| LlamaToken(t)).collect();
+        self.ctx.grad_sequence(&toks, Some(targets), logits).map_err(engine)?;
+        if let Some(backend) = self.deterministic {
+            let ops = self.ctx.grad_graph_ops();
+            check_deterministic(backend, ops.iter().map(String::as_str))?;
+        }
+        Ok(())
+    }
+
+    /// Adds the gradient of `sum_i weights[i] * -log p(tokens[i + 1])` (weighted-sum objectives).
+    fn backward_weighted(&mut self, tokens: &[i32], weights: &[f64]) -> Result<(), Error> {
+        let inputs = &tokens[..tokens.len() - 1];
+        let logits = self.logits(inputs)?;
+        let d = dlogits(&logits, self.n_vocab, tokens, weights);
+        self.backward(inputs, &d, None)
+    }
+
+    /// One optimizer step on `batch`, which must match the recipe's objective.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] for a batch of another objective, an empty or malformed batch, an op
     /// outside the deterministic kernel set in deterministic mode, or an engine refusal; a refused
     /// step leaves the parameters unchanged.
-    pub fn step(&mut self, batch: &[SftExample]) -> Result<StepOutcome, Error> {
+    pub fn step(&mut self, batch: &StepBatch) -> Result<StepOutcome, Error> {
+        self.ctx.grad_reset();
+        let loss = match (&self.recipe.objective, batch) {
+            (Objective::Sft, StepBatch::Sft(b)) => self.accumulate_sft(b)?,
+            (Objective::Dpo { beta }, StepBatch::Dpo(b)) => self.accumulate_dpo(*beta, b)?,
+            (Objective::Grpo { clip, kl_weight }, StepBatch::Grpo(b)) => self.accumulate_grpo(*clip, *kl_weight, b)?,
+            (Objective::Distill, StepBatch::Distill(b)) => self.accumulate_distill(b)?,
+            _ => return Err(Error::Refused("the batch does not match the recipe's objective".into())),
+        };
+        let grad_norm = self.apply_update()?;
+        Ok(StepOutcome { loss, grad_norm })
+    }
+
+    fn accumulate_sft(&mut self, batch: &[SftExample]) -> Result<f64, Error> {
         let n_targets: usize = batch.iter().map(SftExample::n_targets).sum();
         if n_targets == 0 {
             return Err(Error::Refused("the batch has no targets".into()));
         }
-        self.ctx.grad_reset();
-
         let n_vocab = self.n_vocab;
         let mut loss = 0.0f64;
         for ex in batch {
-            if ex.tokens.len() != ex.target_mask.len() || ex.tokens.len() < 2 {
-                return Err(Error::Refused("an example needs two tokens and one mask entry per token".into()));
+            if ex.tokens.len() != ex.target_mask.len() {
+                return Err(Error::Refused("an example needs one mask entry per token".into()));
             }
-            // inputs are tokens[..n-1]; row i predicts tokens[i+1]
+            self.check_tokens(&ex.tokens)?;
+            // inputs are tokens[..n-1]; row i predicts tokens[i+1]. The engine divides by the
+            // rows of a sequence: weighting each target row by n / n_targets makes the sum over
+            // the batch the mean over all targets.
             let n = ex.tokens.len() - 1;
-            let toks: Vec<LlamaToken> = ex.tokens[..n].iter().map(|&t| LlamaToken(t)).collect();
-            // the engine divides by the rows of a sequence: weighting each target row by
-            // n / n_targets makes the sum over the batch the mean over all targets
             #[allow(clippy::cast_precision_loss)]
             let w = n as f32 / n_targets as f32;
             let mut targets = vec![0.0f32; n * n_vocab];
             for i in 0..n {
                 if ex.target_mask[i + 1] {
-                    let t = usize::try_from(ex.tokens[i + 1]).map_err(engine)?;
-                    if t >= n_vocab {
-                        return Err(Error::Refused(format!("token {t} outside the vocabulary")));
-                    }
-                    targets[i * n_vocab + t] = w;
+                    targets[i * n_vocab + usize::try_from(ex.tokens[i + 1]).map_err(engine)?] = w;
                 }
             }
             let mut logits = vec![0.0f32; n * n_vocab];
-            self.ctx.grad_sequence(&toks, Some(&targets), Some(&mut logits)).map_err(engine)?;
-            if let Some(backend) = self.deterministic {
-                let ops = self.ctx.grad_graph_ops();
-                check_deterministic(backend, ops.iter().map(String::as_str))?;
-            }
-            for i in 0..n {
-                if ex.target_mask[i + 1] {
-                    let row = &logits[i * n_vocab..(i + 1) * n_vocab];
-                    let t = usize::try_from(ex.tokens[i + 1]).map_err(engine)?;
-                    loss -= log_softmax_at(row, t);
-                }
-            }
+            self.backward(&ex.tokens[..n], &targets, Some(&mut logits))?;
+            let lp = token_logprobs(&logits, n_vocab, &ex.tokens);
+            loss -= (0..n).filter(|&i| ex.target_mask[i + 1]).map(|i| lp[i]).sum::<f64>();
         }
         #[allow(clippy::cast_precision_loss)]
-        let loss = loss / n_targets as f64;
+        Ok(loss / n_targets as f64)
+    }
 
+    fn completion_weights(n: usize, prompt_len: usize, per_token: &[f64]) -> Vec<f64> {
+        // row i predicts token i+1; completion tokens are prompt_len..n
+        let mut w = vec![0.0; n - 1];
+        for (k, &x) in per_token.iter().enumerate() {
+            w[prompt_len - 1 + k] = x;
+        }
+        w
+    }
+
+    fn check_completion(&self, tokens: &[i32], prompt_len: usize) -> Result<usize, Error> {
+        self.check_tokens(tokens)?;
+        if prompt_len == 0 || prompt_len >= tokens.len() {
+            return Err(Error::Refused("a completion needs a prompt and at least one token".into()));
+        }
+        Ok(tokens.len() - prompt_len)
+    }
+
+    fn accumulate_dpo(&mut self, beta: f64, batch: &[PreferencePair]) -> Result<f64, Error> {
+        if batch.is_empty() {
+            return Err(Error::Refused("the batch has no pairs".into()));
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let n_pairs = batch.len() as f64;
+        let mut loss = 0.0;
+        for p in batch {
+            let nc = self.check_completion(&p.chosen, p.prompt_len)?;
+            let nr = self.check_completion(&p.rejected, p.prompt_len)?;
+            let lc: f64 = self.token_logprobs(&p.chosen)?[p.prompt_len - 1..].iter().sum();
+            let lr: f64 = self.token_logprobs(&p.rejected)?[p.prompt_len - 1..].iter().sum();
+            let (l, w) = dpo(beta, lc, lr, p.ref_chosen, p.ref_rejected);
+            loss += l / n_pairs;
+            let wc = Self::completion_weights(p.chosen.len(), p.prompt_len, &vec![w / n_pairs; nc]);
+            let wr = Self::completion_weights(p.rejected.len(), p.prompt_len, &vec![-w / n_pairs; nr]);
+            self.backward_weighted(&p.chosen, &wc)?;
+            self.backward_weighted(&p.rejected, &wr)?;
+        }
+        Ok(loss)
+    }
+
+    fn accumulate_grpo(&mut self, clip: f64, kl_weight: f64, batch: &[RolloutGroup]) -> Result<f64, Error> {
+        let n_rollouts: usize = batch.iter().map(|g| g.rollouts.len()).sum();
+        if n_rollouts == 0 {
+            return Err(Error::Refused("the batch has no rollouts".into()));
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let n_rollouts = n_rollouts as f64;
+        let mut loss = 0.0;
+        for g in batch {
+            let adv = group_advantages(&g.rollouts.iter().map(|r| r.reward).collect::<Vec<_>>());
+            for (r, a) in g.rollouts.iter().zip(adv) {
+                let nc = self.check_completion(&r.tokens, g.prompt_len)?;
+                if r.sampler_logprobs.len() != nc || r.ref_logprobs.len() != nc {
+                    return Err(Error::Refused("one sampler and one reference log-prob per completion token".into()));
+                }
+                let lp = self.token_logprobs(&r.tokens)?;
+                #[allow(clippy::cast_precision_loss)]
+                let scale = 1.0 / (nc as f64 * n_rollouts);
+                let mut per_token = Vec::with_capacity(nc);
+                for k in 0..nc {
+                    let (l, w) = grpo_token(lp[g.prompt_len - 1 + k], r.sampler_logprobs[k], r.ref_logprobs[k], a, clip, kl_weight);
+                    loss += l * scale;
+                    per_token.push(w * scale);
+                }
+                let w = Self::completion_weights(r.tokens.len(), g.prompt_len, &per_token);
+                self.backward_weighted(&r.tokens, &w)?;
+            }
+        }
+        Ok(loss)
+    }
+
+    fn accumulate_distill(&mut self, batch: &[DistillExample]) -> Result<f64, Error> {
+        let mut n_tokens = 0usize;
+        for ex in batch {
+            n_tokens += self.check_completion(&ex.tokens, ex.prompt_len)?;
+            if ex.teacher_logprobs.len() != ex.tokens.len() - ex.prompt_len {
+                return Err(Error::Refused("one teacher log-prob per completion token".into()));
+            }
+        }
+        if n_tokens == 0 {
+            return Err(Error::Refused("the batch has no completion tokens".into()));
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / n_tokens as f64;
+        let mut loss = 0.0;
+        for ex in batch {
+            let lp = self.token_logprobs(&ex.tokens)?;
+            let mut per_token = Vec::with_capacity(ex.teacher_logprobs.len());
+            for (k, &q) in ex.teacher_logprobs.iter().enumerate() {
+                let (l, w) = distill_token(lp[ex.prompt_len - 1 + k], q);
+                loss += l * scale;
+                per_token.push(w * scale);
+            }
+            let w = Self::completion_weights(ex.tokens.len(), ex.prompt_len, &per_token);
+            self.backward_weighted(&ex.tokens, &w)?;
+        }
+        Ok(loss)
+    }
+
+    /// Reads the gradients, clips them by the global norm and applies the optimizer.
+    fn apply_update(&mut self) -> Result<f64, Error> {
         let mut grads = Vec::with_capacity(self.params.len());
         let mut sq = 0.0f64;
         for (_, t) in &self.params {
@@ -263,18 +490,16 @@ impl<'m> LoraSft<'m> {
             match self.recipe.optimizer {
                 OptimizerSpec::AdamW { lr, beta1, beta2, eps, weight_decay } => {
                     let step = i32::try_from(self.step).map_err(engine)?;
-                    let bc1 = 1.0 / (1.0 - f64::from(beta1).powi(step));
-                    let bc2 = 1.0 / (1.0 - f64::from(beta2).powi(step));
                     #[allow(clippy::cast_possible_truncation)]
-                    let (bc1, bc2) = (bc1 as f32, bc2 as f32);
+                    let bc1 = (1.0 / (1.0 - f64::from(beta1).powi(step))) as f32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let bc2 = (1.0 / (1.0 - f64::from(beta2).powi(step))) as f32;
                     let (m, v) = (&mut self.m[k], &mut self.v[k]);
                     for i in 0..p.len() {
                         let gi = g[i] * clip;
                         m[i] = beta1 * m[i] + (1.0 - beta1) * gi;
                         v[i] = beta2 * v[i] + (1.0 - beta2) * gi * gi;
-                        let mh = m[i] * bc1;
-                        let vh = v[i] * bc2;
-                        p[i] = p[i] * (1.0 - lr * weight_decay) - lr * mh / (vh.sqrt() + eps);
+                        p[i] = p[i] * (1.0 - lr * weight_decay) - lr * (m[i] * bc1) / ((v[i] * bc2).sqrt() + eps);
                     }
                 }
                 OptimizerSpec::Sgd { lr, weight_decay } => {
@@ -282,20 +507,35 @@ impl<'m> LoraSft<'m> {
                         p[i] = p[i] * (1.0 - lr * weight_decay) - lr * g[i] * clip;
                     }
                 }
-                OptimizerSpec::Muon { .. } => unreachable!("refused at construction"),
+                OptimizerSpec::Muon { lr, momentum, ns_steps, weight_decay } => {
+                    // momentum on the matrix, then an orthogonalized update scaled by its aspect
+                    let shape = t.shape();
+                    let cols = usize::try_from(shape[0]).map_err(engine)?;
+                    let rows = p.len() / cols;
+                    let m = &mut self.m[k];
+                    for i in 0..p.len() {
+                        m[i] = momentum * m[i] + g[i] * clip;
+                    }
+                    let o = newton_schulz(m, rows, cols, ns_steps);
+                    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                    let scale = (rows as f64 / cols as f64).max(1.0).sqrt() as f32;
+                    for i in 0..p.len() {
+                        p[i] = p[i] * (1.0 - lr * weight_decay) - lr * scale * o[i];
+                    }
+                }
             }
             t.write_f32(&p).map_err(engine)?;
         }
-        Ok(StepOutcome { loss, grad_norm })
+        Ok(grad_norm)
     }
 
     /// Runs `spec` on `batch` and returns the step result: the new state root, the loss, the
     /// gradient norm and a digest of the per-token log-probs of `probe` after the step.
     ///
     /// # Errors
-    /// [`Error::Mismatch`] when the current state is not `spec.state_root` or the step index is
-    /// not the next one; step and engine refusals.
-    pub fn run_step(&mut self, spec: &StepSpec, batch: &[SftExample], probe: &[i32]) -> Result<StepResult, Error> {
+    /// [`Error::Mismatch`] when the current state is not `spec.state_root`, the step index is not
+    /// the next one or the recipe hash differs; step and engine refusals.
+    pub fn run_step(&mut self, spec: &StepSpec, batch: &StepBatch, probe: &[i32]) -> Result<StepResult, Error> {
         if spec.step_index != self.step {
             return Err(Error::Mismatch(format!("step index {} but {} steps taken", spec.step_index, self.step)));
         }
@@ -306,11 +546,9 @@ impl<'m> LoraSft<'m> {
             return Err(Error::Mismatch("starting state root".into()));
         }
         let out = self.step(batch)?;
-        let logits = self.logits(probe)?;
         let mut bytes = Vec::with_capacity(probe.len() * 8);
-        for (i, row) in logits.chunks(self.n_vocab).enumerate().take(probe.len().saturating_sub(1)) {
-            let t = usize::try_from(probe[i + 1]).map_err(engine)?;
-            bytes.extend_from_slice(&log_softmax_at(row, t).to_le_bytes());
+        for lp in self.token_logprobs(probe)? {
+            bytes.extend_from_slice(&lp.to_le_bytes());
         }
         Ok(StepResult {
             state_root: self.state()?.state_root(),
@@ -321,8 +559,16 @@ impl<'m> LoraSft<'m> {
         })
     }
 
-    /// The trainable state: `param.<tensor>` for every adapter tensor and, for `AdamW`,
-    /// `opt.<tensor>.m` and `opt.<tensor>.v`.
+    fn has_m(&self) -> bool {
+        matches!(self.recipe.optimizer, OptimizerSpec::AdamW { .. } | OptimizerSpec::Muon { .. })
+    }
+
+    fn has_v(&self) -> bool {
+        matches!(self.recipe.optimizer, OptimizerSpec::AdamW { .. })
+    }
+
+    /// The trainable state: `param.<tensor>` for every adapter tensor, `opt.<tensor>.m` for
+    /// `AdamW` and Muon, and `opt.<tensor>.v` for `AdamW`.
     ///
     /// # Errors
     /// Engine refusals.
@@ -331,8 +577,10 @@ impl<'m> LoraSft<'m> {
         for (k, (name, t)) in self.params.iter().enumerate() {
             let shape: Vec<u64> = shape_of(*t);
             s.insert(format!("{PARAM_PREFIX}{name}"), Tensor::from_f32(shape.clone(), &t.read_f32().map_err(engine)?))?;
-            if matches!(self.recipe.optimizer, OptimizerSpec::AdamW { .. }) {
+            if self.has_m() {
                 s.insert(format!("{OPT_PREFIX}{name}.m"), Tensor::from_f32(shape.clone(), &self.m[k]))?;
+            }
+            if self.has_v() {
                 s.insert(format!("{OPT_PREFIX}{name}.v"), Tensor::from_f32(shape, &self.v[k]))?;
             }
         }
@@ -344,6 +592,7 @@ impl<'m> LoraSft<'m> {
     /// # Errors
     /// [`Error::Mismatch`] for a missing tensor or a shape that differs.
     pub fn load_state(&mut self, state: &TrainState, steps_taken: u64) -> Result<(), Error> {
+        let (has_m, has_v) = (self.has_m(), self.has_v());
         for (k, (name, t)) in self.params.iter().enumerate() {
             let get = |key: String| -> Result<Vec<f32>, Error> {
                 let tensor = state.get(&key).ok_or_else(|| Error::Mismatch(format!("missing {key}")))?;
@@ -353,8 +602,10 @@ impl<'m> LoraSft<'m> {
                 tensor.to_f32()
             };
             t.write_f32(&get(format!("{PARAM_PREFIX}{name}"))?).map_err(engine)?;
-            if matches!(self.recipe.optimizer, OptimizerSpec::AdamW { .. }) {
+            if has_m {
                 self.m[k] = get(format!("{OPT_PREFIX}{name}.m"))?;
+            }
+            if has_v {
                 self.v[k] = get(format!("{OPT_PREFIX}{name}.v"))?;
             }
         }
@@ -396,12 +647,4 @@ fn shape_of(t: TrainTensor) -> Vec<u64> {
     let ne = t.shape();
     let n_dims = ne.iter().rposition(|&d| d != 1).map_or(1, |i| i + 1);
     ne[..n_dims].iter().map(|&d| u64::try_from(d).unwrap_or(0)).collect()
-}
-
-/// `log_softmax(row)[t]` in f64 with a fixed summation order.
-#[must_use]
-pub fn log_softmax_at(row: &[f32], t: usize) -> f64 {
-    let mx = row.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(f64::from(x)));
-    let sum: f64 = row.iter().map(|&x| (f64::from(x) - mx).exp()).sum();
-    f64::from(row[t]) - mx - sum.ln()
 }

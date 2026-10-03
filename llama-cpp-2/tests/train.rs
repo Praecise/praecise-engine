@@ -11,7 +11,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::train::{GgufMetadata, LoraWeight, TrainError, write_lora_gguf};
+use llama_cpp_2::train::{GgufMetadata, GradLoss, LoraWeight, TrainError, write_lora_gguf};
 
 const N_VOCAB: usize = 40;
 const N_EMBD: usize = 32;
@@ -105,8 +105,8 @@ fn lora_gradients_match_finite_differences() {
         .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED);
     let mut ctx = model.new_context(&backend, params).unwrap();
     ctx.lora_adapter_set(&mut adapter, 1.0).unwrap();
-    ctx.grad_init(|name| name.ends_with(".lora_a") || name.ends_with(".lora_b")).unwrap();
-    assert_eq!(ctx.grad_init(|_| true), Err(TrainError::AlreadyTraining));
+    ctx.grad_init(GradLoss::CrossEntropy, |name| name.ends_with(".lora_a") || name.ends_with(".lora_b")).unwrap();
+    assert_eq!(ctx.grad_init(GradLoss::CrossEntropy, |_| true), Err(TrainError::AlreadyTraining));
 
     let tokens: Vec<LlamaToken> = (0..10).map(|i| LlamaToken((i * 7 + 1) % N_VOCAB as i32)).collect();
     let target_ids: Vec<usize> = (0..10).map(|i| (i * 5 + 3) % N_VOCAB).collect();

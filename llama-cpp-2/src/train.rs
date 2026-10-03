@@ -154,19 +154,36 @@ unsafe extern "C" fn select_trampoline(tensor: *const llama_cpp_sys_2::ggml_tens
     select(&name.to_string_lossy())
 }
 
+/// What the targets of a gradient pass mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GradLoss {
+    /// Distributions over the vocabulary; the pass differentiates
+    /// `-sum_rows sum(targets * log_softmax(logits)) / n_tokens`.
+    CrossEntropy,
+    /// The gradient of the caller's objective with respect to the logits; the pass
+    /// differentiates `sum(targets * logits)`.
+    WeightedSum,
+}
+
 impl LlamaContext<'_> {
-    /// Makes the context compute gradients. `select` receives each F32 tensor name of the model
-    /// and of the `LoRA` adapters set on the context, and returns whether it is trainable.
+    /// Makes the context compute gradients of `loss`. `select` receives each F32 tensor name of
+    /// the model and of the `LoRA` adapters set on the context, and returns whether it is
+    /// trainable.
     ///
     /// # Errors
     ///
     /// The refusal reasons of [`TrainError`].
-    pub fn grad_init(&mut self, mut select: impl FnMut(&str) -> bool) -> Result<(), TrainError> {
+    pub fn grad_init(&mut self, loss: GradLoss, mut select: impl FnMut(&str) -> bool) -> Result<(), TrainError> {
         let mut dyn_select: &mut dyn FnMut(&str) -> bool = &mut select;
+        let loss_type = match loss {
+            GradLoss::CrossEntropy => llama_cpp_sys_2::GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
+            GradLoss::WeightedSum => llama_cpp_sys_2::GGML_OPT_LOSS_TYPE_WEIGHTED_SUM,
+        };
         let rc = unsafe {
             llama_cpp_sys_2::llama_opt_grad_init(
                 self.context.as_ptr(),
                 self.model.model.as_ptr(),
+                loss_type,
                 Some(select_trampoline),
                 (&raw mut dyn_select).cast::<c_void>(),
             )
@@ -182,9 +199,8 @@ impl LlamaContext<'_> {
     }
 
     /// Runs one sequence at positions `0..tokens.len()` from an empty memory. `logits` receives
-    /// `tokens.len() x n_vocab` forward logits. With `targets` (`tokens.len() x n_vocab`, each row
-    /// a distribution) the pass also adds the gradient of
-    /// `-sum_rows sum(targets * log_softmax(logits)) / tokens.len()` to the parameter gradients.
+    /// `tokens.len() x n_vocab` forward logits. With `targets` (`tokens.len() x n_vocab`) the pass
+    /// also adds the gradient of the context's [`GradLoss`] to the parameter gradients.
     ///
     /// # Errors
     ///
