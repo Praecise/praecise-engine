@@ -1,0 +1,14 @@
+[package]
+name = "praecise-train"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine training substrate: the deterministic replayable step, the hash-linked step log, content-hashed checkpoints with lineage, objectives, optimizers and parameter-delta primitives, on the same ggml graphs and backends that serve the model."
+
+[dependencies]
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+
+[lints]
+workspace = true

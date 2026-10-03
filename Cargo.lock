@@ -1781,6 +1781,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "praecise-train"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"

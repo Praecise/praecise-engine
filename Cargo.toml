@@ -5,6 +5,7 @@ members = [
   "praecise-ffi",
   "praecise-host",
   "praecise-diffusion",
+  "praecise-train",
   "llama-cpp-sys-2",
   "llama-cpp-2",
   "examples/embeddings",
