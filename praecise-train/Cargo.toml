@@ -9,6 +9,15 @@ description = "Praecise Engine training substrate: the deterministic replayable 
 thiserror = "2"
 sha2 = "0.10"
 hex = "0.4"
+llama-cpp-2 = { path = "../llama-cpp-2", optional = true }
+llama-cpp-sys-2 = { path = "../llama-cpp-sys-2", optional = true }
+
+[features]
+default = ["engine"]
+# Steps on the engine: LoRA SFT on the serving graph.
+engine = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
+cuda = ["engine", "llama-cpp-2/cuda"]
+metal = ["engine", "llama-cpp-2/metal"]
 
 [lints]
 workspace = true

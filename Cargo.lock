@@ -1785,6 +1785,8 @@ name = "praecise-train"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "llama-cpp-2",
+ "llama-cpp-sys-2",
  "sha2",
  "thiserror 2.0.19",
 ]
