@@ -8,7 +8,8 @@
 //! on caption, lyrics and timbre, decoded to a waveform by an Oobleck
 //! autoencoder. The video family is Cosmos3, a joint text-and-video
 //! transformer over patchified 3D latents sampled with UniPC, decoded frame by
-//! frame by a causal video autoencoder.
+//! frame by a causal video autoencoder. The LTX-2.3 audio-video transformer
+//! denoises video and audio latents together.
 //!
 //! Every weight is read from the checkpoint's own safetensors files and made
 //! resident once; the optional 8-bit format is produced from those files at
@@ -22,6 +23,7 @@ pub mod cosmos3;
 pub mod error;
 pub mod flux2;
 pub mod ggml;
+pub mod ltx2;
 pub mod music;
 pub mod oobleck;
 pub mod pipeline;

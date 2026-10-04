@@ -746,6 +746,14 @@ impl Graph {
     pub fn silu(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_silu(self.ctx, a.0) })
     }
+    /// GELU, tanh approximation.
+    pub fn gelu_tanh(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_gelu(self.ctx, a.0) })
+    }
+    /// Logistic sigmoid.
+    pub fn sigmoid(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_sigmoid(self.ctx, a.0) })
+    }
     /// `silu(a[:n/2]) * a[n/2:]` along dimension 0.
     pub fn swiglu(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_swiglu(self.ctx, a.0) })
