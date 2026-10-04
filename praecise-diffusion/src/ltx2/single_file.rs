@@ -21,6 +21,8 @@ pub enum Part {
     AudioVae,
     /// The video autoencoder.
     VideoVae,
+    /// The vocoder with its bandwidth extension.
+    Vocoder,
 }
 
 const TRANSFORMER: &str = "model.diffusion_model.";
@@ -71,6 +73,9 @@ pub fn component_name(key: &str) -> Option<(Part, String)> {
         }
         let name = TRANSFORMER_RENAMES.iter().fold(rest.to_string(), |n, (from, to)| n.replace(from, to));
         return Some((Part::Transformer, name));
+    }
+    if let Some(rest) = key.strip_prefix("vocoder.") {
+        return Some((Part::Vocoder, rest.to_string()));
     }
     if let Some(rest) = key.strip_prefix("vae.") {
         let name = rest.replace("per_channel_statistics.mean-of-means", "latents_mean").replace("per_channel_statistics.std-of-means", "latents_std");
@@ -173,7 +178,8 @@ mod tests {
         assert_eq!(name("audio_vae.per_channel_statistics.std-of-means"), (Part::AudioVae, "latents_std".into()));
         assert_eq!(name("vae.decoder.up_blocks.1.conv.conv.weight"), (Part::VideoVae, "decoder.up_blocks.1.conv.conv.weight".into()));
         assert_eq!(name("vae.per_channel_statistics.mean-of-means"), (Part::VideoVae, "latents_mean".into()));
-        assert_eq!(component_name("vocoder.mel_stft.window"), None);
+        assert_eq!(name("vocoder.vocoder.ups.0.weight"), (Part::Vocoder, "vocoder.ups.0.weight".into()));
+        assert_eq!(component_name("unknown.tensor"), None);
     }
 
     #[test]

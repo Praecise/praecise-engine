@@ -163,3 +163,27 @@ fn ltx2_parity_audio_decoder_f32() {
 fn ltx2_parity_audio_decoder_bf16() {
     audio_decoder_run(Precision::Bf16, 0.9999, 2e-2);
 }
+
+fn vocoder_run(precision: Precision, min_cos: f64, max_rel: f64) {
+    let d = PathBuf::from(std::env::var("PRAECISE_LTX2_VOCODER_PARITY").expect("PRAECISE_LTX2_VOCODER_PARITY names the fixture dir"));
+    let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from) };
+    let voc = vocoder::Ltx2Vocoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let frames = m["frames"].as_u64().unwrap() as usize;
+    assert_eq!(voc.config().samples(frames) as u64, m["out_shape"][1].as_u64().unwrap());
+    let wave = voc.synthesize(&read("mel"), frames).unwrap();
+    assert_close("vocoder", &wave, &read("wave"), min_cos, max_rel);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_vocoder_f32() {
+    vocoder_run(Precision::F32, 0.999_999, 1e-4);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_vocoder_bf16() {
+    vocoder_run(Precision::Bf16, 0.999_999, 1e-4);
+}

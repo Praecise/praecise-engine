@@ -949,6 +949,18 @@ impl Graph {
         let c = Tn(unsafe { sys::ggml_cpy(self.ctx, src.0, dst.0) });
         self.expand(c);
     }
+    /// Element-wise clamp to `[min, max]`.
+    pub fn clamp(&mut self, a: Tn, min: f32, max: f32) -> Tn {
+        Tn(unsafe { sys::ggml_clamp(self.ctx, a.0, min, max) })
+    }
+    /// Element-wise natural logarithm.
+    pub fn log(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_log(self.ctx, a.0) })
+    }
+    /// Element-wise square root.
+    pub fn sqrt(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_sqrt(self.ctx, a.0) })
+    }
     /// Element-wise square.
     pub fn sqr(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_sqr(self.ctx, a.0) })

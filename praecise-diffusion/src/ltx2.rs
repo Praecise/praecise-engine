@@ -31,6 +31,7 @@ pub mod audio_vae;
 pub mod connectors;
 pub mod single_file;
 pub mod vae;
+pub mod vocoder;
 
 #[cfg(test)]
 mod parity;
