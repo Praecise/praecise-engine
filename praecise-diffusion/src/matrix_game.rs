@@ -28,6 +28,9 @@ use crate::wan_dit::{attend_batched, rope_pairs, WanDitConfig};
 use llama_cpp_sys_2 as sys;
 
 pub mod camera;
+pub mod model;
+
+pub use model::MatrixGame;
 
 /// Action module settings, as in the checkpoint configuration.
 #[derive(Debug, Clone, Deserialize)]

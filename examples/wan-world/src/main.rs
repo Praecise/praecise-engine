@@ -1,6 +1,9 @@
-//! Run a Wan2.2 world-model session: a prompt (and optionally a first
-//! frame) rolled forward chunk by chunk from a bounded memory, each chunk
-//! streamed out as it is decoded. Reports per-chunk timings and pixel
+//! Run a world-model session: a prompt (and optionally a first frame)
+//! rolled forward chunk by chunk from a bounded memory, each chunk
+//! streamed out as it is decoded. With `--world` the action world model
+//! runs on the Wan2.2 checkpoint's text encoder and autoencoder, from a
+//! first frame (a P6 PPM, or a plain horizon) and a scripted walk that
+//! moves forward and turns. Reports per-chunk timings and pixel
 //! statistics and writes the stream as Y4M.
 //!
 //! ```text
@@ -14,7 +17,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use praecise_diffusion::wan_video::Wan22;
-use praecise_diffusion::{CheckpointFiles, LoadOptions, Precision, SessionConfig, WorldSession};
+use praecise_diffusion::{CheckpointFiles, LoadOptions, MatrixGame, Precision, RgbImage, SessionConfig, WorldModel, WorldSession};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -60,6 +63,16 @@ struct Args {
     /// Y4M output.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Action world-model checkpoint directory; `--model` then gives the
+    /// Wan2.2 text encoder and autoencoder.
+    #[arg(long)]
+    world: Option<PathBuf>,
+    /// First frame (binary PPM) for the action world model.
+    #[arg(long)]
+    image: Option<PathBuf>,
+    /// Latent frames held between chunks (defaults to the memory).
+    #[arg(long)]
+    history: Option<usize>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,21 +84,70 @@ fn main() -> anyhow::Result<()> {
         _ => Precision::Bf16,
     };
     let threads = std::thread::available_parallelism().map_or(8, usize::from);
+    let opts = LoadOptions { precision, cpu_threads: threads, device: None };
     let t = Instant::now();
-    let wan = Wan22::load(&CheckpointFiles::new(&a.model), LoadOptions { precision, cpu_threads: threads, device: None })?;
+    if let Some(world) = &a.world {
+        let m = MatrixGame::load(&CheckpointFiles::new(world), &CheckpointFiles::new(&a.model), opts)?;
+        println!("loaded on {} in {:.1}s, {:.2} GB resident", m.device(), t.elapsed().as_secs_f64(), m.resident_bytes() as f64 / 1e9);
+        let first = match &a.image {
+            Some(p) => ppm(p)?,
+            None => horizon(a.width, a.height),
+        };
+        return run(&m, &a, Some(&first));
+    }
+    let wan = Wan22::load(&CheckpointFiles::new(&a.model), opts)?;
     println!("loaded on {} in {:.1}s, {:.2} GB resident", wan.device(), t.elapsed().as_secs_f64(), wan.resident_bytes() as f64 / 1e9);
+    run(&wan, &a, None)
+}
+
+/// A plain sky over ground.
+fn horizon(w: u32, h: u32) -> RgbImage {
+    let rgb = (0..h).flat_map(|y| (0..w).flat_map(move |_| if y < h / 2 { [120, 170, 230] } else { [90, 120, 60] })).collect();
+    RgbImage { width: w, height: h, rgb }
+}
+
+/// Read a binary PPM (P6, 8-bit).
+fn ppm(p: &PathBuf) -> anyhow::Result<RgbImage> {
+    let b = std::fs::read(p)?;
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while fields.len() < 4 {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let s = i;
+        while b.get(i).is_some_and(|c| !c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        fields.push(String::from_utf8_lossy(&b[s..i]).into_owned());
+    }
+    anyhow::ensure!(fields[0] == "P6" && fields[3] == "255", "only 8-bit P6 images are read");
+    let (width, height): (u32, u32) = (fields[1].parse()?, fields[2].parse()?);
+    let rgb = b.get(i + 1..i + 1 + (width * height * 3) as usize).ok_or_else(|| anyhow::anyhow!("short image"))?.to_vec();
+    Ok(RgbImage { width, height, rgb })
+}
+
+/// One scripted action row per pixel frame: forward, turning right.
+fn walk(dims: usize, rows: usize) -> Vec<f32> {
+    if dims == 0 {
+        return Vec::new();
+    }
+    (0..rows).flat_map(|_| (0..dims).map(|d| match d { 0 => 1.0, _ if d == dims - 1 => 0.1, _ => 0.0 })).collect()
+}
+
+fn run<M: WorldModel>(model: &M, a: &Args, first: Option<&RgbImage>) -> anyhow::Result<()> {
     let cfg = SessionConfig {
         width: a.width,
         height: a.height,
         fps: a.fps,
         chunk_latent_frames: a.chunk,
         memory_latent_frames: a.memory,
-        history_latent_frames: a.memory,
+        history_latent_frames: a.history.unwrap_or(a.memory),
         steps: a.steps,
         guidance_scale: a.guidance,
         seed: a.seed,
     };
-    let mut s = WorldSession::start(&wan, cfg, &a.prompt, &a.negative, None)?;
+    let mut s = WorldSession::start(model, cfg, &a.prompt, &a.negative, first)?;
     let mut out = match &a.out {
         Some(p) => {
             let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
@@ -96,7 +158,7 @@ fn main() -> anyhow::Result<()> {
     };
     for _ in 0..a.chunks {
         let t = Instant::now();
-        let c = s.step(&[])?;
+        let c = s.step(&walk(model.action_dims(), s.pixel_frames_next()))?;
         let n = c.rgb.len() as f64;
         let mean = c.rgb.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
         let sd = (c.rgb.iter().map(|&v| (f64::from(v) - mean).powi(2)).sum::<f64>() / n).sqrt();

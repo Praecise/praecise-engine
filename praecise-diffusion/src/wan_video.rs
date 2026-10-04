@@ -130,25 +130,12 @@ impl Wan22 {
     /// Token ids of a cleaned prompt with the end token, at most
     /// [`TEXT_TOKENS`].
     pub(crate) fn tokens(&self, prompt: &str) -> Result<Vec<i32>> {
-        let enc = self.tokenizer.encode(clean_prompt(prompt), true).map_err(|e| Error::Tokenizer(e.to_string()))?;
-        let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
-        ids.truncate(TEXT_TOKENS);
-        Ok(ids)
+        tokens(&self.tokenizer, prompt)
     }
 
-    /// Text states `[text_dim][TEXT_TOKENS]` (token-major): the prompt's,
-    /// then zeros.
+    /// Text states of `ids` (see [`text_states`]).
     fn context(&self, ids: &[i32]) -> Result<Vec<f32>> {
-        let n = ids.len();
-        let mut g = Graph::new(&self.backend)?;
-        let io = umt5::build(&mut g, &self.te_cfg, &self.te, n as i64);
-        g.finish(&[io.out])?;
-        g.set_i32(io.ids, ids);
-        g.set_i32(io.buckets, &self.te_cfg.buckets(n));
-        g.compute()?;
-        let mut states = g.read_f32(io.out);
-        states.resize(self.te_cfg.d_model as usize * TEXT_TOKENS, 0.0);
-        Ok(states)
+        text_states(&self.backend, &self.te_cfg, &self.te, ids)
     }
 
     /// Generate one video.
@@ -335,13 +322,37 @@ impl WorldModel for Wan22 {
     }
 }
 
+/// Token ids of a cleaned prompt with the end token, at most
+/// [`TEXT_TOKENS`].
+pub(crate) fn tokens(tokenizer: &tokenizers::Tokenizer, prompt: &str) -> Result<Vec<i32>> {
+    let enc = tokenizer.encode(clean_prompt(prompt), true).map_err(|e| Error::Tokenizer(e.to_string()))?;
+    let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+    ids.truncate(TEXT_TOKENS);
+    Ok(ids)
+}
+
+/// Text states `[text_dim][TEXT_TOKENS]` (token-major): the prompt's,
+/// then zeros.
+pub(crate) fn text_states(backend: &Backend, te_cfg: &Umt5Config, te: &Weights, ids: &[i32]) -> Result<Vec<f32>> {
+    let n = ids.len();
+    let mut g = Graph::new(backend)?;
+    let io = umt5::build(&mut g, te_cfg, te, n as i64);
+    g.finish(&[io.out])?;
+    g.set_i32(io.ids, ids);
+    g.set_i32(io.buckets, &te_cfg.buckets(n));
+    g.compute()?;
+    let mut states = g.read_f32(io.out);
+    states.resize(te_cfg.d_model as usize * TEXT_TOKENS, 0.0);
+    Ok(states)
+}
+
 /// Latent grid `(frames, rows, cols)` of a request.
 fn grid(req: &VideoRequest) -> (usize, usize, usize) {
     (1 + (req.num_frames as usize - 1) / 4, req.height as usize / 16, req.width as usize / 16)
 }
 
 /// Write one latent frame `[z][plane]` over frame `t` of `[z][T][plane]`.
-fn place_frame(latents: &mut [f32], frame: &[f32], t: usize, lt: usize, plane: usize) {
+pub(crate) fn place_frame(latents: &mut [f32], frame: &[f32], t: usize, lt: usize, plane: usize) {
     for (c, src) in frame.chunks_exact(plane).enumerate() {
         let at = (c * lt + t) * plane;
         latents[at..at + plane].copy_from_slice(src);
@@ -349,7 +360,7 @@ fn place_frame(latents: &mut [f32], frame: &[f32], t: usize, lt: usize, plane: u
 }
 
 /// Zero the first `held` frames of `[z][T][plane]`.
-fn zero_frames(v: &mut [f32], held: usize, lt: usize, plane: usize) {
+pub(crate) fn zero_frames(v: &mut [f32], held: usize, lt: usize, plane: usize) {
     let z = v.len() / (lt * plane);
     for c in 0..z {
         v[c * lt * plane..(c * lt + held) * plane].fill(0.0);

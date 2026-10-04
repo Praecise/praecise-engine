@@ -47,6 +47,7 @@ pub mod zimage;
 
 pub use error::{Error, Result};
 pub use ggml::Device;
+pub use matrix_game::MatrixGame;
 pub use music::{AceStep, Audio, MusicRequest};
 pub use video::{action_resolution_tier, ActionMode, ActionOutput, ActionRequest, Cosmos3, Embodiment, Video, VideoRequest};
 pub use world::{SessionConfig, WorldChunk, WorldModel, WorldSession};
