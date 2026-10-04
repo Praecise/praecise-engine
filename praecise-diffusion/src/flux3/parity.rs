@@ -47,7 +47,7 @@ fn agreement(ours: &[f32], reference: &[f32]) -> (f64, f64) {
 
 fn run(precision: Precision, min_cos: f64, max_rel: f64) {
     let meta: Value = serde_json::from_slice(&std::fs::read(root().join("meta.json")).unwrap()).unwrap();
-    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from) };
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
     for (tag, m) in meta.as_object().unwrap() {
         let dir = root().join(tag);
         let tf = Flux3Transformer::load(&[dir.join("model.safetensors")], "dit.", opts).unwrap();

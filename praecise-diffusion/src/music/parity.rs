@@ -36,7 +36,7 @@ fn load() -> AceStep {
         _ => Precision::F32,
     };
     let threads = std::thread::available_parallelism().map_or(8, usize::from);
-    AceStep::load(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision, cpu_threads: threads })
+    AceStep::load(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision, cpu_threads: threads, device: None })
         .unwrap()
 }
 

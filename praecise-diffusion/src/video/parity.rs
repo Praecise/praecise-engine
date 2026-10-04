@@ -36,7 +36,7 @@ fn load() -> Cosmos3 {
         _ => Precision::F32,
     };
     let threads = std::thread::available_parallelism().map_or(8, usize::from);
-    Cosmos3::load(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision, cpu_threads: threads }).unwrap()
+    Cosmos3::load(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision, cpu_threads: threads, device: None }).unwrap()
 }
 
 fn request(m: &Value, image: bool, guided: bool) -> VideoRequest {

@@ -349,7 +349,7 @@ impl Ltx2VideoDecoder {
         let header = header_config(&st)?;
         let cfg = VideoVaeConfig::from_single_file(&header["vae"])?;
         let st = open_part(st, Part::VideoVae)?;
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         let kt = if opts.precision == Precision::F32 { WType::F32 } else { WType::F16 };
         let w = Weights::from_host(&backend, &cfg.host_tensors(&st, kt)?)?;
         let c = cfg.latent_channels;

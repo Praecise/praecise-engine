@@ -695,7 +695,7 @@ impl Ltx2Transformer {
     pub fn load(files: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
         let cfg: Ltx2Config = parse(files.json("transformer/config.json")?, "transformer config")?;
         cfg.validate()?;
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "audio-video backend selected");
         let st = SafeTensors::open(&files.weights("transformer")?)?;
         let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;

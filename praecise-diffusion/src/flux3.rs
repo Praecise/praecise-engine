@@ -309,7 +309,7 @@ impl Flux3Transformer {
     pub fn load(files: &[std::path::PathBuf], prefix: &str, opts: LoadOptions) -> Result<Self> {
         let st = SafeTensors::open(files)?.renamed(|n| n.strip_prefix(prefix).map(str::to_owned))?;
         let cfg = Flux3Config::from_tensors(&st)?;
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), streams = ?cfg.streams, "multi-stream transformer backend selected");
         let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;
         Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })

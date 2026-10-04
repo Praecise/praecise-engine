@@ -32,7 +32,7 @@ fn load() -> Flux2Klein {
     // reference, and the small random checkpoint amplifies rounding across its
     // 27 encoder layers far more than a trained one does. The faster formats
     // are measured on the real checkpoint.
-    Flux2Klein::load(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision: Precision::F32, cpu_threads: 8 })
+    Flux2Klein::load(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision: Precision::F32, cpu_threads: 8, device: None })
         .unwrap()
 }
 

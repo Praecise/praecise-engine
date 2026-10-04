@@ -43,7 +43,7 @@ fn load() -> ZImage {
         Ok("image") => (false, true),
         _ => (true, true),
     };
-    ZImage::load_parts(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision, cpu_threads: threads }, text, image)
+    ZImage::load_parts(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision, cpu_threads: threads, device: None }, text, image)
         .unwrap()
 }
 

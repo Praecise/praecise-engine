@@ -255,7 +255,7 @@ impl Gemma3Encoder {
             .into_iter()
             .find(|p| st.get(&format!("{p}embed_tokens.weight")).is_some())
             .ok_or_else(|| Error::MissingTensor("embed_tokens.weight".into()))?;
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         let exact = opts.precision == Precision::F32;
         let embed = if exact { WType::F32 } else { WType::F16 };
         let w = Weights::load(&backend, &st, &cfg.weight_specs(prefix, embed, opts.precision.wtype()))?;
@@ -427,7 +427,7 @@ mod parity {
     fn run(precision: Precision, min_cos: f64, max_rel: f64) {
         let d = PathBuf::from(std::env::var("PRAECISE_GEMMA3_PARITY").expect("PRAECISE_GEMMA3_PARITY names the fixture dir"));
         let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
-        let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from) };
+        let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
         let e = Gemma3Encoder::load(&CheckpointFiles::new(d.join("checkpoint")), "text_encoder", opts).unwrap();
         for case in m["cases"].as_array().unwrap() {
             let tag = case["tag"].as_str().unwrap();

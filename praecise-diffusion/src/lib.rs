@@ -40,6 +40,7 @@ pub mod wan;
 pub mod zimage;
 
 pub use error::{Error, Result};
+pub use ggml::Device;
 pub use music::{AceStep, Audio, MusicRequest};
 pub use video::{Cosmos3, Video, VideoRequest};
 pub use zimage::ZImage;

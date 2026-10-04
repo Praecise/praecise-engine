@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::flux2::{self, Flux2Config};
-use crate::ggml::{Backend, Graph, WType, Weights};
+use crate::ggml::{Backend, Device, Graph, WType, Weights};
 use crate::qwen3::{self, Qwen3Config};
 use crate::safetensors::SafeTensors;
 use crate::schedule;
@@ -54,13 +54,31 @@ impl Precision {
 pub struct LoadOptions {
     /// Weight format for the transformer and the text encoder.
     pub precision: Precision,
-    /// CPU threads, used only on a host without GPU hardware.
+    /// CPU threads, used only when the backend is the CPU.
     pub cpu_threads: usize,
+    /// Device to run on; `None` reads `PRAECISE_DEVICE` (unset = automatic).
+    #[serde(default)]
+    pub device: Option<Device>,
+}
+
+impl LoadOptions {
+    /// The backend these options select.
+    ///
+    /// # Errors
+    /// As [`Backend::select_device`], or [`Error::Config`] for an unknown
+    /// `PRAECISE_DEVICE` value.
+    pub fn backend(&self) -> crate::error::Result<Backend> {
+        let device = match self.device {
+            Some(d) => d,
+            None => Device::from_env()?,
+        };
+        Backend::select_device(device, self.cpu_threads)
+    }
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { precision: Precision::Bf16, cpu_threads: std::thread::available_parallelism().map_or(4, usize::from) }
+        Self { precision: Precision::Bf16, cpu_threads: std::thread::available_parallelism().map_or(4, usize::from), device: None }
     }
 }
 
@@ -231,7 +249,7 @@ impl Flux2Klein {
             return Err(Error::Config("transformer and autoencoder latent widths disagree".into()));
         }
 
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "diffusion backend selected");
         let linear = opts.precision.wtype();
 

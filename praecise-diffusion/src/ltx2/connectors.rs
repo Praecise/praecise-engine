@@ -212,7 +212,7 @@ impl Ltx2Connectors {
     pub fn load(files: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
         let cfg: ConnectorsConfig = parse(files.json("connectors/config.json")?, "connectors config")?;
         cfg.validate()?;
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         let st = SafeTensors::open(&files.weights("connectors")?)?;
         let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;
         Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })
@@ -231,7 +231,7 @@ impl Ltx2Connectors {
             .ok_or_else(|| Error::MissingTensor("text_embedding_projection.video_aggregate_embed.weight".into()))?;
         let cfg = ConnectorsConfig::from_single_file(&header["transformer"], k)?;
         let st = open_part(st, Part::Connectors)?;
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;
         Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })
     }

@@ -164,7 +164,7 @@ impl Cosmos3 {
         let sched: UniPcConfig = parse(files.json("scheduler/scheduler_config.json")?, "scheduler config")?;
         sched.validate()?;
 
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "video backend selected");
         let exact = opts.precision == Precision::F32;
         let tf_files = SafeTensors::open(&files.weights("transformer")?)?;

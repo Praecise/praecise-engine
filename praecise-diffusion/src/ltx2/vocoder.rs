@@ -559,7 +559,7 @@ impl Ltx2Vocoder {
         let mel = st.require("mel_stft.mel_basis", &[b.num_mels, (l / 2 + 1) as u64])?.to_f32();
         h.f32("mel_stft.mel_basis".into(), vec![b.num_mels, (l / 2 + 1) as u64], mel);
         let (v, filters) = (h.v, h.filters);
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         let w = Weights::from_host(&backend, &v)?;
         Ok(Self { backend, cfg, w, filters, in_features, channels, blocks: blocks as u64 })
     }

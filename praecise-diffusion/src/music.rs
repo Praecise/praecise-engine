@@ -250,7 +250,7 @@ impl AceStep {
             return Err(Error::Config("text encoder, condition encoder, transformer and autoencoder widths disagree".into()));
         }
 
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "music backend selected");
         let linear = opts.precision.wtype();
 

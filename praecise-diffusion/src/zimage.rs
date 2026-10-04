@@ -112,7 +112,7 @@ impl ZImage {
             return Err(Error::Config("text encoder, transformer and autoencoder widths disagree".into()));
         }
 
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "image backend selected");
         let linear = opts.precision.wtype();
         let placeholder = || Weights::zeros(&backend, &[WeightSpec::new("placeholder", &[1], WType::F32)]);

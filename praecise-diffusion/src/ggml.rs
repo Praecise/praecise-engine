@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::safetensors::{Dtype, SafeTensors, TensorView};
 
 /// A ggml compute backend: a GPU when the host has one, the CPU only on a host
-/// without GPU hardware.
+/// without GPU hardware or when [`Device::Cpu`] is requested explicitly.
 pub struct Backend {
     raw: sys::ggml_backend_t,
     name: String,
@@ -55,15 +55,77 @@ fn gpu_hardware_present() -> Option<&'static str> {
     None
 }
 
-impl Backend {
-    /// Select the backend: the first GPU device ggml registered. With no GPU
-    /// device registered, the CPU is used only when the host has no GPU
-    /// hardware at all; otherwise loading is refused.
+/// Which device a [`Backend`] runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Device {
+    /// The first GPU device; the CPU only on a host without GPU hardware.
+    #[default]
+    Auto,
+    /// The CPU, even when the host has a GPU. Only ever chosen explicitly
+    /// (for reference and parity runs that must leave the GPU untouched).
+    Cpu,
+}
+
+/// Environment variable that selects the device: `cpu` or `auto`.
+pub const DEVICE_ENV: &str = "PRAECISE_DEVICE";
+
+impl Device {
+    /// Parse a device name: `auto` or `cpu` (case-insensitive).
     ///
     /// # Errors
-    /// [`Error::GpuRequired`] when GPU hardware is present but no GPU backend
-    /// is built in, or the GPU backend fails to initialise.
+    /// [`Error::Config`] for any other value.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            other => Err(Error::Config(format!("{DEVICE_ENV}={other}: expected `auto` or `cpu`"))),
+        }
+    }
+
+    /// The device named by [`DEVICE_ENV`], [`Device::Auto`] when unset.
+    ///
+    /// # Errors
+    /// [`Error::Config`] when the variable holds an unknown value.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(DEVICE_ENV) {
+            Ok(v) => Self::parse(&v),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Auto),
+            Err(std::env::VarError::NotUnicode(_)) => Err(Error::Config(format!("{DEVICE_ENV} is not valid UTF-8"))),
+        }
+    }
+}
+
+impl Backend {
+    /// Select the backend for the device named by [`DEVICE_ENV`] (see
+    /// [`Backend::select_device`]).
+    ///
+    /// # Errors
+    /// [`Error::Config`] for an unknown device name, otherwise as
+    /// [`Backend::select_device`].
     pub fn select(cpu_threads: usize) -> Result<Self> {
+        Self::select_device(Device::from_env()?, cpu_threads)
+    }
+
+    /// Select the backend. [`Device::Cpu`] always runs on the CPU and is
+    /// logged as an explicit choice. [`Device::Auto`] takes the first GPU
+    /// device ggml registered; with no GPU device registered, the CPU is used
+    /// only when the host has no GPU hardware at all, otherwise loading is
+    /// refused.
+    ///
+    /// # Errors
+    /// [`Error::GpuRequired`] when, under [`Device::Auto`], GPU hardware is
+    /// present but no GPU backend is built in, or the GPU backend fails to
+    /// initialise.
+    pub fn select_device(device: Device, cpu_threads: usize) -> Result<Self> {
+        if device == Device::Cpu {
+            tracing::warn!(
+                gpu_hardware = gpu_hardware_present().unwrap_or("none"),
+                threads = cpu_threads.max(1),
+                "{DEVICE_ENV}=cpu: running on the CPU by explicit request"
+            );
+            return Self::cpu(cpu_threads);
+        }
         // SAFETY: device enumeration has no preconditions; the registry is
         // populated statically at link time.
         let count = unsafe { sys::ggml_backend_dev_count() };
@@ -92,6 +154,11 @@ impl Backend {
                 format!("{vendor} GPU hardware is present but this build has no backend for it")
             }));
         }
+        Self::cpu(cpu_threads)
+    }
+
+    fn cpu(cpu_threads: usize) -> Result<Self> {
+        // SAFETY: CPU backend init has no preconditions.
         let raw = unsafe { sys::ggml_backend_cpu_init() };
         if raw.is_null() {
             return Err(Error::Backend("CPU backend failed to initialise".into()));
@@ -219,8 +286,23 @@ mod backend_tests {
     }
 
     #[test]
+    fn an_explicit_cpu_device_runs_on_the_cpu_even_beside_a_gpu() {
+        let selected = Backend::select_device(Device::Cpu, 2).unwrap();
+        assert!(!selected.is_gpu());
+        assert_eq!(selected.name(), "CPU");
+    }
+
+    #[test]
+    fn device_names_parse_and_unknown_names_are_refused() {
+        assert_eq!(Device::parse("cpu").unwrap(), Device::Cpu);
+        assert_eq!(Device::parse(" CPU ").unwrap(), Device::Cpu);
+        assert_eq!(Device::parse("auto").unwrap(), Device::Auto);
+        assert!(matches!(Device::parse("cuda"), Err(Error::Config(_))));
+    }
+
+    #[test]
     fn the_cpu_is_chosen_only_on_a_host_without_gpu_hardware() {
-        let selected = Backend::select(2);
+        let selected = Backend::select_device(Device::Auto, 2);
         match (gpu_hardware_present(), gpu_backend_built_in()) {
             (_, true) => assert!(selected.unwrap().is_gpu()),
             (Some(_), false) => assert!(matches!(selected, Err(Error::GpuRequired(_)))),
