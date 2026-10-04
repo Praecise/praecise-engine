@@ -10,8 +10,9 @@ import types
 import numpy as np
 import torch
 
-for name in ("trimesh", "pandas"):
+for name in ("trimesh", "pandas", "torchvision", "torchvision.transforms"):
     sys.modules.setdefault(name, types.ModuleType(name))
+sys.modules["torchvision.transforms"].Lambda = None
 sys.modules.setdefault("utils.conditions", types.ModuleType("utils.conditions")).Bench_actions_universal = None
 sys.modules.setdefault("utils.transform", types.ModuleType("utils.transform")).get_video_transform = None
 from utils.utils import compute_all_poses_from_actions, build_plucker_from_c2ws, build_plucker_from_pose  # noqa: E402
