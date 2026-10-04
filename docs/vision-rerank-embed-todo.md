@@ -63,22 +63,15 @@ input, so the work can be picked up without re-deriving it.
    pinned revision; pass when the reranker's P(yes) matches within 1e-2 and
    the embedding cosine exceeds 0.999. Text-only parity must stay unchanged.
 
-## Text format of vision-language rerankers (fix first)
+## Text format of vision-language rerankers (done)
 
-The converter writes the same `rerank` template for a vision-language
-reranker as for the text-only reranker family:
-`<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}` with
-an empty think block after the assistant turn. The vision-language
-checkpoint's own pipeline renders the user turn as
-`<Instruct>: {instruction}<Query>:{query}\n<Document>:{document}` (no
-newline before `<Query>:`, no space after the colons), opens the assistant
-turn without a think block, and uses a different default instruction
-("Given a search query, retrieve relevant candidates that answer the
-query."). Scores under the current template agree with the checkpoint run on
-the same template, but that template is not the one the model was trained
-on. Fix: emit the checkpoint's own format when the vision-language reranker
-is detected, and add a parity case that renders the prompt through the
-checkpoint's chat template.
+The converter now writes the vision-language reranker's own `rerank`
+template: `<Instruct>: {instruction}<Query>:{query}\n<Document>:{document}`
+in the user turn, the checkpoint's default instruction ("Given a search
+query, retrieve relevant candidates that answer the query."), and an
+assistant turn without a think block. It is byte-equal to the checkpoint's
+chat template rendered for one text pair. The text-only reranker template is
+unchanged.
 
 ## Out of scope
 
