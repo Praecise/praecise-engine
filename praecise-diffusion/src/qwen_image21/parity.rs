@@ -55,3 +55,29 @@ fn qwen_image21_parity_transformer_f32() {
 fn qwen_image21_parity_transformer_bf16() {
     run(Precision::Bf16, 0.9999, 2e-2);
 }
+
+fn vae_run(precision: Precision, min_cos: f64, max_rel: f64) {
+    let d = dir();
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let threads = std::thread::available_parallelism().map_or(8, usize::from);
+    let backend = LoadOptions { precision, cpu_threads: threads, device: None }.backend().unwrap();
+    let vae = vae::QwenImage21Vae::load(&CheckpointFiles::new(d.join("checkpoint")), &backend, precision, true).unwrap();
+    let (lh, lw) = (m["latent"][0].as_u64().unwrap() as usize, m["latent"][1].as_u64().unwrap() as usize);
+    let s = m["scale"].as_u64().unwrap() as usize;
+    let px = vae.decode(&backend, &bin(&d, "vae_latent"), (lh, lw)).unwrap();
+    assert_close("decoded", &px, &bin(&d, "vae_decoded"), min_cos, max_rel);
+    let z = vae.encode(&backend, &bin(&d, "vae_pixels"), (lh * s, lw * s)).unwrap();
+    assert_close("encoded", &z, &bin(&d, "vae_encoded"), min_cos, max_rel);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn qwen_image21_parity_vae_f32() {
+    vae_run(Precision::F32, 0.999_999, 1e-4);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn qwen_image21_parity_vae_f16() {
+    vae_run(Precision::Bf16, 0.9999, 5e-3);
+}

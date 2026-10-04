@@ -10,6 +10,11 @@ checked against the full block-causal pass. Cases: a prompt with two
 condition images between text runs, and a text-only prompt; each at two
 timesteps against the same prefix. Weights are rounded to bfloat16 first.
 
+A tiny autoencoder of the released layout (residual stages with averaging
+and duplicating shortcuts, one stage that halves time, RGBA pixels, a wider
+decoder) is checked on single images both ways: decoding a normalised latent
+and encoding pixels to the normalised mean.
+
 Needs a diffusers build that has QwenImage21Transformer2DModel.
 
 Usage: python make_qwen_image21_fixtures.py <out_dir>
@@ -20,7 +25,7 @@ import os
 import sys
 
 import torch
-from diffusers import QwenImage21Transformer2DModel
+from diffusers import AutoencoderKLQwenImage21, QwenImage21Transformer2DModel
 
 TINY = dict(
     patch_size=1,
@@ -34,6 +39,19 @@ TINY = dict(
     axes_dims_rope=(4, 6, 6),
     causal_condition=True,
 )
+
+VAE = dict(
+    base_dim=8,
+    decoder_base_dim=12,
+    z_dim=4,
+    dim_mult=[1, 2, 2],
+    num_res_blocks=1,
+    temperal_downsample=[False, True],
+    in_channels=4,
+    out_channels=4,
+    scale_factor_spatial=4,
+)
+LATENT = (5, 6)
 
 SLOT = 4
 TIMES = [0.73, 0.21]
@@ -100,8 +118,27 @@ def main():
                 )[0]
             save(out, f"{tag}_out{k}", y[:, -th * tw :])
         cases.append(dict(tag=tag, layout=[list(s[1:]) if s[0] == "image" else s[1] for s in layout]))
+    gv = torch.Generator().manual_seed(3)
+    mean = torch.randn(VAE["z_dim"], generator=gv).mul(0.5).bfloat16().float()
+    std = torch.rand(VAE["z_dim"], generator=gv).add(0.5).bfloat16().float()
+    vae = AutoencoderKLQwenImage21(**VAE, latents_mean=mean.tolist(), latents_std=std.tolist()).eval()
+    randomise(vae, 4)
+    vae.save_pretrained(os.path.join(out, "checkpoint", "vae"), safe_serialization=True)
+    lh, lw = LATENT
+    z = torch.randn(1, VAE["z_dim"], lh, lw, generator=gv)
+    save(out, "vae_latent", z)
+    s = VAE["scale_factor_spatial"]
+    px = torch.rand(1, VAE["in_channels"], lh * s, lw * s, generator=gv) * 2 - 1
+    save(out, "vae_pixels", px)
+    with torch.no_grad():
+        raw = z * std.view(1, -1, 1, 1) + mean.view(1, -1, 1, 1)
+        dec = vae.decode(raw[:, :, None]).sample[:, :, 0]
+        mu = vae.encode(px[:, :, None]).latent_dist.mode()[:, :, 0]
+        enc = (mu - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)
+    save(out, "vae_decoded", dec)
+    save(out, "vae_encoded", enc)
     with open(os.path.join(out, "meta.json"), "w") as f:
-        json.dump(dict(times=TIMES, cases=cases), f, indent=1)
+        json.dump(dict(times=TIMES, cases=cases, latent=list(LATENT), scale=s), f, indent=1)
 
 
 if __name__ == "__main__":

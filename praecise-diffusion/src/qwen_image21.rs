@@ -16,6 +16,7 @@
 
 #[cfg(test)]
 mod parity;
+pub mod vae;
 
 use serde::Deserialize;
 
