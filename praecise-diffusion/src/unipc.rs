@@ -40,10 +40,17 @@ pub struct UniPcConfig {
     pub use_flow_sigmas: bool,
     /// Noise level after the last step.
     pub final_sigmas_type: String,
-    /// Smallest Karras noise level.
-    pub sigma_min: f64,
-    /// Largest Karras noise level.
-    pub sigma_max: f64,
+    /// Smallest Karras noise level (Karras spacing only).
+    pub sigma_min: Option<f64>,
+    /// Largest Karras noise level (Karras spacing only).
+    pub sigma_max: Option<f64>,
+    /// Rational shift of linearly spaced flow noise levels (without Karras
+    /// spacing).
+    #[serde(default = "unit_shift")]
+    pub flow_shift: f64,
+    /// Terminal stretch of the noise levels; only its absence is implemented.
+    #[serde(default)]
+    pub shift_terminal: Option<f64>,
     /// Resolution-dependent shifting.
     #[serde(default)]
     pub use_dynamic_shifting: bool,
@@ -53,6 +60,10 @@ pub struct UniPcConfig {
     /// Beta spacing.
     #[serde(default)]
     pub use_beta_sigmas: bool,
+}
+
+fn unit_shift() -> f64 {
+    1.0
 }
 
 impl UniPcConfig {
@@ -68,18 +79,21 @@ impl UniPcConfig {
             && !self.thresholding
             && self.lower_order_final
             && self.disable_corrector.is_empty()
-            && self.use_karras_sigmas
             && self.use_flow_sigmas
             && self.final_sigmas_type == "zero"
             && !self.use_dynamic_shifting
             && !self.use_exponential_sigmas
             && !self.use_beta_sigmas
-            && self.sigma_min > 0.0
-            && self.sigma_max > self.sigma_min;
+            && self.shift_terminal.is_none()
+            && match (self.use_karras_sigmas, self.sigma_min, self.sigma_max) {
+                (true, Some(lo), Some(hi)) => lo > 0.0 && hi > lo,
+                (true, _, _) => false,
+                (false, _, _) => self.flow_shift > 0.0,
+            };
         if ok {
             Ok(())
         } else {
-            Err(Error::Config("scheduler: only second-order bh2 UniPC on Karras flow sigmas ending at zero is implemented".into()))
+            Err(Error::Config("scheduler: only second-order bh2 UniPC on Karras or shifted linear flow sigmas ending at zero is implemented".into()))
         }
     }
 
@@ -87,7 +101,10 @@ impl UniPcConfig {
     /// precision; and the integer timesteps the model is told.
     #[must_use]
     pub fn schedule(&self, steps: usize) -> (Vec<f32>, Vec<i64>) {
-        let (lo, hi) = (self.sigma_min.powf(1.0 / RHO), self.sigma_max.powf(1.0 / RHO));
+        let (Some(lo), Some(hi), true) = (self.sigma_min, self.sigma_max, self.use_karras_sigmas) else {
+            return shifted_linear_schedule(steps, self.flow_shift, self.num_train_timesteps);
+        };
+        let (lo, hi) = (lo.powf(1.0 / RHO), hi.powf(1.0 / RHO));
         let mut sigmas = Vec::with_capacity(steps + 1);
         let mut timesteps = Vec::with_capacity(steps);
         for i in 0..steps {
@@ -254,13 +271,16 @@ mod tests {
     use super::*;
 
     fn cfg() -> UniPcConfig {
-        serde_json::from_value(serde_json::json!({
+        serde_json::from_value(json()).unwrap()
+    }
+
+    fn json() -> serde_json::Value {
+        serde_json::json!({
             "num_train_timesteps": 1000, "solver_order": 2, "solver_type": "bh2",
             "prediction_type": "flow_prediction", "predict_x0": true, "thresholding": false,
             "lower_order_final": true, "disable_corrector": [], "use_karras_sigmas": true,
             "use_flow_sigmas": true, "final_sigmas_type": "zero", "sigma_min": 0.147, "sigma_max": 200.0
-        }))
-        .unwrap()
+        })
     }
 
     #[test]
@@ -274,6 +294,22 @@ mod tests {
         assert_eq!(s[4], 0.0);
         assert_eq!(t[0], 995);
         assert!(s.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn without_karras_spacing_the_levels_are_shifted_linear() {
+        let mut v = json();
+        v["use_karras_sigmas"] = false.into();
+        v["sigma_min"] = serde_json::Value::Null;
+        v["sigma_max"] = serde_json::Value::Null;
+        v["flow_shift"] = 5.0.into();
+        let c: UniPcConfig = serde_json::from_value(v).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.schedule(4), shifted_linear_schedule(4, 5.0, 1000));
+        assert_eq!(c.schedule(4).1, vec![999, 937, 833, 624]);
+        let mut v = json();
+        v["sigma_max"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<UniPcConfig>(v).unwrap().validate().is_err());
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub mod zimage;
 pub use error::{Error, Result};
 pub use ggml::Device;
 pub use music::{AceStep, Audio, MusicRequest};
-pub use video::{ActionMode, ActionOutput, ActionRequest, Cosmos3, Embodiment, Video, VideoRequest};
+pub use video::{action_resolution_tier, ActionMode, ActionOutput, ActionRequest, Cosmos3, Embodiment, Video, VideoRequest};
 pub use zimage::ZImage;
 pub use pipeline::{
     CheckpointFiles, Flux2Klein, Image, LoadOptions, MAX_REFERENCE_PIXELS, Precision, Request, RgbImage, Timings,

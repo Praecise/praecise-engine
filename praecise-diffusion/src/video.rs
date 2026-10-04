@@ -538,7 +538,7 @@ impl Cosmos3 {
 }
 
 mod action;
-pub use action::{action_caption, ActionMode, ActionOutput, ActionRequest, Embodiment};
+pub use action::{action_caption, action_resolution_tier, ActionMode, ActionOutput, ActionRequest, Embodiment};
 
 #[cfg(test)]
 mod parity;

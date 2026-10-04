@@ -94,6 +94,12 @@ const RESOLUTION_TIERS: &[(u32, [(u32, u32); 5])] = &[
     (720, [(960, 960), (832, 1104), (1104, 832), (720, 1280), (1280, 720)]),
 ];
 
+/// The lowest resolution tier that takes a `height` x `width` canvas.
+#[must_use]
+pub fn action_resolution_tier(height: u32, width: u32) -> Option<u32> {
+    RESOLUTION_TIERS.iter().find(|(_, canvases)| canvases.contains(&(height, width))).map(|(t, _)| *t)
+}
+
 /// Camera framing sentences, by viewpoint name.
 const VIEWPOINTS: &[(&str, &str)] = &[
     ("ego_view", "This video is captured from a first-person perspective looking at the scene."),
@@ -508,6 +514,15 @@ mod tests {
         assert!(c.starts_with("{\"actions\": [{\"time\": \"0:00-0:03\", \"description\": \"Wave!\"}]"), "{c}");
         assert!(c.ends_with("\"fps\": 12.5, \"resolution\": {\"H\": 480, \"W\": 832}, \"aspect_ratio\": \"16,9\"}"), "{c}");
         assert_eq!(json_str("caf\u{e9} \u{1f600}"), "\"caf\\u00e9 \\ud83d\\ude00\"");
+    }
+
+    #[test]
+    fn a_canvas_names_its_lowest_tier() {
+        assert_eq!(action_resolution_tier(256, 256), Some(256));
+        assert_eq!(action_resolution_tier(544, 736), Some(480));
+        assert_eq!(action_resolution_tier(960, 960), Some(704));
+        assert_eq!(action_resolution_tier(720, 1280), Some(720));
+        assert_eq!(action_resolution_tier(500, 500), None);
     }
 
     #[test]
