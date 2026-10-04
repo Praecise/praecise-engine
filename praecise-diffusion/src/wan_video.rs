@@ -238,7 +238,7 @@ impl Wan22 {
         let mut passes = Vec::with_capacity(contexts.len());
         for ctx in contexts {
             let mut g = Graph::new(&self.backend)?;
-            let io = wan_dit::build(&mut g, &self.cfg, &self.tf, &self.pe, n as i64, TEXT_TOKENS as i64, time_tokens as i64, self.exact);
+            let io = wan_dit::build(&mut g, &self.cfg, &self.tf, &self.pe, lt as i64, n as i64, TEXT_TOKENS as i64, time_tokens as i64, self.exact);
             g.finish(&[io.out])?;
             passes.push((g, io, ctx));
         }

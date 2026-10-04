@@ -26,6 +26,7 @@ pub mod flux3;
 pub mod gemma3;
 pub mod ggml;
 pub mod ltx2;
+pub mod matrix_game;
 pub mod music;
 pub mod oobleck;
 pub mod pipeline;

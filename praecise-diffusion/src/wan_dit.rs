@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use llama_cpp_sys_2 as sys;
 
 use crate::ggml::{Graph, HostTensor, Tn, WType, WeightSpec, Weights};
+use crate::matrix_game::{self, ActionIo, WorldDit};
 use crate::safetensors::SafeTensors;
 
 /// Sinusoidal timestep features.
@@ -64,6 +65,9 @@ pub struct WanDitConfig {
     /// `rope_max_seq_len` from the checkpoint configuration.
     #[serde(default = "rope_len")]
     pub rope_max_seq_len: u64,
+    /// Action-conditioned world-model additions (see [`crate::matrix_game`]).
+    #[serde(skip)]
+    pub world: Option<WorldDit>,
 }
 
 fn freq_dim() -> u64 {
@@ -169,7 +173,17 @@ impl WanDitConfig {
             v.push(WeightSpec::new(format!("{p}.ffn.net.2.bias"), &[d], f));
             v.push(WeightSpec::new(format!("{p}.scale_shift_table"), &[1, 6, d], f));
         }
+        if let Some(wd) = &self.world {
+            v.extend(matrix_game::weight_specs(self, wd, linear));
+        }
         v
+    }
+
+    /// Rotary tables per token: one set shared by all heads, or one per
+    /// head for a world model.
+    #[must_use]
+    pub fn rope_heads(&self) -> usize {
+        if self.world.is_some() { self.num_attention_heads as usize } else { 1 }
     }
 
     /// The patch embedding as a matrix `[dim, channels * dy * dx]` (the
@@ -197,6 +211,9 @@ impl WanDitConfig {
     /// positions, not at their place in the sequence).
     #[must_use]
     pub fn rotary_tables_at(&self, positions: &[usize], rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
+        if let Some(wd) = &self.world {
+            return matrix_game::rotary_tables(self, wd, positions, rows, cols);
+        }
         let axes = self.rope_axes();
         let inv: Vec<Vec<f64>> = axes
             .iter()
@@ -289,10 +306,15 @@ pub struct DitIo {
     pub time: Tn,
     /// Text encoder states `[text_dim, text tokens]`.
     pub context: Tn,
-    /// Rotary tables `[1, pairs, 1, tokens]`.
+    /// Rotary tables `[1, pairs, rope heads, tokens]`.
     pub cos: Tn,
     /// Sine table, like `cos`.
     pub sin: Tn,
+    /// Action windows (world model only).
+    pub actions: Option<ActionIo>,
+    /// Patchified camera rays `[camera_channels * 4, tokens]` (world model
+    /// only).
+    pub camera: Option<Tn>,
     /// Predicted velocity `[patch_out, tokens]`.
     pub out: Tn,
 }
@@ -315,8 +337,10 @@ fn modulate(g: &mut Graph, x: Tn, shift: Tn, scale: Tn, eps: f32) -> Tn {
     g.add(h, shift)
 }
 
-/// Rotate adjacent pairs of `x` `[hd, heads, n]` by the tables `[1, hd/2, 1, n]`.
-fn rope_pairs(g: &mut Graph, x: Tn, cos: Tn, sin: Tn) -> Tn {
+/// Rotate adjacent pairs of `x` `[hd, heads, n]` by the tables
+/// `[1, hd/2, 1 or heads, n]` (a table divides `n` when shared across a
+/// repeat of the token axis).
+pub(crate) fn rope_pairs(g: &mut Graph, x: Tn, cos: Tn, sin: Tn) -> Tn {
     let (hd, heads, n) = (x.ne(0), x.ne(1), x.ne(2));
     let half = hd / 2;
     let x = g.reshape(x, &[2, half, heads, n]);
@@ -338,6 +362,14 @@ fn rope_pairs(g: &mut Graph, x: Tn, cos: Tn, sin: Tn) -> Tn {
 /// `q` `[hd, heads, n]`, `k`/`v` `[hd, heads, m]`; result `[hd * heads, n]`.
 fn attend(g: &mut Graph, q: Tn, k: Tn, v: Tn, exact: bool) -> Tn {
     let (hd, heads, n) = (q.ne(0), q.ne(1), q.ne(2));
+    let o = attend_batched(g, q, k, v, exact);
+    g.reshape(o, &[hd * heads, n])
+}
+
+/// `q` `[hd, heads, n, b]`, `k`/`v` `[hd, heads, m, b]`; result
+/// `[hd, heads, n, b]`.
+pub(crate) fn attend_batched(g: &mut Graph, q: Tn, k: Tn, v: Tn, exact: bool) -> Tn {
+    let hd = q.ne(0);
     let scale = 1.0 / (hd as f32).sqrt();
     let q = g.permute(q, [0, 2, 1, 3]);
     let k = g.permute(k, [0, 2, 1, 3]);
@@ -351,7 +383,7 @@ fn attend(g: &mut Graph, q: Tn, k: Tn, v: Tn, exact: bool) -> Tn {
         let v = g.cast(v, sys::GGML_TYPE_F16);
         g.attention(q, k, v, None, scale, true)
     };
-    g.reshape(o, &[hd * heads, n])
+    g.cont(o)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -377,19 +409,30 @@ fn attention(g: &mut Graph, cfg: &WanDitConfig, w: &Weights, p: &str, x: Tn, ctx
     lin(g, w, &format!("{p}.to_out.0"), o)
 }
 
-/// Build one denoising evaluation over `tokens` patches, `text` context
+/// Build one denoising evaluation over `tokens` patches in `frames` latent
+/// frames, `text` context
 /// tokens, and `time_tokens` timesteps (1, or `tokens` for per-token time).
 /// `pe` holds [`WanDitConfig::patch_weights`].
 #[allow(clippy::too_many_arguments)]
-pub fn build(g: &mut Graph, cfg: &WanDitConfig, w: &Weights, pe: &Weights, tokens: i64, text: i64, time_tokens: i64, exact: bool) -> DitIo {
+pub fn build(g: &mut Graph, cfg: &WanDitConfig, w: &Weights, pe: &Weights, frames: i64, tokens: i64, text: i64, time_tokens: i64, exact: bool) -> DitIo {
     let d = cfg.dim() as i64;
     let eps = cfg.eps as f32;
     let half = (cfg.attention_head_dim / 2) as i64;
     let patches = g.input(sys::GGML_TYPE_F32, &[cfg.patch_in() as i64, tokens]);
     let time = g.input(sys::GGML_TYPE_F32, &[FREQ_DIM as i64, time_tokens]);
     let context = g.input(sys::GGML_TYPE_F32, &[cfg.text_dim as i64, text]);
-    let cos = g.input(sys::GGML_TYPE_F32, &[1, half, 1, tokens]);
-    let sin = g.input(sys::GGML_TYPE_F32, &[1, half, 1, tokens]);
+    let rh = cfg.rope_heads() as i64;
+    let cos = g.input(sys::GGML_TYPE_F32, &[1, half, rh, tokens]);
+    let sin = g.input(sys::GGML_TYPE_F32, &[1, half, rh, tokens]);
+    let (actions, camera) = match &cfg.world {
+        Some(wd) => {
+            let a = matrix_game::action_inputs(g, &wd.action, frames);
+            let rays = g.input(sys::GGML_TYPE_F32, &[(wd.camera_channels * cfg.patch_size.iter().product::<u64>()) as i64, tokens]);
+            (Some(a), Some(rays))
+        }
+        None => (None, None),
+    };
+    let cam = camera.map(|r| matrix_game::build_camera(g, w, r));
 
     let x = g.linear(pe.get("patch_embedding.weight"), patches);
     let mut x = g.add(x, w.get("patch_embedding.bias"));
@@ -416,12 +459,23 @@ pub fn build(g: &mut Graph, cfg: &WanDitConfig, w: &Weights, pe: &Weights, token
         let a = attention(g, cfg, w, &format!("{p}.attn1"), h, h, Some((cos, sin)), exact);
         let a = g.mul(a, gate);
         x = g.add(x, a);
+        if let Some(cam) = cam {
+            x = matrix_game::inject_camera(g, w, &p, x, cam);
+        }
 
         let h = g.norm(x, eps);
         let h = g.mul(h, w.get(&format!("{p}.norm2.weight")));
         let h = g.add(h, w.get(&format!("{p}.norm2.bias")));
+        if cfg.world.is_some() {
+            x = h;
+        }
         let a = attention(g, cfg, w, &format!("{p}.attn2"), h, ctx, None, exact);
         x = g.add(x, a);
+        if let (Some(wd), Some(aio)) = (&cfg.world, &actions) {
+            if wd.action.blocks.contains(&i) {
+                x = matrix_game::build_action(g, &wd.action, w, &format!("{p}.action_model"), x, aio, frames, exact);
+            }
+        }
 
         let h = modulate(g, x, c_shift, c_scale, eps);
         let f = lin(g, w, &format!("{p}.ffn.net.0.proj"), h);
@@ -441,7 +495,7 @@ pub fn build(g: &mut Graph, cfg: &WanDitConfig, w: &Weights, pe: &Weights, token
     let scale = g.cont(v);
     let h = modulate(g, x, shift, scale, eps);
     let out = lin(g, w, "proj_out", h);
-    DitIo { patches, time, context, cos, sin, out }
+    DitIo { patches, time, context, cos, sin, actions, camera, out }
 }
 
 #[cfg(test)]

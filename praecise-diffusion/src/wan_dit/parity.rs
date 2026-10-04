@@ -47,7 +47,7 @@ fn run(per_token: bool, exact: bool) -> f64 {
     let n = frames * rows * cols;
     let tt = if per_token { n } else { 1 };
     let mut g = Graph::new(&backend).unwrap();
-    let io = build(&mut g, &cfg, &wts, &pe, n as i64, text as i64, tt as i64, exact);
+    let io = build(&mut g, &cfg, &wts, &pe, frames as i64, n as i64, text as i64, tt as i64, exact);
     g.finish(&[io.out]).unwrap();
     let (cos, sin) = cfg.rotary_tables(frames, rows, cols);
     let time: Vec<f32> = if per_token {

@@ -54,7 +54,7 @@ fn wan_pipeline_parity() {
     let (rows, cols) = (lh / 2, lw / 2);
     let n = lt * rows * cols;
     let mut g = Graph::new(&wan.backend).unwrap();
-    let io = wan_dit::build(&mut g, &wan.cfg, &wan.tf, &wan.pe, n as i64, TEXT_TOKENS as i64, 1, true);
+    let io = wan_dit::build(&mut g, &wan.cfg, &wan.tf, &wan.pe, lt as i64, n as i64, TEXT_TOKENS as i64, 1, true);
     g.finish(&[io.out]).unwrap();
     let (cs, sn) = wan.cfg.rotary_tables(lt, rows, cols);
     let (sigmas, steps) = flow_sigmas_schedule(u("steps") as usize, wan.sched.flow_shift, wan.sched.num_train_timesteps);
