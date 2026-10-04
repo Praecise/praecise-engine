@@ -114,3 +114,28 @@ fn ltx2_parity_connectors_single_file_f32() {
 fn ltx2_parity_connectors_bf16() {
     connectors_run(Precision::Bf16, false, 0.9999, 2e-2);
 }
+
+fn video_decoder_run(precision: Precision, min_cos: f64, max_rel: f64) {
+    let d = PathBuf::from(std::env::var("PRAECISE_LTX2_VAE_PARITY").expect("PRAECISE_LTX2_VAE_PARITY names the fixture dir"));
+    let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from) };
+    let dec = vae::Ltx2VideoDecoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let u = |k: &str| m[k].as_u64().unwrap() as usize;
+    let frames = u("frames");
+    assert_eq!(dec.config().video_frames(frames) as u64, m["out_shape"][1].as_u64().unwrap());
+    let px = dec.decode(&read("latent"), frames, u("height"), u("width")).unwrap();
+    assert_close("video decoder", &px, &read("video"), min_cos, max_rel);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_video_decoder_f32() {
+    video_decoder_run(Precision::F32, 0.999_999, 1e-4);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_video_decoder_bf16() {
+    video_decoder_run(Precision::Bf16, 0.9999, 2e-2);
+}

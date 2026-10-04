@@ -29,6 +29,7 @@ use llama_cpp_sys_2 as sys;
 
 pub mod connectors;
 pub mod single_file;
+pub mod vae;
 
 #[cfg(test)]
 mod parity;

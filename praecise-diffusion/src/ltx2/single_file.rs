@@ -19,6 +19,8 @@ pub enum Part {
     Connectors,
     /// The audio autoencoder.
     AudioVae,
+    /// The video autoencoder.
+    VideoVae,
 }
 
 const TRANSFORMER: &str = "model.diffusion_model.";
@@ -69,6 +71,10 @@ pub fn component_name(key: &str) -> Option<(Part, String)> {
         }
         let name = TRANSFORMER_RENAMES.iter().fold(rest.to_string(), |n, (from, to)| n.replace(from, to));
         return Some((Part::Transformer, name));
+    }
+    if let Some(rest) = key.strip_prefix("vae.") {
+        let name = rest.replace("per_channel_statistics.mean-of-means", "latents_mean").replace("per_channel_statistics.std-of-means", "latents_std");
+        return Some((Part::VideoVae, name));
     }
     if let Some(rest) = key.strip_prefix("audio_vae.") {
         let name = rest.replace("per_channel_statistics.mean-of-means", "latents_mean").replace("per_channel_statistics.std-of-means", "latents_std");
@@ -165,6 +171,8 @@ mod tests {
         assert_eq!(name("model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.7.attn1.q_norm.weight"), c("audio_connector.transformer_blocks.7.attn1.norm_q.weight"));
         assert_eq!(name("text_embedding_projection.video_aggregate_embed.weight"), c("video_text_proj_in.weight"));
         assert_eq!(name("audio_vae.per_channel_statistics.std-of-means"), (Part::AudioVae, "latents_std".into()));
+        assert_eq!(name("vae.decoder.up_blocks.1.conv.conv.weight"), (Part::VideoVae, "decoder.up_blocks.1.conv.conv.weight".into()));
+        assert_eq!(name("vae.per_channel_statistics.mean-of-means"), (Part::VideoVae, "latents_mean".into()));
         assert_eq!(component_name("vocoder.mel_stft.window"), None);
     }
 
