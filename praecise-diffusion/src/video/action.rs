@@ -298,7 +298,7 @@ impl Cosmos3 {
 
     /// Positions `[time, height, width]` of `n` action tokens after a text of
     /// `text` tokens: one per transition, starting one frame in.
-    fn action_positions(&self, text: usize, n: usize, fps: f32) -> Vec<[f32; 3]> {
+    pub(super) fn action_positions(&self, text: usize, n: usize, fps: f32) -> Vec<[f32; 3]> {
         let offset = (text as u64 + self.cfg.unified_3d_mrope_temporal_modality_margin) as f32;
         let spatial = if self.cfg.unified_3d_mrope_reset_spatial_ids { 0.0 } else { offset };
         let base_tps = (self.cfg.base_fps / self.vae_cfg.scale_factor_temporal as f64) as f32;

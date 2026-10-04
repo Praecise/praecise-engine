@@ -54,7 +54,8 @@ def save(out, name, t):
     return list(a.shape)
 
 
-def build(out, released):
+def build(out, released, **extra):
+    """The small checkpoint; `extra` adds transformer settings."""
     ckpt = os.path.join(out, "checkpoint")
     os.makedirs(ckpt, exist_ok=True)
     torch.manual_seed(0)
@@ -81,6 +82,7 @@ def build(out, released):
         use_und_k_norm_for_gen=True,
         unified_3d_mrope_reset_spatial_ids=True,
         unified_3d_mrope_temporal_modality_margin=15000,
+        **extra,
     )
     randomise(transformer, 1)
     g = torch.Generator().manual_seed(3)

@@ -544,6 +544,9 @@ pub use action::{action_caption, ActionMode, ActionOutput, ActionRequest, Embodi
 mod parity;
 
 #[cfg(test)]
+mod action_parity;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
