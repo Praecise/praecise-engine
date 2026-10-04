@@ -138,7 +138,13 @@ fn append(base: &str, addition: &str) -> String {
 
 /// Latent grid `(frames, height, width)` of a request.
 fn grid(req: &VideoRequest) -> (usize, usize, usize) {
-    (((req.num_frames - 1) / 4 + 1) as usize, (req.height / 16) as usize, (req.width / 16) as usize)
+    grid_of(req.num_frames, req.height, req.width)
+}
+
+/// Latent grid `(frames, height, width)` of `num_frames` frames of
+/// `height` x `width`.
+fn grid_of(num_frames: u32, height: u32, width: u32) -> (usize, usize, usize) {
+    (((num_frames - 1) / 4 + 1) as usize, (height / 16) as usize, (width / 16) as usize)
 }
 
 impl Cosmos3 {
@@ -377,7 +383,7 @@ impl Cosmos3 {
             let cache = self.text_cache(ids)?;
             let mut g = Graph::new(&self.backend)?;
             let io = cosmos3::build_gen(&mut g, &self.cfg, &self.tf, &cache, n, cond, None, self.exact);
-            g.finish(&[io.out])?;
+            g.finish(&[io.out.expect("a noisy video token")])?;
             let (cos, sin) = self.cfg.rotary_tables(&self.video_positions(ids.len(), lt, gh, gw, fps));
             passes.push((g, io, cache, cos, sin));
         }
@@ -395,7 +401,7 @@ impl Cosmos3 {
                 g.set_f32(io.sin, sin);
                 g.compute()?;
                 evaluations += 1;
-                preds.push(self.velocity(&g.read_f32(io.out), cond_frames, shape));
+                preds.push(self.velocity(&g.read_f32(io.out.expect("a noisy video token")), cond_frames, shape));
             }
             let v = if use_cfg {
                 preds[1].iter().zip(&preds[0]).map(|(u, c)| u + guidance * (c - u)).collect()
@@ -530,6 +536,9 @@ impl Cosmos3 {
         })
     }
 }
+
+mod action;
+pub use action::{action_caption, ActionMode, ActionOutput, ActionRequest, Embodiment};
 
 #[cfg(test)]
 mod parity;

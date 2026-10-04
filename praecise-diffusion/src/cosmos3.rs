@@ -445,8 +445,9 @@ pub struct ActionIo {
     pub time: Tn,
     /// Embodiment index `[1]` (i32).
     pub domain: Tn,
-    /// Velocity of the predicted actions `[action width, tokens - cond]`.
-    pub out: Tn,
+    /// Velocity of the predicted actions `[action width, tokens - cond]`;
+    /// `None` when every action token is given.
+    pub out: Option<Tn>,
 }
 
 /// Inputs and outputs of the generation-stream graph.
@@ -461,21 +462,24 @@ pub struct GenIo {
     pub cos: Tn,
     /// Sine table, same layout.
     pub sin: Tn,
-    /// Velocity of the noisy tokens `[patch width, tokens - cond]`.
-    pub out: Tn,
+    /// Velocity of the noisy tokens `[patch width, tokens - cond]`; `None`
+    /// when every video token is given.
+    pub out: Option<Tn>,
     /// The action tokens, when the graph carries them.
     pub actions: Option<ActionIo>,
 }
 
 /// Add the timestep embedding of `time` to every column of `x` after the
 /// first `cond`.
+/// When every column is clean, `time` stays outside the graph and must not
+/// be set.
 fn add_time(g: &mut Graph, w: &Weights, time: Tn, x: Tn, n: i64, cond: i64) -> Tn {
-    let t = g.linear_b(w.get("time_embedder.linear_1.weight"), w.get("time_embedder.linear_1.bias"), time);
-    let t = g.silu(t);
-    let temb = g.linear_b(w.get("time_embedder.linear_2.weight"), w.get("time_embedder.linear_2.bias"), t);
     if cond == n {
         return x;
     }
+    let t = g.linear_b(w.get("time_embedder.linear_1.weight"), w.get("time_embedder.linear_1.bias"), time);
+    let t = g.silu(t);
+    let temb = g.linear_b(w.get("time_embedder.linear_2.weight"), w.get("time_embedder.linear_2.bias"), t);
     if cond > 0 {
         let c = g.view_cols(x, 0, cond);
         let rest = g.view_cols(x, cond, n - cond);
@@ -490,8 +494,8 @@ fn add_time(g: &mut Graph, w: &Weights, time: Tn, x: Tn, n: i64, cond: i64) -> T
 /// One evaluation of the generation stream over `n` patch tokens, the first
 /// `cond` of which are clean conditioning tokens (no timestep embedding, no
 /// prediction), followed by the action tokens of `actions` if given,
-/// attending to the text keys and values in `cache`. At least one video
-/// token must be predicted.
+/// attending to the text keys and values in `cache`. At least one video or
+/// action token must be predicted.
 ///
 /// # Panics
 /// When `actions` is given and the configuration has no action width.
@@ -559,14 +563,18 @@ pub fn build_gen(
         x = g.add(x, m);
     }
     let h = rms(g, w, "norm_moe_gen.weight", x, eps);
-    let hv = g.view_cols(h, cond, n - cond);
-    let hv = g.cont(hv);
-    let out = g.linear_b(w.get("proj_out.weight"), w.get("proj_out.bias"), hv);
+    let out = (cond < n).then(|| {
+        let hv = g.view_cols(h, cond, n - cond);
+        let hv = g.cont(hv);
+        g.linear_b(w.get("proj_out.weight"), w.get("proj_out.bias"), hv)
+    });
     let actions = action.map(|(span, values, time, domain)| {
         let ad = cfg.action_dim.expect("action width") as i64;
-        let ha = g.view_cols(h, n + span.cond, span.tokens - span.cond);
-        let ha = g.cont(ha);
-        let out = domain_linear(g, w, "action_proj_out", domain, d, ad, ha);
+        let out = (span.cond < span.tokens).then(|| {
+            let ha = g.view_cols(h, n + span.cond, span.tokens - span.cond);
+            let ha = g.cont(ha);
+            domain_linear(g, w, "action_proj_out", domain, d, ad, ha)
+        });
         ActionIo { values, time, domain, out }
     });
     GenIo { patches, time, cos, sin, out, actions }

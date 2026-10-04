@@ -74,7 +74,7 @@ fn run(name: &str, wtype: WType, exact: bool) -> ((f64, f64), (f64, f64)) {
     let mut g = Graph::new(&backend).unwrap();
     let io = build_gen(&mut g, &cfg, &w, &cache, n, cond, Some(ActionSpan { tokens: na, cond: acond }), exact);
     let a = io.actions.clone().unwrap();
-    g.finish(&[io.out, a.out]).unwrap();
+    g.finish(&[io.out.unwrap(), a.out.unwrap()]).unwrap();
     let gp = bin(&dir, "gen_positions");
     let pos: Vec<[f32; 3]> = gp.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect();
     let (cos, sin) = cfg.rotary_tables(&pos);
@@ -86,8 +86,8 @@ fn run(name: &str, wtype: WType, exact: bool) -> ((f64, f64), (f64, f64)) {
     g.set_f32(a.time, &cfg.time_features(u("t_action")));
     g.set_i32(a.domain, &[u("domain") as i32]);
     g.compute().unwrap();
-    let v = cosine(&g.read_f32(io.out), &bin(&dir, "out_vision"));
-    let a = cosine(&g.read_f32(a.out), &bin(&dir, "out_action"));
+    let v = cosine(&g.read_f32(io.out.unwrap()), &bin(&dir, "out_vision"));
+    let a = cosine(&g.read_f32(a.out.unwrap()), &bin(&dir, "out_action"));
     eprintln!("{name} {wtype:?}: video cos {:.6} rel {:.2e}, action cos {:.6} rel {:.2e}", v.0, v.1, a.0, a.1);
     (v, a)
 }
