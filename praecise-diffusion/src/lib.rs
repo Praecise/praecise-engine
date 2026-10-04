@@ -32,6 +32,7 @@ pub mod oobleck;
 pub mod pipeline;
 pub mod qwen3;
 pub mod qwen_image;
+pub mod qwen_image21;
 pub mod qwen_vl;
 pub mod s3dit;
 pub mod safetensors;
@@ -54,6 +55,7 @@ pub use video::{action_resolution_tier, ActionMode, ActionOutput, ActionRequest,
 pub use world::{SessionConfig, WorldChunk, WorldModel, WorldSession};
 pub use zimage::ZImage;
 pub use qwen_image::pipeline::QwenImageEdit;
+pub use qwen_image21::QwenImage21Transformer;
 pub use ltx2::pipeline::{Guidance as Ltx2Guidance, Ltx2Output, Ltx2Pipeline, Ltx2Request};
 pub use pipeline::{
     CheckpointFiles, Flux2Klein, Image, LoadOptions, MAX_REFERENCE_PIXELS, Precision, Request, RgbImage, Timings,
