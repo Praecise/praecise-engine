@@ -465,6 +465,7 @@ impl Flux3Transformer {
 
 pub mod packing;
 pub mod sampling;
+pub mod video_vae;
 
 #[cfg(test)]
 mod parity;
