@@ -140,6 +140,9 @@ pub enum LlamaContextLoadError {
     /// llama.cpp returned null
     #[error("null reference from llama.cpp")]
     NullReturn,
+    /// The model's served LoRA adapter could not be applied to the context.
+    #[error("the served LoRA adapter could not be applied ({0})")]
+    LoraAdapter(i32),
 }
 
 /// Errors from the sequence-state save/restore API.

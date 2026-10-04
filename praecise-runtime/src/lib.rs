@@ -129,7 +129,7 @@ pub use batching::{
     max_slots, BatchEngine, BatchPrompt, BatchRequest, SequenceHandoff, SequenceResume, SequenceTicket,
 };
 #[cfg(feature = "bundled-llama")]
-pub use loaded::{LoadedDrafter, LoadedModel};
+pub use loaded::{attach_adapter, AdapterSpec, LoadedDrafter, LoadedModel};
 #[cfg(feature = "bundled-llama")]
 pub use sampling::{build_sampler_chain, build_sampler_chain_with_grammar};
 #[cfg(feature = "bundled-llama")]

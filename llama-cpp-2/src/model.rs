@@ -28,10 +28,11 @@ pub mod params;
 
 /// A safe wrapper around `llama_model`.
 #[derive(Debug)]
-#[repr(transparent)]
 #[allow(clippy::module_name_repetitions)]
 pub struct LlamaModel {
     pub(crate) model: NonNull<llama_cpp_sys_2::llama_model>,
+    /// LoRA adapter and scale applied to every context created from this model.
+    pub(crate) served_lora: Option<(LlamaLoraAdapter, f32)>,
 }
 
 /// A safe wrapper around `llama_lora_adapter`.
@@ -694,7 +695,7 @@ impl LlamaModel {
         let model = NonNull::new(llama_model).ok_or(LlamaModelLoadError::NullResult)?;
 
         tracing::debug!(?path, "Loaded model");
-        Ok(LlamaModel { model })
+        Ok(LlamaModel { model, served_lora: None })
     }
 
     /// Initializes a lora adapter from a file.
@@ -727,6 +728,33 @@ impl LlamaModel {
         })
     }
 
+    /// Serves `adapter` at `scale` on every context created from this model from now on; the
+    /// adapter must have been loaded with [`Self::lora_adapter_init`] on this model.
+    pub fn set_served_lora(&mut self, adapter: LlamaLoraAdapter, scale: f32) {
+        self.served_lora = Some((adapter, scale));
+    }
+
+    /// Whether contexts of this model are served with a LoRA adapter.
+    #[must_use]
+    pub fn has_served_lora(&self) -> bool {
+        self.served_lora.is_some()
+    }
+
+    fn apply_served_lora(&self, context: &LlamaContext<'_>) -> Result<(), LlamaContextLoadError> {
+        let Some((adapter, scale)) = &self.served_lora else {
+            return Ok(());
+        };
+        let mut adapters = [adapter.lora_adapter.as_ptr()];
+        let mut scales = [*scale];
+        let rc = unsafe {
+            llama_cpp_sys_2::llama_set_adapters_lora(context.context.as_ptr(), adapters.as_mut_ptr(), 1, scales.as_mut_ptr())
+        };
+        if rc != 0 {
+            return Err(LlamaContextLoadError::LoraAdapter(rc));
+        }
+        Ok(())
+    }
+
     /// Create a new context from this model.
     ///
     /// # Errors
@@ -744,8 +772,9 @@ impl LlamaModel {
             llama_cpp_sys_2::llama_new_context_with_model(self.model.as_ptr(), context_params)
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
-
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+        let context = LlamaContext::new(self, context, params.embeddings());
+        self.apply_served_lora(&context)?;
+        Ok(context)
     }
 
     /// Create a new context bound to another context via llama.cpp's `ctx_other` field.
@@ -770,8 +799,9 @@ impl LlamaModel {
             llama_cpp_sys_2::llama_new_context_with_model(self.model.as_ptr(), context_params)
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
-
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+        let context = LlamaContext::new(self, context, params.embeddings());
+        self.apply_served_lora(&context)?;
+        Ok(context)
     }
 
     /// Creates a new context with backend samplers attached for specific sequences.

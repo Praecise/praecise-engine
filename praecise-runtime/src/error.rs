@@ -101,6 +101,11 @@ pub enum Error {
     #[error("Weight staging error: {0}")]
     Staging(String),
 
+    /// A LoRA adapter whose file does not match its pinned content hash, or that the backend
+    /// refused.
+    #[error("Adapter error: {0}")]
+    Adapter(String),
+
     /// JSON serialization error.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
