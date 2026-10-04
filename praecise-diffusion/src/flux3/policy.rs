@@ -98,6 +98,22 @@ fn pair(v: &Value, key: &str) -> Result<Option<(usize, usize)>> {
     Ok(Some((get(0)?, get(1)?)))
 }
 
+/// Channel indices (negative ones count from the end) resolved against `d`.
+fn channel_list(v: &Value, key: &str, d: usize) -> Result<Vec<usize>> {
+    let Some(x) = field(v, key) else { return Ok(Vec::new()) };
+    let a = x.as_array().ok_or_else(|| Error::Config(format!("policy config: {key} is not a list")))?;
+    a.iter()
+        .map(|n| {
+            let i = n.as_i64().ok_or_else(|| Error::Config(format!("policy config: {key} holds a non-integer")))?;
+            let r = if i < 0 { i + d as i64 } else { i };
+            if r < 0 || r >= d as i64 {
+                return Err(Error::Config(format!("policy config: {key} index {i} is outside {d} channels")));
+            }
+            Ok(r as usize)
+        })
+        .collect()
+}
+
 impl PolicyConfig {
     /// Settings from a policy `config.json`.
     ///
@@ -160,10 +176,7 @@ impl PolicyConfig {
             camera_layout,
             action_modality: field(v, "action_modality").and_then(Value::as_str).unwrap_or("action").to_owned(),
             action_scale: num(v, "action_scale", 2.0)? as f32,
-            gripper_flip_dims: field(v, "gripper_flip_dims")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_u64).map(|n| n as usize).collect())
-                .unwrap_or_default(),
+            gripper_flip_dims: channel_list(v, "gripper_flip_dims", action_dim)?,
             sampler: SamplerSettings { kind, steps: count(v, "num_inference_steps", 4)?, shift: num(v, "sampler_shift", 5.0)? },
             guidance_scale,
             guidance_scale_action: match field(v, "guidance_scale_action") {
@@ -417,6 +430,92 @@ impl std::fmt::Debug for ActionPolicy {
     }
 }
 
+/// Check that a transformer carries the streams the settings name.
+///
+/// # Errors
+/// When a stream is missing or has the wrong width.
+pub fn check_transformer(cfg: &PolicyConfig, dit: &Flux3Transformer) -> Result<()> {
+    let dc = dit.config();
+    let want = [
+        ("video", LATENT_CHANNELS),
+        ("video_cond", LATENT_CHANNELS),
+        (cfg.action_modality.as_str(), cfg.action_dim),
+        (&format!("{}_cond", cfg.action_modality), cfg.conditioning_channels()),
+    ];
+    for (name, ch) in want {
+        if dc.channels(name) != Some(ch as u64) {
+            return Err(Error::Config(format!("transformer stream {name} does not carry {ch} channels")));
+        }
+    }
+    Ok(())
+}
+
+/// Pack an observation into conditioning tokens with the video autoencoder.
+///
+/// # Errors
+/// On a camera/layout mismatch, wrong history length or a backend failure.
+pub fn encode_conditions(cfg: &PolicyConfig, vae: &VideoVae, obs: &Observation<'_>) -> Result<Conditions> {
+    let (ch, cw) = cfg.canvas_hw;
+    let frames = obs.cameras.first().map_or(0, Vec::len);
+    let pick: Vec<usize> = match cfg.conditioning {
+        Conditioning::Frame => vec![frames.checked_sub(1).ok_or_else(|| Error::Request("no camera frames".into()))?],
+        Conditioning::History => {
+            if frames != cfg.n_obs_steps {
+                return Err(Error::Request(format!("the history policy needs {} frames per camera", cfg.n_obs_steps)));
+            }
+            packing::snapshot_indices(cfg.n_obs_steps, cfg.history_snapshots)
+        }
+    };
+    let mut latents = Vec::with_capacity(pick.len());
+    let mut seconds = Vec::with_capacity(pick.len());
+    for &i in &pick {
+        let cams: Vec<Vec<Frame>> = obs.cameras.iter().map(|c| vec![c[i].clone()]).collect();
+        let canvas = packing::compose_canvas(&cams, cfg.camera_layout, ch, cw)?;
+        // The frame packer encodes the current frame as a padded chunk;
+        // history snapshots are encoded on their own.
+        let (lat, dims) = match cfg.conditioning {
+            Conditioning::Frame => vae.encode_chunked(&canvas, 1, ch, cw)?,
+            Conditioning::History => vae.encode(&canvas, 1, ch, cw)?,
+        };
+        latents.push((lat, dims));
+        seconds.push(match cfg.conditioning {
+            Conditioning::Frame => 0.0,
+            Conditioning::History => i as f32 / cfg.video_fps(),
+        });
+    }
+    let (video, video_ids) = pack_video(cfg, &latents, &seconds);
+    let (action, action_ids) = pack_actions(cfg, obs.states, obs.past_actions)?;
+    Ok(Conditions { video, video_ids, action, action_ids })
+}
+
+/// Instruction context and, when guidance is on, the empty-prompt context.
+///
+/// # Errors
+/// On a tokenizer or backend failure.
+pub fn encode_instruction(cfg: &PolicyConfig, text: &TextEncoder, instruction: &str) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+let (ctx, _) = text.encode(instruction, cfg.text_fixed_length)?;
+let uncond = if cfg.guidance().iter().any(|&g| g != 1.0) { Some(text.encode("", cfg.text_fixed_length)?.0) } else { None };
+Ok((ctx, uncond))
+}
+
+/// Sample one action chunk `[chunk][action_dim]` in the normalised action
+/// space (grippers unflipped) from packed conditions and text context.
+///
+/// # Errors
+/// On mismatched inputs or a backend failure.
+pub fn predict_chunk(
+    dit: &Flux3Transformer,
+    cfg: &PolicyConfig,
+    cond: &Conditions,
+    ctx: &[f32],
+    ctx_uncond: Option<&[f32]>,
+    noise: &Noise,
+) -> Result<Vec<f32>> {
+    let mut chunk = sample_chunk(dit, cfg, cond, ctx, ctx_uncond, noise)?;
+    packing::flip_channels(&mut chunk, cfg.action_dim, &cfg.gripper_flip_dims);
+    Ok(chunk)
+}
+
 impl ActionPolicy {
     /// Load a policy from its settings and component files: the transformer
     /// shards (keys `dit.*`), the autoencoder shards (keys `model.*`) and the
@@ -433,21 +532,10 @@ impl ActionPolicy {
         opts: LoadOptions,
     ) -> Result<Self> {
         let dit = Flux3Transformer::load(dit_files, "dit.", opts)?;
-        let dc = dit.config();
-        let want = [
-            ("video", LATENT_CHANNELS),
-            ("video_cond", LATENT_CHANNELS),
-            (cfg.action_modality.as_str(), cfg.action_dim),
-            (&format!("{}_cond", cfg.action_modality), cfg.conditioning_channels()),
-        ];
-        for (name, ch) in want {
-            if dc.channels(name) != Some(ch as u64) {
-                return Err(Error::Config(format!("transformer stream {name} does not carry {ch} channels")));
-            }
-        }
+        check_transformer(&cfg, &dit)?;
         let vae = VideoVae::load(vae_files, "model.", VaeConfig::default(), opts)?;
         let text = TextEncoder::load(text_dir, &CONTEXT_LAYERS, opts)?;
-        if text.context_width() as u64 != dc.context_in_dim {
+        if text.context_width() as u64 != dit.config().context_in_dim {
             return Err(Error::Config("text encoder width does not match the transformer".into()));
         }
         Ok(Self { cfg, dit, vae, text })
@@ -459,44 +547,25 @@ impl ActionPolicy {
         &self.cfg
     }
 
+    /// Device bytes held by the weights.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.dit.resident_bytes() + self.vae.resident_bytes() + self.text.resident_bytes()
+    }
+
+    /// Name of the compute device.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        self.dit.device()
+    }
+
     /// Pack an observation into conditioning tokens.
     ///
     /// # Errors
     /// On a camera/layout mismatch, wrong history length or a backend
     /// failure.
     pub fn conditions(&self, obs: &Observation<'_>) -> Result<Conditions> {
-        let cfg = &self.cfg;
-        let (ch, cw) = cfg.canvas_hw;
-        let frames = obs.cameras.first().map_or(0, Vec::len);
-        let pick: Vec<usize> = match cfg.conditioning {
-            Conditioning::Frame => vec![frames.checked_sub(1).ok_or_else(|| Error::Request("no camera frames".into()))?],
-            Conditioning::History => {
-                if frames != cfg.n_obs_steps {
-                    return Err(Error::Request(format!("the history policy needs {} frames per camera", cfg.n_obs_steps)));
-                }
-                packing::snapshot_indices(cfg.n_obs_steps, cfg.history_snapshots)
-            }
-        };
-        let mut latents = Vec::with_capacity(pick.len());
-        let mut seconds = Vec::with_capacity(pick.len());
-        for &i in &pick {
-            let cams: Vec<Vec<Frame>> = obs.cameras.iter().map(|c| vec![c[i].clone()]).collect();
-            let canvas = packing::compose_canvas(&cams, cfg.camera_layout, ch, cw)?;
-            // The frame packer encodes the current frame as a padded chunk;
-            // history snapshots are encoded on their own.
-            let (lat, dims) = match cfg.conditioning {
-                Conditioning::Frame => self.vae.encode_chunked(&canvas, 1, ch, cw)?,
-                Conditioning::History => self.vae.encode(&canvas, 1, ch, cw)?,
-            };
-            latents.push((lat, dims));
-            seconds.push(match cfg.conditioning {
-                Conditioning::Frame => 0.0,
-                Conditioning::History => i as f32 / cfg.video_fps(),
-            });
-        }
-        let (video, video_ids) = pack_video(cfg, &latents, &seconds);
-        let (action, action_ids) = pack_actions(cfg, obs.states, obs.past_actions)?;
-        Ok(Conditions { video, video_ids, action, action_ids })
+        encode_conditions(&self.cfg, &self.vae, obs)
     }
 
     /// Predict one action chunk `[chunk][action_dim]` in the normalised
@@ -506,15 +575,8 @@ impl ActionPolicy {
     /// On a malformed observation or a backend failure.
     pub fn predict(&self, obs: &Observation<'_>, noise: &Noise) -> Result<Vec<f32>> {
         let cond = self.conditions(obs)?;
-        let (ctx, _) = self.text.encode(obs.instruction, self.cfg.text_fixed_length)?;
-        let uncond = if self.cfg.guidance().iter().any(|&g| g != 1.0) {
-            Some(self.text.encode("", self.cfg.text_fixed_length)?.0)
-        } else {
-            None
-        };
-        let mut chunk = sample_chunk(&self.dit, &self.cfg, &cond, &ctx, uncond.as_deref(), noise)?;
-        packing::flip_channels(&mut chunk, self.cfg.action_dim, &self.cfg.gripper_flip_dims);
-        Ok(chunk)
+        let (ctx, uncond) = encode_instruction(&self.cfg, &self.text, obs.instruction)?;
+        predict_chunk(&self.dit, &self.cfg, &cond, &ctx, uncond.as_deref(), noise)
     }
 }
 

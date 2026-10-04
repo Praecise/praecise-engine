@@ -329,6 +329,12 @@ impl std::fmt::Debug for VideoVae {
 }
 
 impl VideoVae {
+    /// Device bytes held by the weights.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     /// Load from safetensors files whose tensor names carry `prefix`
     /// (stripped; tensors without it are ignored).
     ///

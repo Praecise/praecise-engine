@@ -55,6 +55,12 @@ impl std::fmt::Debug for TextEncoder {
 }
 
 impl TextEncoder {
+    /// Device bytes held by the weights.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     /// Load from a directory holding `config.json` (with a `text_config`),
     /// `tokenizer.json`, `tokenizer_config.json` and the safetensors shards,
     /// reading the hidden states after `layers` (1-based; the released

@@ -301,6 +301,18 @@ impl std::fmt::Debug for Flux3Transformer {
 }
 
 impl Flux3Transformer {
+    /// Device bytes held by the weights.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
+    /// Name of the compute device.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        self.backend.name()
+    }
+
     /// Load from safetensors files whose tensor names may carry `prefix`
     /// (stripped; tensors without it are ignored).
     ///
@@ -465,6 +477,7 @@ impl Flux3Transformer {
 
 pub mod packing;
 pub mod policy;
+pub mod release;
 pub mod sampling;
 pub mod text_encoder;
 pub mod video_vae;
