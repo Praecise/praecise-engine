@@ -51,9 +51,18 @@ fn assert_close(what: &str, ours: &[f32], reference: &[f32], min_cos: f64, max_r
 }
 
 fn run(precision: Precision, min_cos: f64, max_rel: f64) {
+    run_from(precision, false, min_cos, max_rel);
+}
+
+fn run_from(precision: Precision, single_file: bool, min_cos: f64, max_rel: f64) {
     let m: Value = serde_json::from_slice(&std::fs::read(dir().join("meta.json")).unwrap()).unwrap();
     let threads = std::thread::available_parallelism().map_or(8, usize::from);
-    let tf = Ltx2Transformer::load(&CheckpointFiles::new(dir().join("checkpoint")), LoadOptions { precision, cpu_threads: threads, device: None }).unwrap();
+    let opts = LoadOptions { precision, cpu_threads: threads, device: None };
+    let tf = if single_file {
+        Ltx2Transformer::load_single_file(&dir().join("single.safetensors"), opts).unwrap()
+    } else {
+        Ltx2Transformer::load(&CheckpointFiles::new(dir().join("checkpoint")), opts).unwrap()
+    };
     let u = |k: &str| m[k].as_u64().unwrap() as usize;
     let s = AvShape { frames: u("frames"), height: u("height"), width: u("width"), audio_frames: u("audio_frames"), fps: m["fps"].as_f64().unwrap() as f32 };
     let (video, audio, text, audio_text) = (bin("video"), bin("audio"), bin("text"), bin("audio_text"));
@@ -76,6 +85,12 @@ fn ltx2_parity_transformer_f32() {
 #[ignore = "needs the reference fixtures"]
 fn ltx2_parity_transformer_bf16() {
     run(Precision::Bf16, 0.9999, 2e-2);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_transformer_single_file_f32() {
+    run_from(Precision::F32, true, 0.999_999, 1e-4);
 }
 
 fn connectors_run(precision: Precision, single_file: bool, min_cos: f64, max_rel: f64) {

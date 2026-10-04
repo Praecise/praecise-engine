@@ -702,6 +702,23 @@ impl Ltx2Transformer {
         Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })
     }
 
+    /// Load the transformer of a single-file checkpoint.
+    ///
+    /// # Errors
+    /// As [`Self::load`].
+    pub fn load_single_file(path: &std::path::Path, opts: LoadOptions) -> Result<Self> {
+        let st = SafeTensors::open(&[path.to_path_buf()])?;
+        let header = single_file::header_config(&st)?;
+        let key = "model.diffusion_model.audio_patchify_proj.weight";
+        let audio_in = st.get(key).and_then(|v| v.shape.get(1).copied()).ok_or_else(|| Error::MissingTensor(key.into()))?;
+        let cfg = Ltx2Config::from_single_file(&header, audio_in)?;
+        let st = single_file::open_part(st, single_file::Part::Transformer)?;
+        let backend = opts.backend()?;
+        tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "audio-video backend selected");
+        let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;
+        Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })
+    }
+
     /// The configuration.
     #[must_use]
     pub fn config(&self) -> &Ltx2Config {

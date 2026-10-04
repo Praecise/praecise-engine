@@ -6,7 +6,10 @@
 //! maps each original name to its component and the name that component
 //! loads.
 
+use super::audio_vae::AudioVaeConfig;
 use super::connectors::ConnectorsConfig;
+use super::vae::VideoVaeConfig;
+use super::Ltx2Config;
 use crate::error::{Error, Result};
 use crate::safetensors::SafeTensors;
 
@@ -148,12 +151,151 @@ impl ConnectorsConfig {
     }
 }
 
+impl Ltx2Config {
+    /// The transformer configuration of a single-file checkpoint, from its
+    /// header (the transformer section plus the compression factors of the
+    /// two autoencoders) and the audio latent width (read off the audio input
+    /// projection, which the header does not record).
+    ///
+    /// # Errors
+    /// When a field is missing or the layout is not the released one.
+    pub fn from_single_file(header: &serde_json::Value, audio_in_channels: u64) -> Result<Self> {
+        let t = &header["transformer"];
+        let missing = |k: &str| Error::Config(format!("single-file transformer config lacks {k}"));
+        let u = |k: &str| t[k].as_u64().ok_or_else(|| missing(k));
+        let f = |k: &str| t[k].as_f64().ok_or_else(|| missing(k));
+        let b = |k: &str| t[k].as_bool().ok_or_else(|| missing(k));
+        let s = |k: &str| t[k].as_str().ok_or_else(|| missing(k));
+        let first = |k: &str, i: usize| t[k][i].as_u64().ok_or_else(|| missing(k));
+        let released = [
+            ("use_audio_video_cross_attention", b("use_audio_video_cross_attention")?),
+            ("av_cross_ada_norm", b("av_cross_ada_norm")?),
+            ("use_embeddings_connector", b("use_embeddings_connector")?),
+            ("caption_proj_before_connector", b("caption_proj_before_connector")?),
+            ("causal_temporal_positioning", b("causal_temporal_positioning")?),
+            ("use_middle_indices_grid", b("use_middle_indices_grid")?),
+            ("double_self_attention", !b("double_self_attention")?),
+            ("only_cross_attention", !b("only_cross_attention")?),
+            ("share_ff", !b("share_ff")?),
+            ("upcast_attention", !b("upcast_attention")?),
+            ("positional_embedding_type", s("positional_embedding_type")? == "rope"),
+            ("frequencies_precision", s("frequencies_precision")? == "float64"),
+            ("standardization_norm", s("standardization_norm")? == "rms_norm"),
+            ("attention_type", s("attention_type")? == "default"),
+        ];
+        if let Some((k, _)) = released.iter().find(|(_, ok)| !ok) {
+            return Err(Error::Config(format!("single-file transformer: {k} other than the released layout not implemented")));
+        }
+        let qk_norm = match s("qk_norm")? {
+            "rms_norm" => "rms_norm_across_heads".to_string(),
+            other => other.to_string(),
+        };
+        let vae = VideoVaeConfig::from_single_file(&header["vae"])?;
+        let (spatial, temporal) = vae.factors();
+        let audio = &header["audio_vae"];
+        let avae = AudioVaeConfig::from_single_file(audio)?;
+        let pre = &audio["preprocessing"];
+        let sampling_rate = pre["audio"]["sampling_rate"].as_u64().ok_or_else(|| missing("audio_vae preprocessing sampling_rate"))?;
+        let hop_length = pre["stft"]["hop_length"].as_u64().ok_or_else(|| missing("audio_vae preprocessing hop_length"))?;
+        let gated = b("apply_gated_attention")?;
+        let prompt_mod = b("cross_attention_adaln")?;
+        let bias = b("attention_bias")?;
+        let cfg = Self {
+            in_channels: u("in_channels")?,
+            out_channels: u("out_channels")?,
+            patch_size: 1,
+            patch_size_t: 1,
+            num_attention_heads: u("num_attention_heads")?,
+            attention_head_dim: u("attention_head_dim")?,
+            cross_attention_dim: u("cross_attention_dim")?,
+            vae_scale_factors: vec![temporal, spatial, spatial],
+            pos_embed_max_pos: first("positional_embedding_max_pos", 0)?,
+            base_height: first("positional_embedding_max_pos", 1)?,
+            base_width: first("positional_embedding_max_pos", 2)?,
+            gated_attn: gated,
+            cross_attn_mod: prompt_mod,
+            audio_in_channels,
+            audio_out_channels: u("audio_out_channels")?,
+            audio_patch_size: 1,
+            audio_patch_size_t: 1,
+            audio_num_attention_heads: u("audio_num_attention_heads")?,
+            audio_attention_head_dim: u("audio_attention_head_dim")?,
+            audio_cross_attention_dim: u("audio_cross_attention_dim")?,
+            audio_scale_factor: 1 << (avae.ch_mult.len() - 1),
+            audio_pos_embed_max_pos: first("audio_positional_embedding_max_pos", 0)?,
+            audio_sampling_rate: sampling_rate,
+            audio_hop_length: hop_length,
+            audio_gated_attn: gated,
+            audio_cross_attn_mod: prompt_mod,
+            num_layers: usize::try_from(u("num_layers")?).map_err(|_| missing("num_layers"))?,
+            activation_fn: s("activation_fn")?.to_string(),
+            qk_norm,
+            norm_elementwise_affine: b("norm_elementwise_affine")?,
+            norm_eps: f("norm_eps")?,
+            rope_theta: f("positional_embedding_theta")?,
+            causal_offset: 1,
+            timestep_scale_multiplier: u("timestep_scale_multiplier")?,
+            cross_attn_timestep_scale_multiplier: t["av_ca_timestep_scale_multiplier"].as_f64().map(|v| v as u64).ok_or_else(|| missing("av_ca_timestep_scale_multiplier"))?,
+            rope_type: s("rope_type")?.to_string(),
+            use_prompt_embeddings: false,
+            use_prompt_adaln_single: prompt_mod,
+            attention_bias: bias,
+            attention_out_bias: bias,
+            ff_bias: true,
+            audio_ff_bias: true,
+            use_keyframes_abs_pos_embedding: false,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn name(k: &str) -> (Part, String) {
         component_name(k).unwrap()
+    }
+
+    /// The header sections of the released single file.
+    pub(crate) fn released_header() -> serde_json::Value {
+        serde_json::json!({
+            "transformer": {"activation_fn": "gelu-approximate", "apply_gated_attention": true, "attention_bias": true,
+                "attention_head_dim": 128, "attention_type": "default", "audio_attention_head_dim": 64,
+                "audio_cross_attention_dim": 2048, "audio_num_attention_heads": 32, "audio_out_channels": 128,
+                "audio_positional_embedding_max_pos": [20], "av_ca_timestep_scale_multiplier": 1000.0, "av_cross_ada_norm": true,
+                "caption_proj_before_connector": true, "causal_temporal_positioning": true, "cross_attention_adaln": true,
+                "cross_attention_dim": 4096, "double_self_attention": false, "frequencies_precision": "float64", "in_channels": 128,
+                "norm_elementwise_affine": false, "norm_eps": 1e-06, "num_attention_heads": 32, "num_layers": 48,
+                "only_cross_attention": false, "out_channels": 128, "positional_embedding_max_pos": [20, 2048, 2048],
+                "positional_embedding_theta": 10000.0, "positional_embedding_type": "rope", "qk_norm": "rms_norm",
+                "rope_type": "split", "share_ff": false, "standardization_norm": "rms_norm", "timestep_scale_multiplier": 1000,
+                "upcast_attention": false, "use_audio_video_cross_attention": true, "use_embeddings_connector": true,
+                "use_middle_indices_grid": true},
+            "vae": {"dims": 3, "latent_channels": 128, "patch_size": 4, "decoder_base_channels": 128, "causal_decoder": false,
+                "decoder_blocks": [["res_x", {"num_layers": 4}], ["compress_space", {"multiplier": 2}], ["res_x", {"num_layers": 6}],
+                ["compress_time", {"multiplier": 2}], ["res_x", {"num_layers": 4}], ["compress_all", {"multiplier": 1}],
+                ["res_x", {"num_layers": 2}], ["compress_all", {"multiplier": 2}], ["res_x", {"num_layers": 2}]]},
+            "audio_vae": {"model": {"params": {"ddconfig": {"double_z": true, "mel_bins": 64, "z_channels": 8,
+                "resolution": 256, "downsample_time": false, "in_channels": 2, "out_ch": 2, "ch": 128, "ch_mult": [1, 2, 4],
+                "num_res_blocks": 2, "attn_resolutions": [], "dropout": 0.0, "mid_block_add_attention": false,
+                "norm_type": "pixel", "causality_axis": "height"}}},
+                "preprocessing": {"audio": {"sampling_rate": 16000}, "stft": {"hop_length": 160}}}
+        })
+    }
+
+    #[test]
+    fn released_transformer_config() {
+        let c = Ltx2Config::from_single_file(&released_header(), 128).unwrap();
+        assert_eq!((c.inner(), c.audio_inner(), c.num_layers), (4096, 2048, 48));
+        assert_eq!(c.vae_scale_factors, vec![8, 32, 32]);
+        assert_eq!((c.audio_scale_factor, c.audio_sampling_rate, c.audio_hop_length), (4, 16000, 160));
+        assert_eq!((c.pos_embed_max_pos, c.base_height, c.base_width, c.audio_pos_embed_max_pos), (20, 2048, 2048, 20));
+        assert_eq!(c.cross_attn_timestep_scale_multiplier, 1000);
+        let mut h = released_header();
+        h["transformer"]["share_ff"] = true.into();
+        assert!(Ltx2Config::from_single_file(&h, 128).is_err());
     }
 
     #[test]
