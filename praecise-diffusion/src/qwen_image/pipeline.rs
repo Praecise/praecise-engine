@@ -204,6 +204,12 @@ impl QwenImageEdit {
         Ok(Self { tf, vae, enc, tokenizer, sched, condition_area: CONDITION_AREA, latent_area: LATENT_AREA })
     }
 
+    /// Name of the backend the pipeline runs on.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        self.tf.backend.name()
+    }
+
     /// Device bytes held by the weights.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
