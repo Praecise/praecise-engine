@@ -302,6 +302,13 @@ impl MiniMaxH3Pipeline {
         self.transformer.device()
     }
 
+    /// Bytes of weights held on the device.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        let text = self.text.as_ref().map_or(0, |(e, _)| e.resident_bytes());
+        self.transformer.resident_bytes() + self.vae.resident_bytes() + self.audio_vae.resident_bytes() + text
+    }
+
     /// Resolve a request's geometry as the reference does.
     ///
     /// # Errors

@@ -60,6 +60,7 @@ pub use qwen_image::pipeline::QwenImageEdit;
 pub use qwen_image21::pipeline::QwenImage21;
 pub use qwen_image21::QwenImage21Transformer;
 pub use ltx2::pipeline::{Guidance as Ltx2Guidance, Ltx2Output, Ltx2Pipeline, Ltx2Request};
+pub use minimax_h3::pipeline::{H3Output, H3Request, MiniMaxH3Pipeline};
 pub use pipeline::{
     CheckpointFiles, Flux2Klein, Image, LoadOptions, MAX_REFERENCE_PIXELS, Precision, Request, RgbImage, Timings,
 };
