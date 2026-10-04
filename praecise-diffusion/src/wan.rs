@@ -118,9 +118,10 @@ impl WanVaeConfig {
     }
 
     /// Every weight both directions read, re-laid out: one `[out, in, kh,
-    /// kw]` kernel per temporal tap (`.t0` to `.t2` for the decoder, the last
-    /// tap alone for the encoder), 1x1 attention projections as matrices,
-    /// and the fixed averaging kernels of the encoder's shortcuts.
+    /// kw]` kernel per temporal tap (`.t0` to `.t2`), 1x1 attention projections
+    /// as matrices, and the fixed averaging kernels of the encoder's
+    /// shortcuts (`avg_shortcut` for the later frame of a pair, `.prev` for
+    /// the earlier one where the stage halves time).
     ///
     /// # Errors
     /// Missing or mis-shaped tensors.
@@ -130,41 +131,47 @@ impl WanVaeConfig {
         // Encoder.
         let z2 = 2 * self.z_dim;
         let ed = self.enc_dims();
-        h.causal_last("encoder.conv_in", self.in_channels, ed[0])?;
+        h.causal_taps("encoder.conv_in", self.in_channels, ed[0])?;
         for (i, (cin, cout, temporal, spatial)) in self.down_stages().into_iter().enumerate() {
             let p = format!("encoder.down_blocks.{i}");
             let mut c = cin;
             for r in 0..self.num_res_blocks {
-                h.resnet(&format!("{p}.resnets.{r}"), c, cout, false)?;
+                h.resnet(&format!("{p}.resnets.{r}"), c, cout)?;
                 c = cout;
             }
             if spatial {
                 h.conv2d(&format!("{p}.downsampler.resample.1"), cout, cout)?;
+                if temporal {
+                    h.time_conv(&format!("{p}.downsampler.time_conv"), cout, cout)?;
+                }
             }
-            if let Some(k) = avg_down_kernel(cin, cout, temporal, spatial) {
-                h.v.push(HostTensor { name: format!("{p}.avg_shortcut"), shape: vec![cout, cin, 2, 2], ty: self.kernel_type(exact), data: k });
+            let phases: &[(usize, &str)] = if temporal { &[(1, ""), (0, ".prev")] } else { &[(0, "")] };
+            for &(phase, suffix) in phases {
+                if let Some(k) = avg_down_kernel(cin, cout, temporal, spatial, phase) {
+                    h.v.push(HostTensor { name: format!("{p}.avg_shortcut{suffix}"), shape: vec![cout, cin, 2, 2], ty: self.kernel_type(exact), data: k });
+                }
             }
         }
         let top = *ed.last().expect("five widths");
-        h.mid("encoder.mid_block", top, false)?;
+        h.mid("encoder.mid_block", top)?;
         h.gamma("encoder.norm_out", top)?;
-        h.causal_last("encoder.conv_out", top, z2)?;
+        h.causal_taps("encoder.conv_out", top, z2)?;
         h.pointwise("quant_conv", z2, z2)?;
         // Decoder.
         let dd = self.dec_dims();
         h.pointwise("post_quant_conv", self.z_dim, self.z_dim)?;
         h.causal_taps("decoder.conv_in", self.z_dim, dd[0])?;
-        h.mid("decoder.mid_block", dd[0], true)?;
+        h.mid("decoder.mid_block", dd[0])?;
         for (i, (cin, cout, temporal, spatial)) in self.up_stages().into_iter().enumerate() {
             let p = format!("decoder.up_blocks.{i}");
             let mut c = cin;
             for r in 0..=self.num_res_blocks {
-                h.resnet(&format!("{p}.resnets.{r}"), c, cout, true)?;
+                h.resnet(&format!("{p}.resnets.{r}"), c, cout)?;
                 c = cout;
             }
             if spatial {
                 if temporal {
-                    h.time_conv(&format!("{p}.upsampler.time_conv"), cout)?;
+                    h.time_conv(&format!("{p}.upsampler.time_conv"), cout, 2 * cout)?;
                 }
                 h.conv2d(&format!("{p}.upsampler.resample.1"), cout, cout)?;
             }
@@ -211,14 +218,51 @@ impl WanVaeConfig {
         add("decoder.conv_out".into(), *dd.last().expect("five widths"), w, h);
         v
     }
+
+    /// The encoder's resident frame caches for a `width` x `height` video:
+    /// the last two inputs of every causal convolution and the last frame
+    /// before every temporal downsampling, zeroed before the first chunk.
+    #[must_use]
+    pub fn encoder_cache_specs(&self, width: i64, height: i64) -> Vec<WeightSpec> {
+        let mut v = Vec::new();
+        let mut add = |name: String, t: u64, c: u64, w: i64, h: i64| v.push(WeightSpec::new(name, &[t, c, h as u64, w as u64], WType::F32));
+        let ed = self.enc_dims();
+        let p = PATCH as i64;
+        let (mut w, mut h) = (width / p, height / p);
+        add("encoder.conv_in".into(), 2, self.in_channels, w, h);
+        for (i, (cin, cout, temporal, spatial)) in self.down_stages().into_iter().enumerate() {
+            let pre = format!("encoder.down_blocks.{i}");
+            let mut c = cin;
+            for r in 0..self.num_res_blocks {
+                add(format!("{pre}.resnets.{r}.conv1"), 2, c, w, h);
+                add(format!("{pre}.resnets.{r}.conv2"), 2, cout, w, h);
+                c = cout;
+            }
+            if spatial {
+                w /= 2;
+                h /= 2;
+                if temporal {
+                    add(format!("{pre}.downsampler.time_conv"), 1, cout, w, h);
+                }
+            }
+        }
+        let top = *ed.last().expect("five widths");
+        for r in 0..2 {
+            add(format!("encoder.mid_block.resnets.{r}.conv1"), 2, top, w, h);
+            add(format!("encoder.mid_block.resnets.{r}.conv2"), 2, top, w, h);
+        }
+        add("encoder.conv_out".into(), 2, top, w, h);
+        v
+    }
 }
 
-/// The encoder's averaging shortcut on a single frame as a 2x2, stride-2
+/// One temporal phase of the encoder's averaging shortcut as a 2x2, stride-2
 /// convolution kernel `[out, in, 2, 2]`: output channel `o` averages the
-/// `group` space-to-depth channels `o * group ..`, where the temporal half of
-/// the space-to-depth reads the zero frame the causal padding adds. `None`
+/// `group` space-to-depth channels `o * group ..`, and this kernel keeps the
+/// ones reading frame `phase` of each pair (the only phase when the stage
+/// keeps time; on a lone first frame phase 0 is the zero padding). `None`
 /// when the shortcut is the identity.
-fn avg_down_kernel(cin: u64, cout: u64, temporal: bool, spatial: bool) -> Option<Vec<f32>> {
+fn avg_down_kernel(cin: u64, cout: u64, temporal: bool, spatial: bool, phase: usize) -> Option<Vec<f32>> {
     let (ft, fs) = (if temporal { 2 } else { 1 }, if spatial { 2 } else { 1 });
     if ft == 1 && fs == 1 && cin == cout {
         return None;
@@ -233,7 +277,7 @@ fn avg_down_kernel(cin: u64, cout: u64, temporal: bool, spatial: bool) -> Option
             let j = o * group + gi;
             let (c, sub) = (j / factor, j % factor);
             let (it, rem) = (sub / (fs * fs), sub % (fs * fs));
-            if it != ft - 1 {
+            if it != phase {
                 continue;
             }
             let (ih, iw) = (rem / fs, rem % fs);
@@ -272,22 +316,18 @@ impl Hosts<'_> {
         self.bias(p, cout)
     }
 
-    fn causal_last(&mut self, p: &str, cin: u64, cout: u64) -> Result<()> {
-        self.taps(p, cin, cout, 3, &[(2, format!("{p}.weight"))])
-    }
-
     fn causal_taps(&mut self, p: &str, cin: u64, cout: u64) -> Result<()> {
         self.taps(p, cin, cout, 3, &(0..3).map(|t| (t, format!("{p}.weight.t{t}"))).collect::<Vec<_>>())
     }
 
-    fn time_conv(&mut self, p: &str, c: u64) -> Result<()> {
-        let w = self.files.require(&format!("{p}.weight"), &[2 * c, c, 3, 1, 1])?.to_f32();
-        let (ci, co) = (c as usize, 2 * c as usize);
+    fn time_conv(&mut self, p: &str, c: u64, cout: u64) -> Result<()> {
+        let w = self.files.require(&format!("{p}.weight"), &[cout, c, 3, 1, 1])?.to_f32();
+        let (ci, co) = (c as usize, cout as usize);
         for t in 0..3 {
             let d: Vec<f32> = (0..co * ci).map(|j| w[j * 3 + t]).collect();
-            self.v.push(HostTensor { name: format!("{p}.weight.t{t}"), shape: vec![2 * c, c, 1, 1], ty: self.kt, data: d });
+            self.v.push(HostTensor { name: format!("{p}.weight.t{t}"), shape: vec![cout, c, 1, 1], ty: self.kt, data: d });
         }
-        self.bias(p, 2 * c)
+        self.bias(p, cout)
     }
 
     fn pointwise(&mut self, p: &str, cin: u64, cout: u64) -> Result<()> {
@@ -308,15 +348,11 @@ impl Hosts<'_> {
         Ok(())
     }
 
-    fn resnet(&mut self, p: &str, cin: u64, cout: u64, taps: bool) -> Result<()> {
+    fn resnet(&mut self, p: &str, cin: u64, cout: u64) -> Result<()> {
         self.gamma(&format!("{p}.norm1"), cin)?;
         self.gamma(&format!("{p}.norm2"), cout)?;
         for (n, i) in [("conv1", cin), ("conv2", cout)] {
-            if taps {
-                self.causal_taps(&format!("{p}.{n}"), i, cout)?;
-            } else {
-                self.causal_last(&format!("{p}.{n}"), i, cout)?;
-            }
+            self.causal_taps(&format!("{p}.{n}"), i, cout)?;
         }
         if cin != cout {
             self.pointwise(&format!("{p}.conv_shortcut"), cin, cout)?;
@@ -324,8 +360,8 @@ impl Hosts<'_> {
         Ok(())
     }
 
-    fn mid(&mut self, p: &str, c: u64, taps: bool) -> Result<()> {
-        self.resnet(&format!("{p}.resnets.0"), c, c, taps)?;
+    fn mid(&mut self, p: &str, c: u64) -> Result<()> {
+        self.resnet(&format!("{p}.resnets.0"), c, c)?;
         let a = format!("{p}.attentions.0");
         let g = self.files.require(&format!("{a}.norm.gamma"), &[c, 1, 1])?.to_f32();
         self.v.push(HostTensor { name: format!("{a}.norm.gamma"), shape: vec![c], ty: WType::F32, data: g });
@@ -335,22 +371,15 @@ impl Hosts<'_> {
         let proj = self.files.require(&format!("{a}.proj.weight"), &[c, c, 1, 1])?.to_f32();
         self.v.push(HostTensor { name: format!("{a}.proj.weight"), shape: vec![c, c], ty: WType::F32, data: proj });
         self.bias(&format!("{a}.proj"), c)?;
-        self.resnet(&format!("{p}.resnets.1"), c, c, taps)
+        self.resnet(&format!("{p}.resnets.1"), c, c)
     }
-}
-
-/// How causal convolutions see the frames before the input.
-enum Past<'a> {
-    /// A single first frame: zero padding, so only the last tap applies.
-    None,
-    /// Resident caches of the last two input frames, updated in place.
-    Cache(&'a Weights),
 }
 
 struct Net<'a, 'g> {
     g: &'g mut Graph,
     w: &'a Weights,
-    past: Past<'a>,
+    /// Resident frame caches, read and updated in place by every run.
+    cache: &'a Weights,
     /// Gather indices to set before each run.
     feeds: Vec<(Tn, Vec<i32>)>,
 }
@@ -370,34 +399,64 @@ impl Net<'_, '_> {
         self.g.add(y, b)
     }
 
-    /// A causal 3x3x3 (or 3x1x1 with `pad` 0) convolution over `[W, H, C, T]`.
+    /// A causal 3x3x3 (or 3x1x1 with `pad` 0) convolution over `[W, H, C, T]`
+    /// after the two cached frames.
     fn causal(&mut self, p: &str, x: Tn, pad: i32) -> Tn {
-        let y = match self.past {
-            Past::None => {
-                let k = self.wt(&format!("{p}.weight"));
-                self.g.conv2d(k, x, pad)
-            }
-            Past::Cache(c) => {
-                let cache = c.get(p);
-                let full = self.g.concat(cache, x, 3);
-                let t = x.ne(3);
-                let shape = [x.ne(0), x.ne(1), x.ne(2), t];
-                let mut acc: Option<Tn> = None;
-                for k in 0..3 {
-                    let v = self.g.view_4d(full, shape, full.nb(1), full.nb(2), full.nb(3), k as usize * full.nb(3));
-                    let kern = self.wt(&format!("{p}.weight.t{k}"));
-                    let y = self.g.conv2d(kern, v, pad);
-                    acc = Some(match acc {
-                        None => y,
-                        Some(a) => self.g.add(a, y),
-                    });
-                }
-                let tail = self.g.view_4d(full, [x.ne(0), x.ne(1), x.ne(2), 2], full.nb(1), full.nb(2), full.nb(3), t as usize * full.nb(3));
-                self.g.copy_into(tail, cache);
-                acc.expect("three taps")
-            }
-        };
+        let cache = self.cache.get(p);
+        let full = self.g.concat(cache, x, 3);
+        let t = x.ne(3);
+        let shape = [x.ne(0), x.ne(1), x.ne(2), t];
+        let mut acc: Option<Tn> = None;
+        for k in 0..3 {
+            let v = self.g.view_4d(full, shape, full.nb(1), full.nb(2), full.nb(3), k as usize * full.nb(3));
+            let kern = self.wt(&format!("{p}.weight.t{k}"));
+            let y = self.g.conv2d(kern, v, pad);
+            acc = Some(match acc {
+                None => y,
+                Some(a) => self.g.add(a, y),
+            });
+        }
+        let tail = self.g.view_4d(full, [x.ne(0), x.ne(1), x.ne(2), 2], full.nb(1), full.nb(2), full.nb(3), t as usize * full.nb(3));
+        self.g.copy_into(tail, cache);
+        let y = acc.expect("three taps");
         self.add_bias(y, p)
+    }
+
+    /// Every second frame of `x` from frame `start`: `count` frames.
+    fn every_other(&mut self, x: Tn, start: i64, count: i64) -> Tn {
+        let v = self.g.view_4d(x, [x.ne(0), x.ne(1), x.ne(2), count], x.nb(1), x.nb(2), 2 * x.nb(3), start as usize * x.nb(3));
+        self.g.cont(v)
+    }
+
+    /// The stride-2 temporal 3x1x1 convolution of a downsampling stage over
+    /// the cached last frame then `x` (an even number of frames); halves time
+    /// and keeps the last frame of `x` for the next chunk.
+    fn time_down(&mut self, p: &str, x: Tn) -> Tn {
+        let cache = self.cache.get(p);
+        let full = self.g.concat(cache, x, 3);
+        let t = x.ne(3);
+        let mut acc: Option<Tn> = None;
+        for k in 0..3 {
+            let v = self.every_other(full, k, t / 2);
+            let kern = self.wt(&format!("{p}.weight.t{k}"));
+            let y = self.g.conv2d(kern, v, 0);
+            acc = Some(match acc {
+                None => y,
+                Some(a) => self.g.add(a, y),
+            });
+        }
+        // Copy from `full`, not `x`: the copy then depends on the concat
+        // that reads the cache, so it cannot overwrite the cache first.
+        self.keep_last(p, full);
+        let y = acc.expect("three taps");
+        self.add_bias(y, p)
+    }
+
+    /// Store the last frame of `x` in the one-frame cache `p`.
+    fn keep_last(&mut self, p: &str, x: Tn) {
+        let cache = self.cache.get(p);
+        let last = self.g.view_4d(x, [x.ne(0), x.ne(1), x.ne(2), 1], x.nb(1), x.nb(2), x.nb(3), (x.ne(3) - 1) as usize * x.nb(3));
+        self.g.copy_into(last, cache);
     }
 
     fn pointwise(&mut self, p: &str, x: Tn) -> Tn {
@@ -505,21 +564,26 @@ fn pixel_shuffle(g: &mut Graph, z: Tn) -> Tn {
     g.reshape(a, &[2 * w, 2 * h, c4 / 4, t])
 }
 
-/// Inputs and outputs of the single-frame encoder.
+/// Inputs and outputs of one streamed encoder chunk.
 #[derive(Debug, Clone)]
 pub struct EncodeIo {
-    /// Patched pixels `[W / 2, H / 2, 12]` in `[-1, 1]`.
+    /// Patched frames `[W / 2, H / 2, 12, T]` in `[-1, 1]`: one on the first
+    /// chunk, four after.
     pub pixels: Tn,
-    /// Latent mean `[W / 16, H / 16, z]` (unnormalised).
+    /// One latent frame's mean `[W / 16, H / 16, z]` (unnormalised).
     pub mean: Tn,
 }
 
-/// The encoder over one frame of `width` x `height` pixels.
+/// One chunk of a `width` x `height` video through the encoder, reading and
+/// updating `cache` ([`WanVaeConfig::encoder_cache_specs`]). `first` takes
+/// the lone first frame (time padded with zeros), otherwise the next four
+/// frames; either way the chunk yields one latent frame.
 #[must_use]
-pub fn build_encoder(g: &mut Graph, cfg: &WanVaeConfig, w: &Weights, width: i64, height: i64) -> EncodeIo {
+pub fn build_encoder(g: &mut Graph, cfg: &WanVaeConfig, w: &Weights, cache: &Weights, width: i64, height: i64, first: bool) -> EncodeIo {
     let p = PATCH as i64;
-    let pixels = g.input(sys::GGML_TYPE_F32, &[width / p, height / p, cfg.in_channels as i64, 1]);
-    let mut n = Net { g, w, past: Past::None, feeds: Vec::new() };
+    let frames = if first { 1 } else { 4 };
+    let pixels = g.input(sys::GGML_TYPE_F32, &[width / p, height / p, cfg.in_channels as i64, frames]);
+    let mut n = Net { g, w, cache, feeds: Vec::new() };
     let mut x = n.causal("encoder.conv_in", pixels, 1);
     for (i, (cin, cout, temporal, spatial)) in cfg.down_stages().into_iter().enumerate() {
         let pre = format!("encoder.down_blocks.{i}");
@@ -534,13 +598,29 @@ pub fn build_encoder(g: &mut Graph, cfg: &WanVaeConfig, w: &Weights, width: i64,
             let k = n.wt(&format!("{pre}.downsampler.resample.1.weight"));
             let y = n.g.conv2d_stride2(k, padded);
             x = n.add_bias(y, &format!("{pre}.downsampler.resample.1"));
-        }
-        let s = match avg_down_kernel(cin, cout, temporal, spatial) {
-            Some(_) => {
-                let k = n.wt(&format!("{pre}.avg_shortcut"));
-                n.g.conv2d_strided(k, skip, 2)
+            if temporal {
+                let tc = format!("{pre}.downsampler.time_conv");
+                if first {
+                    n.keep_last(&tc, x);
+                } else {
+                    x = n.time_down(&tc, x);
+                }
             }
-            None => skip,
+        }
+        let s = if avg_down_kernel(cin, cout, temporal, spatial, 0).is_none() {
+            skip
+        } else if temporal && !first {
+            let half = skip.ne(3) / 2;
+            let even = n.every_other(skip, 0, half);
+            let odd = n.every_other(skip, 1, half);
+            let k0 = n.wt(&format!("{pre}.avg_shortcut.prev"));
+            let k1 = n.wt(&format!("{pre}.avg_shortcut"));
+            let a = n.g.conv2d_strided(k0, even, 2);
+            let b = n.g.conv2d_strided(k1, odd, 2);
+            n.g.add(a, b)
+        } else {
+            let k = n.wt(&format!("{pre}.avg_shortcut"));
+            n.g.conv2d_strided(k, skip, 2)
         };
         x = n.g.add(x, s);
     }
@@ -573,7 +653,7 @@ pub struct DecodeIo {
 #[must_use]
 pub fn build_decoder(g: &mut Graph, cfg: &WanVaeConfig, w: &Weights, cache: &Weights, lw: i64, lh: i64, first: bool) -> DecodeIo {
     let latent = g.input(sys::GGML_TYPE_F32, &[lw, lh, cfg.z_dim as i64, 1]);
-    let mut n = Net { g, w, past: Past::Cache(cache), feeds: Vec::new() };
+    let mut n = Net { g, w, cache, feeds: Vec::new() };
     let x = n.pointwise("post_quant_conv", latent);
     let dd = cfg.dec_dims();
     let mut x = n.causal("decoder.conv_in", x, 1);
@@ -658,12 +738,19 @@ mod tests {
     fn the_averaging_shortcut_reads_only_the_real_frame() {
         // 2 -> 4 channels, halving time and space: groups of 4, the first
         // half of each channel's 8 space-to-depth slots is the zero frame.
-        let k = avg_down_kernel(2, 4, true, true).unwrap();
+        let k = avg_down_kernel(2, 4, true, true, 1).unwrap();
         let sum = |o: usize| k[o * 8..(o + 1) * 8].iter().sum::<f32>();
         assert_eq!(sum(0), 0.0);
         assert!((sum(1) - 1.0).abs() < 1e-6);
         assert_eq!(sum(2), 0.0);
         assert!((sum(3) - 1.0).abs() < 1e-6);
-        assert!(avg_down_kernel(4, 4, false, false).is_none());
+        assert!(avg_down_kernel(4, 4, false, false, 0).is_none());
+        // The earlier phase is the complement: the two sum to a plain mean.
+        let prev = avg_down_kernel(2, 4, true, true, 0).unwrap();
+        for (a, b) in k.iter().zip(&prev) {
+            assert!(a * b == 0.0);
+        }
+        let total: f32 = k.iter().chain(&prev).sum();
+        assert!((total - 4.0).abs() < 1e-5);
     }
 }

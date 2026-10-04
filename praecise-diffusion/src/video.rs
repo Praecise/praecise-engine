@@ -297,27 +297,62 @@ impl Cosmos3 {
 
     /// Encode a first frame to its normalised latent `[z][1][H/16][W/16]`.
     pub(crate) fn encode_image(&self, img: &RgbImage) -> Result<Vec<f32>> {
-        let (w, h) = (img.width as usize, img.height as usize);
-        let mut px = vec![0f32; 3 * w * h];
-        for (i, p) in img.rgb.chunks_exact(3).enumerate() {
-            for c in 0..3 {
-                px[c * w * h + i] = f32::from(p[c]) / 127.5 - 1.0;
+        self.encode_frames(std::slice::from_ref(img))
+    }
+
+    /// Encode `1 + 4k` frames of one size to normalised latents
+    /// `[z][1 + k][H/16][W/16]`: the first frame alone, then four at a time
+    /// through the encoder's frame caches.
+    pub(crate) fn encode_frames(&self, frames: &[RgbImage]) -> Result<Vec<f32>> {
+        let Some(head) = frames.first() else {
+            return Err(Error::Request("no frames to encode".into()));
+        };
+        if (frames.len() - 1) % 4 != 0 {
+            return Err(Error::Request(format!("{} frames to encode; the encoder takes 1 + 4k", frames.len())));
+        }
+        let (w, h) = (head.width as usize, head.height as usize);
+        let patched = |img: &RgbImage| {
+            let mut px = vec![0f32; 3 * w * h];
+            for (i, p) in img.rgb.chunks_exact(3).enumerate() {
+                for c in 0..3 {
+                    px[c * w * h + i] = f32::from(p[c]) / 127.5 - 1.0;
+                }
+            }
+            wan::patchify(&px, w, h)
+        };
+        let cache = Weights::zeros(&self.backend, &self.vae_cfg.encoder_cache_specs(w as i64, h as i64))?;
+        let lt = 1 + (frames.len() - 1) / 4;
+        let mut graphs: Vec<(Graph, wan::EncodeIo)> = Vec::new();
+        for first in [true, false].into_iter().take(lt.min(2)) {
+            let mut g = Graph::new(&self.backend)?;
+            let io = wan::build_encoder(&mut g, &self.vae_cfg, &self.vae, &cache, w as i64, h as i64, first);
+            g.finish(&[io.mean])?;
+            graphs.push((g, io));
+        }
+        let mut per_frame: Vec<Vec<f32>> = Vec::with_capacity(lt);
+        for t in 0..lt {
+            let chunk: &[RgbImage] = if t == 0 { &frames[..1] } else { &frames[1 + 4 * (t - 1)..1 + 4 * t] };
+            let mut input = Vec::new();
+            for f in chunk {
+                input.extend(patched(f));
+            }
+            let (g, io) = &graphs[usize::from(t > 0)];
+            g.set_f32(io.pixels, &input);
+            g.compute()?;
+            per_frame.push(g.read_f32(io.mean));
+        }
+        let z = self.vae_cfg.z_dim as usize;
+        let plane = per_frame[0].len() / z;
+        let mut out = vec![0f32; z * lt * plane];
+        for (t, mean) in per_frame.iter().enumerate() {
+            for c in 0..z {
+                let (m, inv) = (self.vae_cfg.latents_mean[c], 1.0 / self.vae_cfg.latents_std[c]);
+                for i in 0..plane {
+                    out[(c * lt + t) * plane + i] = (mean[c * plane + i] - m) * inv;
+                }
             }
         }
-        let mut g = Graph::new(&self.backend)?;
-        let io = wan::build_encoder(&mut g, &self.vae_cfg, &self.vae, w as i64, h as i64);
-        g.finish(&[io.mean])?;
-        g.set_f32(io.pixels, &wan::patchify(&px, w, h));
-        g.compute()?;
-        let mut mean = g.read_f32(io.mean);
-        let per = mean.len() / self.vae_cfg.z_dim as usize;
-        for (c, chunk) in mean.chunks_exact_mut(per).enumerate() {
-            let (m, inv) = (self.vae_cfg.latents_mean[c], 1.0 / self.vae_cfg.latents_std[c]);
-            for v in chunk {
-                *v = (*v - m) * inv;
-            }
-        }
-        Ok(mean)
+        Ok(out)
     }
 
     /// Patch tokens `[tokens][192]` of latents `[z][T][H][W]`, frame-major.

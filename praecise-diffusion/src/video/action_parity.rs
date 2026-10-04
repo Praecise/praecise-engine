@@ -50,7 +50,12 @@ fn run(p: &mut Cosmos3, m: &Value, mode: ActionMode, name: &str) -> (f64, f64, O
         view_point: m["view_point"].as_str().unwrap().into(),
         resolution_tier: u("tier"),
         chunk_size: chunk,
-        frames: vec![RgbImage { width, height, rgb: std::fs::read(dir().join("image.bin")).unwrap() }],
+        frames: if mode == ActionMode::InverseDynamics {
+            let clip = std::fs::read(dir().join("video.bin")).unwrap();
+            clip.chunks_exact((width * height * 3) as usize).map(|f| RgbImage { width, height, rgb: f.to_vec() }).collect()
+        } else {
+            vec![RgbImage { width, height, rgb: std::fs::read(dir().join("image.bin")).unwrap() }]
+        },
         actions: (mode == ActionMode::ForwardDynamics).then_some(given),
         fps: m["fps"].as_f64().unwrap() as f32,
         steps: u("steps"),
@@ -125,4 +130,7 @@ fn cosmos3_action_parity() {
     let (fc, fr, acts) = run(&mut p, &m, ActionMode::ForwardDynamics, "forward_dynamics");
     assert!(acts.is_none(), "forward dynamics returns no actions");
     assert!(fc >= min_cos && fr <= max_rel, "forward dynamics");
+    let (fc, fr, acts) = run(&mut p, &m, ActionMode::InverseDynamics, "inverse_dynamics");
+    let (ac, _) = acts.expect("inverse dynamics predicts actions");
+    assert!(fc >= min_cos && fr <= max_rel && ac >= min_cos, "inverse dynamics");
 }

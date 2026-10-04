@@ -67,6 +67,9 @@ def reference(pipe, out, run_spec):
     w, h, chunk = spec["width"], spec["height"], spec["chunk"]
     image = first_frame(w, h)
     image.tofile(os.path.join(out, "image.bin"))
+    # A moving clip for inverse dynamics: the test image panned 3 px a frame.
+    video = np.stack([np.roll(image, 3 * k, axis=1) for k in range(chunk + 1)])
+    video.tofile(os.path.join(out, "video.bin"))
     acts = given_actions(chunk, spec["action_width"])
     meta = {"prompt": PROMPT, "negative": NEGATIVE, **spec}
     meta["given_actions"] = save(out, "given_actions", acts)
@@ -75,12 +78,14 @@ def reference(pipe, out, run_spec):
     hook = pipe.transformer.register_forward_pre_hook(calls, with_kwargs=True)
     pipeline_cosmos3_omni.randn_tensor = log
     try:
-        for mode, guidance in (("policy", spec["guidance"]), ("forward_dynamics", 1.0)):
+        for mode, guidance in (("policy", spec["guidance"]), ("forward_dynamics", 1.0), ("inverse_dynamics", 1.0)):
             log.draws.clear()
             calls.calls.clear()
             cond = CosmosActionCondition(
                 mode=mode, chunk_size=chunk, domain_name=spec["embodiment"], resolution_tier=spec["tier"],
-                raw_actions=acts if mode == "forward_dynamics" else None, image=Image.fromarray(image),
+                raw_actions=acts if mode == "forward_dynamics" else None,
+                image=None if mode == "inverse_dynamics" else Image.fromarray(image),
+                video=[Image.fromarray(f) for f in video] if mode == "inverse_dynamics" else None,
                 view_point=spec["view_point"],
             )
             with torch.no_grad():

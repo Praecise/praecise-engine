@@ -318,11 +318,6 @@ impl Cosmos3 {
             .collect()
     }
 
-    /// Encode a whole video to normalised latents `[z][T][H/16][W/16]`.
-    fn encode_video(&self, _frames: &[RgbImage]) -> Result<Vec<f32>> {
-        Err(Error::Request("inverse dynamics needs the full-video encoder, which this build does not have yet".into()))
-    }
-
     /// Run one action task.
     ///
     /// # Errors
@@ -362,7 +357,7 @@ impl Cosmos3 {
         let uncond_ids = self.tokens(req.negative_prompt.as_deref().unwrap_or(""), false)?;
 
         let cond_frames = if req.mode == ActionMode::InverseDynamics {
-            latents = self.encode_video(&req.frames[..num_frames as usize])?;
+            latents = self.encode_frames(&req.frames[..num_frames as usize])?;
             lt
         } else {
             let enc = self.encode_image(first)?;
