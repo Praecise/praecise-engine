@@ -100,3 +100,61 @@ fn wan_pipeline_parity() {
         assert_eq!(video.frames, req.num_frames);
     }
 }
+
+/// A session opened on the first frame, with one chunk filling the rest of
+/// the clip, streams exactly the frames a single first-frame-conditioned
+/// generation decodes from the same seed; later chunks continue from the
+/// bounded memory.
+#[test]
+#[ignore = "needs PRAECISE_WAN_PIPELINE_PARITY fixtures"]
+fn wan_session_matches_generation() {
+    use crate::world::{SessionConfig, WorldSession};
+    let m: Value = serde_json::from_slice(&std::fs::read(dir().join("meta.json")).unwrap()).unwrap();
+    let u = |k: &str| m[k].as_u64().unwrap() as u32;
+    let threads = std::thread::available_parallelism().map_or(8, usize::from);
+    let opts = LoadOptions { precision: Precision::F32, cpu_threads: threads, device: None };
+    let mut wan = Wan22::load(&CheckpointFiles::new(dir().join("checkpoint")), opts).unwrap();
+    let (w, h) = (u("width"), u("height"));
+    let first = RgbImage { width: w, height: h, rgb: std::fs::read(dir().join("first.rgb")).unwrap() };
+    let req = VideoRequest {
+        prompt: m["prompt"].as_str().unwrap().into(),
+        negative_prompt: Some(m["negative"].as_str().unwrap().into()),
+        image: Some(first.clone()),
+        width: w,
+        height: h,
+        num_frames: u("frames"),
+        fps: m["fps"].as_f64().unwrap() as f32,
+        steps: u("steps"),
+        guidance_scale: m["guidance"].as_f64().unwrap() as f32,
+        seed: 3,
+    };
+    let video = wan.generate(&req).unwrap();
+    let lt = 1 + (req.num_frames as usize - 1) / 4;
+    let cfg = SessionConfig {
+        width: w,
+        height: h,
+        fps: req.fps,
+        chunk_latent_frames: lt - 1,
+        memory_latent_frames: 2,
+        steps: req.steps,
+        guidance_scale: req.guidance_scale,
+        seed: 3,
+    };
+    let mut s = WorldSession::start(&wan, cfg, &req.prompt, req.negative_prompt.as_deref().unwrap(), Some(&first)).unwrap();
+    let a = s.step(&[]).unwrap();
+    assert_eq!(a.frames, video.frames);
+    // The generation's frame 0 goes through the sampler with zero velocity,
+    // which holds it up to rounding; the session keeps the encoded frame
+    // exactly. The two may differ by one level in a few bytes.
+    let diff = a.rgb.iter().zip(&video.rgb).filter(|(x, y)| x != y).count();
+    let worst = a.rgb.iter().zip(&video.rgb).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0);
+    println!("session chunk 0: {} frames, {diff} of {} bytes differ from the generation, by at most {worst}", a.frames, a.rgb.len());
+    assert!(worst <= 1 && diff * 1000 < a.rgb.len(), "{diff} bytes differ, worst {worst}");
+    for k in 1..3 {
+        let c = s.step(&[]).unwrap();
+        assert_eq!(c.frames as usize, 4 * (lt - 1));
+        assert!(s.memory().count() <= 2);
+        println!("session chunk {k}: first frame {}, {} frames, {} evaluations", c.first_frame, c.frames, c.evaluations);
+    }
+    assert!((s.simulated_secs() - f64::from(video.frames + 8 * (lt as u32 - 1)) / f64::from(req.fps)).abs() < 1e-9);
+}

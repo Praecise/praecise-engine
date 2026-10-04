@@ -40,12 +40,14 @@ pub mod video;
 pub mod wan;
 pub mod wan_dit;
 pub mod wan_video;
+pub mod world;
 pub mod zimage;
 
 pub use error::{Error, Result};
 pub use ggml::Device;
 pub use music::{AceStep, Audio, MusicRequest};
 pub use video::{action_resolution_tier, ActionMode, ActionOutput, ActionRequest, Cosmos3, Embodiment, Video, VideoRequest};
+pub use world::{SessionConfig, WorldChunk, WorldModel, WorldSession};
 pub use zimage::ZImage;
 pub use ltx2::pipeline::{Guidance as Ltx2Guidance, Ltx2Output, Ltx2Pipeline, Ltx2Request};
 pub use pipeline::{

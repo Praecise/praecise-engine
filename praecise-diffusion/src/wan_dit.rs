@@ -189,15 +189,23 @@ impl WanDitConfig {
     /// `frames x rows x cols` patches, in token order.
     #[must_use]
     pub fn rotary_tables(&self, frames: usize, rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
+        self.rotary_tables_at(&(0..frames).collect::<Vec<_>>(), rows, cols)
+    }
+
+    /// [`Self::rotary_tables`] with an explicit time position per latent
+    /// frame (frames kept from earlier in a stream sit at their own
+    /// positions, not at their place in the sequence).
+    #[must_use]
+    pub fn rotary_tables_at(&self, positions: &[usize], rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
         let axes = self.rope_axes();
         let inv: Vec<Vec<f64>> = axes
             .iter()
             .map(|&p| (0..p).map(|j| 1.0 / 10000f64.powf((2 * j) as f64 / (2 * p) as f64)).collect())
             .collect();
         let half = axes.iter().sum::<usize>();
-        let n = frames * rows * cols;
+        let n = positions.len() * rows * cols;
         let (mut cos, mut sin) = (Vec::with_capacity(n * half), Vec::with_capacity(n * half));
-        for f in 0..frames {
+        for &f in positions {
             for r in 0..rows {
                 for c in 0..cols {
                     for (axis, pos) in [f, r, c].into_iter().enumerate() {

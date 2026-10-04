@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::ggml::{Backend, Graph, Weights};
-use crate::pipeline::{parse, CheckpointFiles, LoadOptions, Precision, Timings};
+use crate::pipeline::{parse, CheckpointFiles, LoadOptions, Precision, RgbImage, Timings};
 use crate::safetensors::SafeTensors;
 use crate::schedule;
 use crate::umt5::{self, Umt5Config};
@@ -27,6 +27,7 @@ use crate::unipc::{flow_sigmas_schedule, UniPc, UniPcConfig};
 use crate::video::{to_rgb8, Cosmos3, Video, VideoRequest};
 use crate::wan::{self, WanVaeConfig};
 use crate::wan_dit::{self, WanDitConfig};
+use crate::world::{ChunkRequest, WorldModel};
 
 /// Text states the transformer attends to: the prompt's, then zeros.
 pub const TEXT_TOKENS: usize = 512;
@@ -197,26 +198,43 @@ impl Wan22 {
         if latents.len() != self.cfg.in_channels as usize * lt * lh * lw {
             return Err(Error::Request("starting noise does not match the latent grid".into()));
         }
-        let use_cfg = req.guidance_scale > 1.0;
         let negative = req.negative_prompt.clone().unwrap_or_default();
-        let mut contexts = vec![self.context(&self.tokens(&req.prompt)?)?];
-        if use_cfg {
-            contexts.push(self.context(&self.tokens(&negative)?)?);
-        }
-        let conditioned = match &req.image {
+        let contexts = self.contexts(&req.prompt, &negative, req.guidance_scale > 1.0)?;
+        let held = match &req.image {
             Some(img) => {
                 let first = wan::encode_frames(&self.backend, &self.vae_cfg, &self.vae, std::slice::from_ref(img))?;
-                place_first_frame(&mut latents, &first, lt, lh * lw);
-                true
+                place_frame(&mut latents, &first, 0, lt, lh * lw);
+                1
             }
-            None => false,
+            None => 0,
         };
         let encode_ms = t0.elapsed().as_millis() as u64;
         let t1 = Instant::now();
+        let positions: Vec<usize> = (0..lt).collect();
+        let evaluations = self.denoise(&contexts, &mut latents, shape, &positions, held, req.steps, req.guidance_scale, trace)?;
+        Ok((latents, evaluations, encode_ms, t1.elapsed().as_millis() as u64))
+    }
+
+    /// The prompt's text states, then the negative prompt's under guidance.
+    fn contexts(&self, prompt: &str, negative: &str, guided: bool) -> Result<Vec<Vec<f32>>> {
+        let mut contexts = vec![self.context(&self.tokens(prompt)?)?];
+        if guided {
+            contexts.push(self.context(&self.tokens(negative)?)?);
+        }
+        Ok(contexts)
+    }
+
+    /// Denoise `latents` `[z][T][H][W]` in place. The first `held` latent
+    /// frames are clean conditioning: their tokens carry timestep 0 and
+    /// their velocity is zeroed, so they do not move. `positions` gives each
+    /// latent frame's time position for the rotary embedding. Guidance runs
+    /// when two contexts are given. Returns the transformer evaluations.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(&self, contexts: &[Vec<f32>], latents: &mut Vec<f32>, (lt, lh, lw): (usize, usize, usize), positions: &[usize], held: usize, steps: u32, guidance: f32, trace: &mut Vec<Vec<f32>>) -> Result<u32> {
         let (rows, cols) = (lh / 2, lw / 2);
         let n = lt * rows * cols;
-        let time_tokens = if conditioned { n } else { 1 };
-        let (cos, sin) = self.cfg.rotary_tables(lt, rows, cols);
+        let time_tokens = if held > 0 { n } else { 1 };
+        let (cos, sin) = self.cfg.rotary_tables_at(positions, rows, cols);
         let mut passes = Vec::with_capacity(contexts.len());
         for ctx in contexts {
             let mut g = Graph::new(&self.backend)?;
@@ -224,18 +242,18 @@ impl Wan22 {
             g.finish(&[io.out])?;
             passes.push((g, io, ctx));
         }
-        let (sigmas, timesteps) = flow_sigmas_schedule(req.steps as usize, self.sched.flow_shift, self.sched.num_train_timesteps);
+        let (sigmas, timesteps) = flow_sigmas_schedule(steps as usize, self.sched.flow_shift, self.sched.num_train_timesteps);
         let mut sampler = UniPc::new(sigmas);
         let mut evaluations = 0u32;
-        let first = rows * cols;
+        let clean = held * rows * cols;
         for &t in &timesteps {
             let t = t as f32;
-            let time: Vec<f32> = if conditioned {
-                (0..n).flat_map(|i| wan_dit::time_features(if i < first { 0.0 } else { t })).collect()
+            let time: Vec<f32> = if held > 0 {
+                (0..n).flat_map(|i| wan_dit::time_features(if i < clean { 0.0 } else { t })).collect()
             } else {
                 wan_dit::time_features(t)
             };
-            let patches = wan_dit::patchify(&self.cfg, &latents, lt, lh, lw);
+            let patches = wan_dit::patchify(&self.cfg, latents, lt, lh, lw);
             let mut preds = Vec::with_capacity(passes.len());
             for (g, io, ctx) in &passes {
                 g.set_f32(io.patches, &patches);
@@ -247,19 +265,73 @@ impl Wan22 {
                 evaluations += 1;
                 preds.push(wan_dit::unpatchify(&self.cfg, &g.read_f32(io.out), lt, lh, lw));
             }
-            let mut v: Vec<f32> = if use_cfg {
-                preds[1].iter().zip(&preds[0]).map(|(u, c)| u + req.guidance_scale * (c - u)).collect()
+            let mut v: Vec<f32> = if preds.len() == 2 {
+                preds[1].iter().zip(&preds[0]).map(|(u, c)| u + guidance * (c - u)).collect()
             } else {
                 preds.pop().expect("one pass")
             };
-            if conditioned {
-                zero_first_frame(&mut v, lt, lh * lw);
-            }
-            latents = sampler.step(&v, &latents)?;
+            zero_frames(&mut v, held, lt, lh * lw);
+            *latents = sampler.step(&v, latents)?;
             trace.push(v);
             trace.push(latents.clone());
         }
-        Ok((latents, evaluations, encode_ms, t1.elapsed().as_millis() as u64))
+        Ok(evaluations)
+    }
+}
+
+/// Wan2.2 continues a video from the most recent frames it is given: the
+/// memory is placed first as clean frames, re-based to time 0 (it trains on
+/// contiguous clips), and the chunk is generated after it. It takes no
+/// actions.
+impl WorldModel for Wan22 {
+    type Context = Vec<Vec<f32>>;
+    type Stream = wan::Decoder;
+
+    fn latent_channels(&self) -> usize {
+        self.cfg.in_channels as usize
+    }
+
+    fn action_dims(&self) -> usize {
+        0
+    }
+
+    fn spatial_stride(&self) -> usize {
+        16
+    }
+
+    fn context(&self, prompt: &str, negative: &str, guided: bool) -> Result<Self::Context> {
+        self.contexts(prompt, negative, guided)
+    }
+
+    fn encode_image(&self, image: &RgbImage) -> Result<Vec<f32>> {
+        wan::encode_frames(&self.backend, &self.vae_cfg, &self.vae, std::slice::from_ref(image))
+    }
+
+    fn rollout(&self, ctx: &Self::Context, req: &ChunkRequest<'_>) -> Result<(Vec<f32>, u32)> {
+        if !req.actions.is_empty() {
+            return Err(Error::Request("this model takes no actions".into()));
+        }
+        let (lh, lw) = req.grid;
+        let plane = lh * lw;
+        let z = self.latent_channels();
+        let held = req.memory.len();
+        let lt = held + req.new_frames;
+        let mut latents = schedule::gaussian(req.seed, z * lt * plane);
+        for (i, f) in req.memory.iter().enumerate() {
+            place_frame(&mut latents, &f.data, i, lt, plane);
+        }
+        let positions: Vec<usize> = (0..lt).collect();
+        let evaluations = self.denoise(ctx, &mut latents, (lt, lh, lw), &positions, held, req.steps, req.guidance_scale, &mut Vec::new())?;
+        let out = (0..z).flat_map(|c| latents[(c * lt + held) * plane..(c + 1) * lt * plane].iter().copied()).collect();
+        Ok((out, evaluations))
+    }
+
+    fn open_stream(&self, (lh, lw): (usize, usize)) -> Result<Self::Stream> {
+        wan::Decoder::new(&self.backend, &self.vae_cfg, lh, lw)
+    }
+
+    fn decode_next(&self, stream: &mut Self::Stream, latent: &[f32]) -> Result<Vec<f32>> {
+        stream.push(&self.backend, &self.vae_cfg, &self.vae, latent)
     }
 }
 
@@ -268,18 +340,19 @@ fn grid(req: &VideoRequest) -> (usize, usize, usize) {
     (1 + (req.num_frames as usize - 1) / 4, req.height as usize / 16, req.width as usize / 16)
 }
 
-/// Write one encoded frame `[z][plane]` over frame 0 of `[z][T][plane]`.
-fn place_first_frame(latents: &mut [f32], first: &[f32], lt: usize, plane: usize) {
-    for (c, src) in first.chunks_exact(plane).enumerate() {
-        latents[c * lt * plane..c * lt * plane + plane].copy_from_slice(src);
+/// Write one latent frame `[z][plane]` over frame `t` of `[z][T][plane]`.
+fn place_frame(latents: &mut [f32], frame: &[f32], t: usize, lt: usize, plane: usize) {
+    for (c, src) in frame.chunks_exact(plane).enumerate() {
+        let at = (c * lt + t) * plane;
+        latents[at..at + plane].copy_from_slice(src);
     }
 }
 
-/// Zero frame 0 of `[z][T][plane]`.
-fn zero_first_frame(v: &mut [f32], lt: usize, plane: usize) {
+/// Zero the first `held` frames of `[z][T][plane]`.
+fn zero_frames(v: &mut [f32], held: usize, lt: usize, plane: usize) {
     let z = v.len() / (lt * plane);
     for c in 0..z {
-        v[c * lt * plane..c * lt * plane + plane].fill(0.0);
+        v[c * lt * plane..(c * lt + held) * plane].fill(0.0);
     }
 }
 
@@ -299,12 +372,15 @@ mod tests {
     fn the_first_frame_is_placed_and_held() {
         let (lt, plane, z) = (3, 4, 2);
         let mut lat = vec![1.0; z * lt * plane];
-        place_first_frame(&mut lat, &[5.0; 8], lt, plane);
+        place_frame(&mut lat, &[5.0; 8], 0, lt, plane);
+        place_frame(&mut lat, &[6.0; 8], 1, lt, plane);
         assert_eq!(&lat[0..4], &[5.0; 4]);
+        assert_eq!(&lat[4..8], &[6.0; 4]);
         assert_eq!(&lat[12..16], &[5.0; 4]);
-        assert_eq!(lat[4], 1.0);
-        zero_first_frame(&mut lat, lt, plane);
-        assert_eq!(&lat[12..16], &[0.0; 4]);
-        assert_eq!(lat[16], 1.0);
+        assert_eq!(lat[8], 1.0);
+        zero_frames(&mut lat, 2, lt, plane);
+        assert_eq!(&lat[12..20], &[0.0; 8]);
+        assert_eq!(lat[20], 1.0);
+        assert_eq!(lat[8], 1.0);
     }
 }

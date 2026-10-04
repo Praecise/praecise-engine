@@ -700,35 +700,89 @@ pub fn encode_frames(backend: &Backend, cfg: &WanVaeConfig, vae: &Weights, frame
 /// # Errors
 /// Backend failures.
 pub fn decode(backend: &Backend, cfg: &WanVaeConfig, vae: &Weights, latents: &[f32], (lt, lh, lw): (usize, usize, usize)) -> Result<Vec<f32>> {
-    let z = cfg.z_dim as usize;
+    let mut dec = Decoder::new(backend, cfg, lh, lw)?;
     let plane = lh * lw;
-    let cache = Weights::zeros(&backend, &cfg.decoder_cache_specs(lw as i64, lh as i64))?;
+    let z = cfg.z_dim as usize;
     let mut out = Vec::new();
-    let mut graphs: Vec<(Graph, DecodeIo)> = Vec::new();
-    for first in [true, false].into_iter().take(lt.min(2)) {
-        let mut g = Graph::new(&backend)?;
-        let io = build_decoder(&mut g, cfg, vae, &cache, lw as i64, lh as i64, first);
-        g.finish(&[io.out])?;
-        graphs.push((g, io));
-    }
     for t in 0..lt {
-        let mut frame = vec![0f32; z * plane];
-        for c in 0..z {
-            let (m, inv) = (cfg.latents_mean[c], 1.0 / cfg.latents_std[c]);
-            for i in 0..plane {
-                frame[c * plane + i] = latents[(c * lt + t) * plane + i] / inv + m;
-            }
+        let frame: Vec<f32> = (0..z).flat_map(|c| latents[(c * lt + t) * plane..(c * lt + t + 1) * plane].iter().copied()).collect();
+        out.extend(dec.push(backend, cfg, vae, &frame)?);
+    }
+    Ok(out)
+}
+
+/// A causal decoder kept open across calls: latent frames go in one at a
+/// time and pixels come out as soon as each is decoded. Its state is the
+/// fixed-size temporal cache, so a stream of any length holds the same
+/// memory.
+pub struct Decoder {
+    cache: Weights,
+    graphs: Vec<(Graph, DecodeIo)>,
+    lh: usize,
+    lw: usize,
+    pushed: usize,
+}
+
+impl std::fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Decoder").field("pushed", &self.pushed).finish_non_exhaustive()
+    }
+}
+
+impl Decoder {
+    /// An empty stream for a `lh` x `lw` latent grid.
+    ///
+    /// # Errors
+    /// Backend failures.
+    pub fn new(backend: &Backend, cfg: &WanVaeConfig, lh: usize, lw: usize) -> Result<Self> {
+        let cache = Weights::zeros(backend, &cfg.decoder_cache_specs(lw as i64, lh as i64))?;
+        Ok(Self { cache, graphs: Vec::new(), lh, lw, pushed: 0 })
+    }
+
+    /// Latent frames decoded so far.
+    #[must_use]
+    pub fn pushed(&self) -> usize {
+        self.pushed
+    }
+
+    /// Decode the next normalised latent frame `[z][H][W]`: pixels
+    /// `[3][T][H][W]` in [-1, 1], one frame for the first latent and four
+    /// after.
+    ///
+    /// # Errors
+    /// [`Error::Request`] for a frame of the wrong size; backend failures.
+    pub fn push(&mut self, backend: &Backend, cfg: &WanVaeConfig, vae: &Weights, latent: &[f32]) -> Result<Vec<f32>> {
+        let z = cfg.z_dim as usize;
+        let plane = self.lh * self.lw;
+        if latent.len() != z * plane {
+            return Err(Error::Request("latent frame does not match the decoder grid".into()));
         }
-        let (g, io) = &graphs[usize::from(t > 0)];
+        let first = self.pushed == 0;
+        let which = usize::from(!first);
+        if self.graphs.len() <= which {
+            let mut g = Graph::new(backend)?;
+            let io = build_decoder(&mut g, cfg, vae, &self.cache, self.lw as i64, self.lh as i64, first);
+            g.finish(&[io.out])?;
+            self.graphs.push((g, io));
+        }
+        let frame: Vec<f32> = latent
+            .chunks_exact(plane)
+            .enumerate()
+            .flat_map(|(c, ch)| {
+                let (m, s) = (cfg.latents_mean[c], cfg.latents_std[c]);
+                ch.iter().map(move |v| v * s + m)
+            })
+            .collect();
+        let (g, io) = &self.graphs[which];
         g.set_f32(io.latent, &frame);
         for (tn, ids) in &io.feeds {
             g.set_i32(*tn, ids);
         }
         g.compute()?;
+        self.pushed += 1;
         let x = g.read_f32(io.out);
-        out.extend(unpatchify(&x, io.out.ne(0) as usize, io.out.ne(1) as usize, io.out.ne(3) as usize));
+        Ok(unpatchify(&x, io.out.ne(0) as usize, io.out.ne(1) as usize, io.out.ne(3) as usize))
     }
-    Ok(out)
 }
 
 /// Inputs and outputs of one streamed decoder chunk.
