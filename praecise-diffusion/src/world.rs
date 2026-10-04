@@ -5,10 +5,15 @@
 //!
 //! State is bounded however long a session runs:
 //!
-//! - the latent memory keeps at most [`SessionConfig::memory_latent_frames`]
-//!   frames, each at its own time position, so the attention sequence (and
-//!   with it the keys and values every denoising step computes) never grows
-//!   past `memory + chunk` latent frames;
+//! - the session holds at most [`SessionConfig::history_latent_frames`]
+//!   latent frames (plus any the model pins), each at its own time position;
+//!   each chunk is conditioned on [`SessionConfig::memory_latent_frames`] of
+//!   them, so the attention sequence (and with it the keys and values every
+//!   denoising step computes) never grows past `memory + chunk` latent
+//!   frames;
+//! - which held frames condition a chunk is the model's choice
+//!   ([`WorldModel::select_memory`]); a model without a selector takes the
+//!   most recent;
 //! - the prompt is encoded once per session and its states reused for every
 //!   chunk and step;
 //! - the autoencoder decoder is causal and streams with a fixed-size cache.
@@ -60,7 +65,7 @@ pub struct ChunkRequest<'a> {
 
 /// A video model that can be rolled forward in chunks.
 pub trait WorldModel {
-    /// Encoded prompt, computed once per session.
+    /// Encoded prompt and per-session state, created once per session.
     type Context;
     /// Open decoder stream.
     type Stream;
@@ -87,6 +92,25 @@ pub trait WorldModel {
     /// # Errors
     /// Backend failures.
     fn rollout(&self, ctx: &Self::Context, req: &ChunkRequest<'_>) -> Result<(Vec<f32>, u32)>;
+    /// Take in the next chunk's actions (`[pixel frame][dims]`, the first
+    /// at pixel frame `first_pixel`) before its memory is chosen.
+    ///
+    /// # Errors
+    /// Actions the model cannot follow.
+    fn advance(&self, _ctx: &mut Self::Context, _actions: &[f32], _first_pixel: usize) -> Result<()> {
+        Ok(())
+    }
+    /// The `count` memory frames for the chunk starting at latent position
+    /// `first_index`, chosen from the time positions held (oldest first),
+    /// in the order the model takes them; repeats are allowed. `None` takes
+    /// the most recent `count`.
+    fn select_memory(&self, _ctx: &Self::Context, _held: &[usize], _first_index: usize, _count: usize) -> Option<Vec<usize>> {
+        None
+    }
+    /// Whether the frame at latent position `index` stays held however old.
+    fn pinned(&self, _index: usize) -> bool {
+        false
+    }
     /// Open a decoder stream for a latent grid.
     ///
     /// # Errors
@@ -110,8 +134,11 @@ pub struct SessionConfig {
     pub fps: f32,
     /// Latent frames generated per chunk.
     pub chunk_latent_frames: usize,
-    /// Latent frames kept as conditioning between chunks.
+    /// Latent frames conditioning each chunk.
     pub memory_latent_frames: usize,
+    /// Latent frames held between chunks, from which the memory is chosen
+    /// (at least `memory_latent_frames`).
+    pub history_latent_frames: usize,
     /// Denoising steps per chunk.
     pub steps: u32,
     /// Classifier-free guidance scale.
@@ -137,6 +164,9 @@ impl SessionConfig {
         }
         if self.memory_latent_frames == 0 {
             return bad("the memory must keep at least one latent frame");
+        }
+        if self.history_latent_frames < self.memory_latent_frames {
+            return bad("the history must hold at least the memory");
         }
         if self.steps == 0 {
             return bad("steps must be at least 1");
@@ -193,7 +223,7 @@ impl<'m, M: WorldModel> WorldSession<'m, M> {
         let grid = Self::grid_of(&cfg, model.spatial_stride());
         let ctx = model.context(prompt, negative, cfg.guidance_scale > 1.0)?;
         let mut stream = model.open_stream(grid)?;
-        let mut memory = VecDeque::with_capacity(cfg.memory_latent_frames + cfg.chunk_latent_frames);
+        let mut memory = VecDeque::with_capacity(cfg.history_latent_frames + cfg.chunk_latent_frames);
         let mut pending = Vec::new();
         let mut next_index = 0;
         if let Some(img) = first_frame {
@@ -229,7 +259,7 @@ impl<'m, M: WorldModel> WorldSession<'m, M> {
         }
     }
 
-    /// Latent frames held as memory now.
+    /// Latent frames held now, oldest first.
     #[must_use]
     pub fn memory(&self) -> impl Iterator<Item = &LatentFrame> {
         self.memory.iter()
@@ -265,7 +295,18 @@ impl<'m, M: WorldModel> WorldSession<'m, M> {
         let plane = grid.0 * grid.1;
         let z = self.model.latent_channels();
         let new_frames = self.cfg.chunk_latent_frames;
-        let memory: Vec<LatentFrame> = self.memory.iter().cloned().collect();
+        let first_pixel = if self.next_index == 0 { 0 } else { 1 + FRAMES_PER_LATENT * (self.next_index - 1) };
+        self.model.advance(&mut self.ctx, actions, first_pixel)?;
+        let held: Vec<usize> = self.memory.iter().map(|f| f.index).collect();
+        let count = self.cfg.memory_latent_frames.min(held.len());
+        let chosen = self.model.select_memory(&self.ctx, &held, self.next_index, count).unwrap_or_else(|| held[held.len() - count..].to_vec());
+        let memory = chosen
+            .iter()
+            .map(|i| self.memory.iter().find(|f| f.index == *i).cloned().ok_or_else(|| Error::Request(format!("the model chose memory frame {i}, which is not held"))))
+            .collect::<Result<Vec<LatentFrame>>>()?;
+        if memory.len() > self.cfg.memory_latent_frames {
+            return Err(Error::Request("the model chose more memory frames than the session holds".into()));
+        }
         let req = ChunkRequest {
             memory: &memory,
             new_frames,
@@ -287,8 +328,12 @@ impl<'m, M: WorldModel> WorldSession<'m, M> {
             self.memory.push_back(LatentFrame { index: self.next_index, data });
             self.next_index += 1;
         }
-        while self.memory.len() > self.cfg.memory_latent_frames {
-            self.memory.pop_front();
+        let mut unpinned = self.memory.iter().filter(|f| !self.model.pinned(f.index)).count();
+        let pinned = self.memory.len() - unpinned;
+        while pinned + unpinned > self.cfg.history_latent_frames && unpinned > 0 {
+            let at = self.memory.iter().position(|f| !self.model.pinned(f.index)).unwrap_or(0);
+            self.memory.remove(at);
+            unpinned -= 1;
         }
         let (rgb, frames) = to_rgb8(&px, self.cfg.width as usize, self.cfg.height as usize);
         let chunk = WorldChunk {
@@ -315,6 +360,8 @@ mod tests {
     struct Toy {
         dims: usize,
         seen: RefCell<Vec<(Vec<usize>, usize, usize, u64)>>,
+        /// Choose the first held frame (pinned) and the most recent.
+        pick: bool,
     }
 
     impl WorldModel for Toy {
@@ -340,6 +387,13 @@ mod tests {
             let plane = req.grid.0 * req.grid.1;
             Ok(((0..req.new_frames).flat_map(|t| vec![(req.first_index + t) as f32; plane]).collect(), req.steps))
         }
+        fn select_memory(&self, _: &String, held: &[usize], _: usize, count: usize) -> Option<Vec<usize>> {
+            let last = *held.last()?;
+            self.pick.then(|| if count == 1 { vec![last] } else { vec![held[0], last] })
+        }
+        fn pinned(&self, index: usize) -> bool {
+            self.pick && index == 0
+        }
         fn open_stream(&self, _: (usize, usize)) -> Result<usize> {
             Ok(0)
         }
@@ -352,7 +406,7 @@ mod tests {
     }
 
     fn cfg() -> SessionConfig {
-        SessionConfig { width: 32, height: 32, fps: 16.0, chunk_latent_frames: 3, memory_latent_frames: 4, steps: 2, guidance_scale: 1.0, seed: 7 }
+        SessionConfig { width: 32, height: 32, fps: 16.0, chunk_latent_frames: 3, memory_latent_frames: 4, history_latent_frames: 4, steps: 2, guidance_scale: 1.0, seed: 7 }
     }
 
     fn image() -> RgbImage {
@@ -361,7 +415,7 @@ mod tests {
 
     #[test]
     fn memory_stays_bounded_and_keeps_time_positions() {
-        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()) };
+        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()), pick: false };
         let mut s = WorldSession::start(&toy, cfg(), "a road", "", Some(&image())).unwrap();
         for _ in 0..5 {
             s.step(&[]).unwrap();
@@ -379,8 +433,22 @@ mod tests {
     }
 
     #[test]
+    fn a_model_can_choose_its_memory_and_pin_frames() {
+        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()), pick: true };
+        let c = SessionConfig { memory_latent_frames: 2, history_latent_frames: 3, ..cfg() };
+        let mut s = WorldSession::start(&toy, c, "a road", "", Some(&image())).unwrap();
+        for _ in 0..3 {
+            s.step(&[]).unwrap();
+            assert!(s.memory().count() <= 3);
+        }
+        let seen: Vec<Vec<usize>> = toy.seen.borrow().iter().map(|r| r.0.clone()).collect();
+        assert_eq!(seen, vec![vec![0], vec![0, 3], vec![0, 6]]);
+        assert_eq!(s.memory().map(|f| f.index).collect::<Vec<_>>(), vec![0, 8, 9]);
+    }
+
+    #[test]
     fn frames_stream_per_chunk_and_count_simulated_time() {
-        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()) };
+        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()), pick: false };
         let mut s = WorldSession::start(&toy, cfg(), "a road", "", Some(&image())).unwrap();
         let a = s.step(&[]).unwrap();
         assert_eq!(a.frames, 1 + 12);
@@ -393,7 +461,7 @@ mod tests {
 
     #[test]
     fn a_text_only_session_opens_with_a_single_frame() {
-        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()) };
+        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()), pick: false };
         let mut s = WorldSession::start(&toy, cfg(), "a road", "", None).unwrap();
         assert_eq!(s.pixel_frames_next(), 9);
         assert_eq!(s.step(&[]).unwrap().frames, 9);
@@ -403,24 +471,25 @@ mod tests {
 
     #[test]
     fn actions_are_one_row_per_pixel_frame() {
-        let toy = Toy { dims: 8, seen: RefCell::new(Vec::new()) };
+        let toy = Toy { dims: 8, seen: RefCell::new(Vec::new()), pick: false };
         let mut s = WorldSession::start(&toy, cfg(), "a road", "", Some(&image())).unwrap();
         assert_eq!(s.actions_needed(), 8 * 12);
         assert!(matches!(s.step(&[0.0; 8]), Err(Error::Request(_))));
         assert!(matches!(s.step(&[f32::NAN; 96]), Err(Error::Request(_))));
         s.step(&[0.5; 96]).unwrap();
         assert_eq!(toy.seen.borrow()[0].2, 96);
-        let none = Toy { dims: 0, seen: RefCell::new(Vec::new()) };
+        let none = Toy { dims: 0, seen: RefCell::new(Vec::new()), pick: false };
         let mut s = WorldSession::start(&none, cfg(), "a road", "", None).unwrap();
         assert!(matches!(s.step(&[1.0]), Err(Error::Request(_))));
     }
 
     #[test]
     fn settings_are_checked() {
-        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()) };
+        let toy = Toy { dims: 0, seen: RefCell::new(Vec::new()), pick: false };
         for bad in [
             SessionConfig { width: 40, ..cfg() },
             SessionConfig { memory_latent_frames: 0, ..cfg() },
+            SessionConfig { history_latent_frames: 3, ..cfg() },
             SessionConfig { chunk_latent_frames: 0, ..cfg() },
             SessionConfig { fps: 0.0, ..cfg() },
         ] {

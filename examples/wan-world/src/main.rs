@@ -80,6 +80,7 @@ fn main() -> anyhow::Result<()> {
         fps: a.fps,
         chunk_latent_frames: a.chunk,
         memory_latent_frames: a.memory,
+        history_latent_frames: a.memory,
         steps: a.steps,
         guidance_scale: a.guidance,
         seed: a.seed,

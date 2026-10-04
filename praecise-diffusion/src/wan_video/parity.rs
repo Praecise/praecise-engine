@@ -136,6 +136,7 @@ fn wan_session_matches_generation() {
         fps: req.fps,
         chunk_latent_frames: lt - 1,
         memory_latent_frames: 2,
+        history_latent_frames: 2,
         steps: req.steps,
         guidance_scale: req.guidance_scale,
         seed: 3,
