@@ -36,22 +36,28 @@ type Mat4 = [[f64; 4]; 4];
 
 /// A loaded action world model.
 pub struct MatrixGame {
-    backend: Backend,
-    cfg: WanDitConfig,
-    tf: Weights,
-    pe: Weights,
+    dit: Transformer,
     te_cfg: Umt5Config,
     te: Weights,
     vae_cfg: WanVaeConfig,
     vae: Weights,
-    sched: UniPcConfig,
     tokenizer: tokenizers::Tokenizer,
+}
+
+/// The world transformer and its sampler: all a chunk needs once the
+/// prompt is encoded and the first frame is a latent.
+pub(super) struct Transformer {
+    backend: Backend,
+    cfg: WanDitConfig,
+    tf: Weights,
+    pe: Weights,
+    sched: UniPcConfig,
     exact: bool,
 }
 
 impl std::fmt::Debug for MatrixGame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MatrixGame").field("layers", &self.cfg.num_layers).field("device", &self.backend.name()).finish_non_exhaustive()
+        f.debug_struct("MatrixGame").field("layers", &self.dit.cfg.num_layers).field("device", &self.dit.backend.name()).finish_non_exhaustive()
     }
 }
 
@@ -63,6 +69,14 @@ pub struct Session {
     rows: Vec<f32>,
     poses: Vec<Pose>,
     path: Vec<Mat4>,
+}
+
+#[cfg(test)]
+impl Session {
+    /// A session over already encoded text states (prompt, then negative).
+    pub(super) fn with_states(states: Vec<Vec<f32>>) -> Self {
+        Self { states, ..Self::default() }
+    }
 }
 
 /// Pixel and latent spans of one chunk.
@@ -132,30 +146,91 @@ impl MatrixGame {
         let exact = opts.precision == Precision::F32;
         let wt = opts.precision.wtype();
         let tf_files = SafeTensors::open(&world.weights("base_distilled_model")?)?.renamed(rename)?;
-        let tf = Weights::load(&backend, &tf_files, &cfg.weight_specs(wt))?;
-        let pe = Weights::from_host(&backend, &cfg.patch_weights(&tf_files)?)?;
+        let dit = Transformer::new(backend, cfg, &tf_files, sched, opts.precision)?;
         drop(tf_files);
+        let backend = &dit.backend;
         let te_files = SafeTensors::open(&base.weights("text_encoder")?)?;
-        let te = Weights::load(&backend, &te_files, &te_cfg.weight_specs(wt))?;
+        let te = Weights::load(backend, &te_files, &te_cfg.weight_specs(wt))?;
         drop(te_files);
         let vae_files = SafeTensors::open(&base.weights("vae")?)?;
-        let vae = Weights::from_host(&backend, &vae_cfg.host_tensors(&vae_files, exact)?)?;
+        let vae = Weights::from_host(backend, &vae_cfg.host_tensors(&vae_files, exact)?)?;
         drop(vae_files);
         let tok_path = base.root.join("tokenizer/tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| Error::Tokenizer(format!("{}: {e}", tok_path.display())))?;
-        Ok(Self { backend, cfg, tf, pe, te_cfg, te, vae_cfg, vae, sched, tokenizer, exact })
+        Ok(Self { dit, te_cfg, te, vae_cfg, vae, tokenizer })
     }
 
     /// Device bytes held by the weights.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        self.tf.bytes() + self.pe.bytes() + self.te.bytes() + self.vae.bytes()
+        self.dit.tf.bytes() + self.dit.pe.bytes() + self.te.bytes() + self.vae.bytes()
     }
 
     /// The backend device name.
     #[must_use]
     pub fn device(&self) -> &str {
-        self.backend.name()
+        self.dit.backend.name()
+    }
+}
+
+impl Transformer {
+    /// The transformer from its renamed weights.
+    ///
+    /// # Errors
+    /// Weight or backend failures.
+    pub(super) fn new(backend: Backend, cfg: WanDitConfig, files: &SafeTensors, sched: UniPcConfig, precision: Precision) -> Result<Self> {
+        let tf = Weights::load(&backend, files, &cfg.weight_specs(precision.wtype()))?;
+        let pe = Weights::from_host(&backend, &cfg.patch_weights(files)?)?;
+        Ok(Self { backend, cfg, tf, pe, sched, exact: precision == Precision::F32 })
+    }
+
+    /// Latent channels per frame.
+    pub(super) fn latent_channels(&self) -> usize {
+        self.cfg.in_channels as usize
+    }
+
+    /// Keyboard then mouse values per action row.
+    pub(super) fn action_dims(&self) -> usize {
+        let (k, m) = self.dims();
+        k + m
+    }
+
+    /// Take in the actions for pixel frames from `first_pixel` on and
+    /// extend the camera path.
+    pub(super) fn advance(&self, ctx: &mut Session, actions: &[f32], first_pixel: usize) -> Result<()> {
+        let dims = self.action_dims();
+        let (kdim, _) = self.dims();
+        if first_pixel == 0 {
+            return Err(Error::Request("this model starts from a first frame".into()));
+        }
+        if ctx.poses.is_empty() {
+            ctx.rows = vec![0.0; dims];
+            ctx.poses.push([0.0; 5]);
+            ctx.path.push(camera::extrinsic(&[0.0; 5]));
+        }
+        if ctx.rows.len() != first_pixel * dims {
+            return Err(Error::Request(format!("actions must continue at pixel frame {}", ctx.rows.len() / dims)));
+        }
+        ctx.rows.extend_from_slice(actions);
+        for f in first_pixel..ctx.rows.len() / dims {
+            let row = &ctx.rows[(f - 1) * dims..f * dims];
+            let pose = camera::next_pose(&ctx.poses[f - 1], &row[..kdim], &row[kdim..]);
+            ctx.poses.push(pose);
+            ctx.path.push(camera::extrinsic(&pose));
+        }
+        Ok(())
+    }
+
+    /// Latent frames the chunk starting at `first_index` attends to.
+    pub(super) fn select_memory(&self, ctx: &Session, first_index: usize) -> Option<Vec<usize>> {
+        if first_index == 1 {
+            return Some(vec![0]);
+        }
+        let n = (ctx.path.len() - 1) / FRAMES_PER_LATENT + 1 - first_index;
+        let clip = Clip::of(first_index, n).ok()?;
+        let mut chosen: Vec<usize> = camera::memory_by_view(&ctx.path, clip.start, clip.end, VIEW_PICKS).iter().map(|p| p.latent).collect();
+        chosen.extend(first_index - CONTINUITY..first_index);
+        Some(chosen)
     }
 
     fn dims(&self) -> (usize, usize) {
@@ -192,100 +267,10 @@ impl MatrixGame {
         g.finish(&[io.out])?;
         Ok((g, io))
     }
-}
 
-/// Per-token time features: `clean` frames at 0, the rest at `t`.
-fn times(frames: usize, clean: usize, hw: usize, t: f32) -> Vec<f32> {
-    (0..frames * hw).flat_map(|i| wan_dit::time_features(if i < clean * hw { 0.0 } else { t })).collect()
-}
-
-/// `[z][a + b][plane]` from `[z][a][plane]` and `[z][b][plane]`.
-fn join(a: &[f32], b: &[f32], z: usize) -> Vec<f32> {
-    let (fa, fb) = (a.len() / z, b.len() / z);
-    (0..z).flat_map(|c| a[c * fa..(c + 1) * fa].iter().chain(&b[c * fb..(c + 1) * fb]).copied()).collect()
-}
-
-/// Frames `from..` of `[z][frames][plane]`.
-fn tail(v: &[f32], z: usize, frames: usize, from: usize) -> Vec<f32> {
-    let f = v.len() / (z * frames);
-    (0..z).flat_map(|c| v[(c * frames + from) * f..(c + 1) * frames * f].iter().copied()).collect()
-}
-
-/// `[z][frames][plane]` from frames `[z][plane]` each.
-fn stack(frames: &[LatentFrame], z: usize) -> Vec<f32> {
-    let plane = frames.first().map_or(0, |f| f.data.len() / z);
-    (0..z).flat_map(|c| frames.iter().flat_map(move |f| f.data[c * plane..(c + 1) * plane].iter().copied())).collect()
-}
-
-impl WorldModel for MatrixGame {
-    type Context = Session;
-    type Stream = wan::Decoder;
-
-    fn latent_channels(&self) -> usize {
-        self.cfg.in_channels as usize
-    }
-
-    fn action_dims(&self) -> usize {
-        let (k, m) = self.dims();
-        k + m
-    }
-
-    fn spatial_stride(&self) -> usize {
-        STRIDE
-    }
-
-    fn context(&self, prompt: &str, negative: &str, guided: bool) -> Result<Self::Context> {
-        let mut states = vec![text_states(&self.backend, &self.te_cfg, &self.te, &tokens(&self.tokenizer, prompt)?)?];
-        if guided {
-            states.push(text_states(&self.backend, &self.te_cfg, &self.te, &tokens(&self.tokenizer, negative)?)?);
-        }
-        Ok(Session { states, ..Session::default() })
-    }
-
-    fn encode_image(&self, image: &RgbImage) -> Result<Vec<f32>> {
-        wan::encode_frames(&self.backend, &self.vae_cfg, &self.vae, std::slice::from_ref(image))
-    }
-
-    fn advance(&self, ctx: &mut Self::Context, actions: &[f32], first_pixel: usize) -> Result<()> {
-        let dims = self.action_dims();
-        let (kdim, _) = self.dims();
-        if first_pixel == 0 {
-            return Err(Error::Request("this model starts from a first frame".into()));
-        }
-        if ctx.poses.is_empty() {
-            ctx.rows = vec![0.0; dims];
-            ctx.poses.push([0.0; 5]);
-            ctx.path.push(camera::extrinsic(&[0.0; 5]));
-        }
-        if ctx.rows.len() != first_pixel * dims {
-            return Err(Error::Request(format!("actions must continue at pixel frame {}", ctx.rows.len() / dims)));
-        }
-        ctx.rows.extend_from_slice(actions);
-        for f in first_pixel..ctx.rows.len() / dims {
-            let row = &ctx.rows[(f - 1) * dims..f * dims];
-            let pose = camera::next_pose(&ctx.poses[f - 1], &row[..kdim], &row[kdim..]);
-            ctx.poses.push(pose);
-            ctx.path.push(camera::extrinsic(&pose));
-        }
-        Ok(())
-    }
-
-    fn select_memory(&self, ctx: &Self::Context, _held: &[usize], first_index: usize, _count: usize) -> Option<Vec<usize>> {
-        if first_index == 1 {
-            return Some(vec![0]);
-        }
-        let n = (ctx.path.len() - 1) / FRAMES_PER_LATENT + 1 - first_index;
-        let clip = Clip::of(first_index, n).ok()?;
-        let mut chosen: Vec<usize> = camera::memory_by_view(&ctx.path, clip.start, clip.end, VIEW_PICKS).iter().map(|p| p.latent).collect();
-        chosen.extend(first_index - CONTINUITY..first_index);
-        Some(chosen)
-    }
-
-    fn pinned(&self, index: usize) -> bool {
-        index == 1
-    }
-
-    fn rollout(&self, ctx: &Self::Context, req: &ChunkRequest<'_>) -> Result<(Vec<f32>, u32)> {
+    /// Denoise one chunk from `noise` (`[z][clip latents][plane]`, the
+    /// held frames' share overwritten).
+    pub(super) fn rollout(&self, ctx: &Session, req: &ChunkRequest<'_>, noise: Vec<f32>) -> Result<(Vec<f32>, u32)> {
         let dims = self.action_dims();
         let (kdim, mdim) = self.dims();
         let wd = self.cfg.world.as_ref().expect("world config");
@@ -305,7 +290,10 @@ impl WorldModel for MatrixGame {
         let (mem, held) = req.memory.split_at(picks.len());
         let mem = stack(mem, z);
 
-        let mut latents = schedule::gaussian(req.seed, z * clip.latents * plane);
+        if noise.len() != z * clip.latents * plane {
+            return Err(Error::Request("the chunk's noise has the wrong size".into()));
+        }
+        let mut latents = noise;
         for (i, f) in held.iter().enumerate() {
             place_frame(&mut latents, &f.data, i, clip.latents, plane);
         }
@@ -328,7 +316,7 @@ impl WorldModel for MatrixGame {
         let rays = join(&rays, &clip_rays, 6 * STRIDE * STRIDE);
         let clip_pos: Vec<usize> = (clip.latent_start..clip.latent_start + clip.latents).collect();
         let positions: Vec<usize> = picks.iter().map(|p| p.latent).chain(clip_pos.iter().copied()).collect();
-        let act_pos: Vec<usize> = std::iter::repeat_n(0, picks.len()).chain(0..clip.latents).collect();
+        let act_pos: Vec<usize> = (0..picks.len()).chain(0..clip.latents).collect();
         let full_frames = picks.len() + clip.latents;
 
         let guided = ctx.states.len() == 2 && req.guidance_scale > 1.0;
@@ -364,13 +352,83 @@ impl WorldModel for MatrixGame {
         }
         Ok((tail(&latents, z, clip.latents, clip.held), evaluations))
     }
+}
+
+/// Per-token time features: `clean` frames at 0, the rest at `t`.
+fn times(frames: usize, clean: usize, hw: usize, t: f32) -> Vec<f32> {
+    (0..frames * hw).flat_map(|i| wan_dit::time_features(if i < clean * hw { 0.0 } else { t })).collect()
+}
+
+/// `[z][a + b][plane]` from `[z][a][plane]` and `[z][b][plane]`.
+fn join(a: &[f32], b: &[f32], z: usize) -> Vec<f32> {
+    let (fa, fb) = (a.len() / z, b.len() / z);
+    (0..z).flat_map(|c| a[c * fa..(c + 1) * fa].iter().chain(&b[c * fb..(c + 1) * fb]).copied()).collect()
+}
+
+/// Frames `from..` of `[z][frames][plane]`.
+fn tail(v: &[f32], z: usize, frames: usize, from: usize) -> Vec<f32> {
+    let f = v.len() / (z * frames);
+    (0..z).flat_map(|c| v[(c * frames + from) * f..(c + 1) * frames * f].iter().copied()).collect()
+}
+
+/// `[z][frames][plane]` from frames `[z][plane]` each.
+fn stack(frames: &[LatentFrame], z: usize) -> Vec<f32> {
+    let plane = frames.first().map_or(0, |f| f.data.len() / z);
+    (0..z).flat_map(|c| frames.iter().flat_map(move |f| f.data[c * plane..(c + 1) * plane].iter().copied())).collect()
+}
+
+impl WorldModel for MatrixGame {
+    type Context = Session;
+    type Stream = wan::Decoder;
+
+    fn latent_channels(&self) -> usize {
+        self.dit.latent_channels()
+    }
+
+    fn action_dims(&self) -> usize {
+        self.dit.action_dims()
+    }
+
+    fn spatial_stride(&self) -> usize {
+        STRIDE
+    }
+
+    fn context(&self, prompt: &str, negative: &str, guided: bool) -> Result<Self::Context> {
+        let mut states = vec![text_states(&self.dit.backend, &self.te_cfg, &self.te, &tokens(&self.tokenizer, prompt)?)?];
+        if guided {
+            states.push(text_states(&self.dit.backend, &self.te_cfg, &self.te, &tokens(&self.tokenizer, negative)?)?);
+        }
+        Ok(Session { states, ..Session::default() })
+    }
+
+    fn encode_image(&self, image: &RgbImage) -> Result<Vec<f32>> {
+        wan::encode_frames(&self.dit.backend, &self.vae_cfg, &self.vae, std::slice::from_ref(image))
+    }
+
+    fn advance(&self, ctx: &mut Self::Context, actions: &[f32], first_pixel: usize) -> Result<()> {
+        self.dit.advance(ctx, actions, first_pixel)
+    }
+
+    fn select_memory(&self, ctx: &Self::Context, _held: &[usize], first_index: usize, _count: usize) -> Option<Vec<usize>> {
+        self.dit.select_memory(ctx, first_index)
+    }
+
+    fn pinned(&self, index: usize) -> bool {
+        index == 1
+    }
+
+    fn rollout(&self, ctx: &Self::Context, req: &ChunkRequest<'_>) -> Result<(Vec<f32>, u32)> {
+        let plane = req.grid.0 * req.grid.1;
+        let clip = Clip::of(req.first_index, req.new_frames)?;
+        self.dit.rollout(ctx, req, schedule::gaussian(req.seed, self.latent_channels() * clip.latents * plane))
+    }
 
     fn open_stream(&self, (lh, lw): (usize, usize)) -> Result<Self::Stream> {
-        wan::Decoder::new(&self.backend, &self.vae_cfg, lh, lw)
+        wan::Decoder::new(&self.dit.backend, &self.vae_cfg, lh, lw)
     }
 
     fn decode_next(&self, stream: &mut Self::Stream, latent: &[f32]) -> Result<Vec<f32>> {
-        stream.push(&self.backend, &self.vae_cfg, &self.vae, latent)
+        stream.push(&self.dit.backend, &self.vae_cfg, &self.vae, latent)
     }
 }
 

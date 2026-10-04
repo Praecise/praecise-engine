@@ -147,3 +147,69 @@ fn camera_rays_match_reference() {
         assert!(*i == u(wi) && (r - wr).abs() < 2e-3, "view selection {got:?} vs {f}");
     }
 }
+
+/// Session parity: the reference generation loop over three clips with a
+/// tiny transformer (`tests/parity/make_mg3_session_fixtures.py`), every
+/// clip's new latents compared after the full sampler, guidance on.
+#[test]
+#[ignore = "needs PRAECISE_MG3_SESSION fixtures"]
+fn world_session_parity() {
+    use super::model::{Session, Transformer};
+    use crate::pipeline::Precision;
+    use crate::unipc::UniPcConfig;
+    use crate::world::{ChunkRequest, LatentFrame, FRAMES_PER_LATENT};
+
+    let dir = PathBuf::from(std::env::var("PRAECISE_MG3_SESSION").expect("PRAECISE_MG3_SESSION names the fixture dir"));
+    let m: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+    let u = |k: &str| m[k].as_u64().unwrap() as usize;
+    let cfg = config(&serde_json::to_vec(&m["config"]).unwrap()).unwrap();
+    let sched: UniPcConfig = serde_json::from_value(serde_json::json!({
+        "num_train_timesteps": 1000, "solver_order": 2, "solver_type": "bh2", "prediction_type": "flow_prediction",
+        "predict_x0": true, "lower_order_final": true, "use_karras_sigmas": false, "use_flow_sigmas": true,
+        "final_sigmas_type": "zero", "flow_shift": m["shift"], "use_dynamic_shifting": false
+    }))
+    .unwrap();
+    let backend = Backend::select(std::thread::available_parallelism().map_or(8, usize::from)).unwrap();
+    let files = SafeTensors::open(&[dir.join("model.safetensors")]).unwrap().renamed(rename).unwrap();
+    let dit = Transformer::new(backend, cfg, &files, sched, Precision::F32).unwrap();
+    let z = dit.latent_channels();
+    let dims = dit.action_dims();
+    let (h, w) = (u("height"), u("width"));
+    let plane = h * w;
+    let rows = bin(&dir, "actions");
+    let mut ctx = Session::with_states(vec![bin(&dir, "context"), bin(&dir, "negative")]);
+    let mut frames = vec![LatentFrame { index: 0, data: bin(&dir, "image_latent") }];
+    let (mut first, mut pixel) = (1, 1);
+    let mut worst = 1f64;
+    for c in 0..u("clips") {
+        let n = if c == 0 { u("first_frames") } else { u("next_frames") };
+        let end = FRAMES_PER_LATENT * (first + n - 1) + 1;
+        let actions = &rows[pixel * dims..end * dims];
+        dit.advance(&mut ctx, actions, pixel).unwrap();
+        let want_mem: Vec<usize> = m["memory"][c].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+        let picked = dit.select_memory(&ctx, first).unwrap();
+        assert_eq!(picked, want_mem, "clip {c} memory");
+        let memory: Vec<LatentFrame> = picked.iter().map(|&i| LatentFrame { index: i, data: frames[i].data.clone() }).collect();
+        let req = ChunkRequest { memory: &memory, new_frames: n, first_index: first, actions, grid: (h, w), steps: u("steps") as u32, guidance_scale: m["guidance"].as_f64().unwrap() as f32, seed: 0 };
+        let (got, _) = dit.rollout(&ctx, &req, bin(&dir, &format!("noise{c}"))).unwrap();
+        let want = bin(&dir, &format!("out{c}"));
+        let cos = cosine(&got, &want);
+        eprintln!("world session clip {c}: cos {cos:.7}");
+        let per: Vec<String> = (0..n)
+            .map(|k| {
+                let f = |v: &[f32]| -> Vec<f32> { (0..z).flat_map(|ch| v[(ch * n + k) * plane..(ch * n + k + 1) * plane].iter().copied()).collect() };
+                format!("{:.6}", cosine(&f(&got), &f(&want)))
+            })
+            .collect();
+        eprintln!("  per frame {per:?}");
+        worst = worst.min(cos);
+        // Continue from the reference latents so a clip's error does not feed the next.
+        for k in 0..n {
+            let data = (0..z).flat_map(|ch| want[(ch * n + k) * plane..(ch * n + k + 1) * plane].iter().copied()).collect();
+            frames.push(LatentFrame { index: first + k, data });
+        }
+        first += n;
+        pixel = end;
+    }
+    assert!(worst > 0.999, "session parity cos {worst}");
+}
