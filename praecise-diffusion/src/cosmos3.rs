@@ -7,6 +7,12 @@
 //! so its keys and values are computed once per prompt ([`build_text`]) and
 //! reused at every denoising step ([`build_gen`]).
 //!
+//! The generation stream can also carry action tokens after the video
+//! tokens: a chunk of robot actions projected in and out by per-embodiment
+//! weights. Video and action tokens attend to each other fully, so one
+//! evaluation predicts both (policy), or predicts video under given actions
+//! (forward dynamics).
+//!
 //! Sequences are laid out `[width, tokens]`. Rotary embeddings take three
 //! positions per token (time, height, width) whose frequencies interleave;
 //! they are applied from cos/sin tables computed on the host, since the
@@ -84,10 +90,23 @@ pub struct Cosmos3Config {
     /// Video height and width positions start at zero rather than after the
     /// text.
     pub unified_3d_mrope_reset_spatial_ids: bool,
+    /// Action projections are present.
+    #[serde(default)]
+    pub action_gen: bool,
+    /// Width of one (padded) action vector.
+    #[serde(default)]
+    pub action_dim: Option<u64>,
+    /// Embodiments with their own action projections.
+    #[serde(default = "domains")]
+    pub num_embodiment_domains: u64,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn domains() -> u64 {
+    32
 }
 
 impl Cosmos3Config {
@@ -97,11 +116,14 @@ impl Cosmos3Config {
     /// [`Error::Config`] naming the first unsupported setting.
     pub fn validate(&self) -> Result<()> {
         let bad = |m: String| Err(Error::Config(m));
-        if self.hidden_act != "relu2" {
+        if self.hidden_act != "relu2" && self.hidden_act != "silu" {
             return bad(format!("feed-forward activation {:?} is not implemented", self.hidden_act));
         }
-        if self.qk_norm_for_text || !self.use_und_k_norm_for_gen || self.attention_bias {
-            return bad("only the text stream without query/key norms, with a key norm for the generation stream and without attention biases is implemented".into());
+        if self.attention_bias {
+            return bad("attention biases are not implemented".into());
+        }
+        if self.action_gen && self.action_dim.is_none_or(|d| d == 0) {
+            return bad("action projections without an action width".into());
         }
         if self.num_attention_heads % self.num_key_value_heads != 0 || self.head_dim % 2 != 0 {
             return bad("query heads must be a multiple of key/value heads and the head width even".into());
@@ -149,6 +171,15 @@ impl Cosmos3Config {
             WeightSpec::new("time_embedder.linear_2.bias", &[d], WType::F32),
             WeightSpec::new("norm_moe_gen.weight", &[d], WType::F32),
         ];
+        if let (true, Some(ad)) = (self.action_gen, self.action_dim) {
+            let nd = self.num_embodiment_domains;
+            v.push(WeightSpec::new("action_proj_in.fc.weight", &[nd, ad * d], WType::F32));
+            v.push(WeightSpec::new("action_proj_in.bias.weight", &[nd, d], WType::F32));
+            v.push(WeightSpec::new("action_proj_out.fc.weight", &[nd, d * ad], WType::F32));
+            v.push(WeightSpec::new("action_proj_out.bias.weight", &[nd, ad], WType::F32));
+            v.push(WeightSpec::new("action_modality_embed", &[d], WType::F32));
+        }
+        let gated = self.gated();
         let last = self.num_hidden_layers - 1;
         for i in 0..self.num_hidden_layers {
             let p = format!("layers.{i}");
@@ -156,7 +187,16 @@ impl Cosmos3Config {
             for n in ["input_layernorm", "input_layernorm_moe_gen", "post_attention_layernorm_moe_gen"] {
                 v.push(WeightSpec::new(format!("{p}.{n}.weight"), &[d], WType::F32));
             }
-            for n in ["k_norm_und_for_gen", "norm_added_q", "norm_added_k"] {
+            let mut head_norms = vec!["norm_added_q", "norm_added_k"];
+            if self.qk_norm_for_text {
+                head_norms.push("norm_k");
+                if i != last {
+                    head_norms.push("norm_q");
+                }
+            } else if self.use_und_k_norm_for_gen {
+                head_norms.push("k_norm_und_for_gen");
+            }
+            for n in head_norms {
                 v.push(WeightSpec::new(format!("{a}.{n}.weight"), &[hd], WType::F32));
             }
             for (n, rows) in [("to_q", q), ("to_k", kv), ("to_v", kv), ("add_q_proj", q), ("add_k_proj", kv), ("add_v_proj", kv)] {
@@ -165,7 +205,13 @@ impl Cosmos3Config {
             v.push(WeightSpec::new(format!("{a}.to_add_out.weight"), &[d, q], linear));
             v.push(WeightSpec::new(format!("{p}.mlp_moe_gen.up_proj.weight"), &[ff, d], linear));
             v.push(WeightSpec::new(format!("{p}.mlp_moe_gen.down_proj.weight"), &[d, ff], linear));
+            if gated {
+                v.push(WeightSpec::new(format!("{p}.mlp_moe_gen.gate_proj.weight"), &[ff, d], linear));
+            }
             if i != last {
+                if gated {
+                    v.push(WeightSpec::new(format!("{p}.mlp.gate_proj.weight"), &[ff, d], linear));
+                }
                 v.push(WeightSpec::new(format!("{a}.to_out.weight"), &[d, q], linear));
                 v.push(WeightSpec::new(format!("{p}.post_attention_layernorm.weight"), &[d], WType::F32));
                 v.push(WeightSpec::new(format!("{p}.mlp.up_proj.weight"), &[ff, d], linear));
@@ -183,6 +229,11 @@ impl Cosmos3Config {
         (0..self.num_hidden_layers)
             .flat_map(|i| [WeightSpec::new(format!("k{i}"), &shape, WType::F32), WeightSpec::new(format!("v{i}"), &shape, WType::F32)])
             .collect()
+    }
+
+    /// Gated (SiLU) feed-forward rather than squared ReLU.
+    fn gated(&self) -> bool {
+        self.hidden_act == "silu"
     }
 
     fn eps(&self) -> f32 {
@@ -244,11 +295,29 @@ fn rms(g: &mut Graph, w: &Weights, name: &str, x: Tn, eps: f32) -> Tn {
     g.mul(h, w.get(name))
 }
 
-fn relu2_mlp(g: &mut Graph, w: &Weights, p: &str, x: Tn) -> Tn {
-    let h = g.linear(w.get(&format!("{p}.up_proj.weight")), x);
-    let h = g.relu(h);
-    let h = g.sqr(h);
+fn mlp(g: &mut Graph, cfg: &Cosmos3Config, w: &Weights, p: &str, x: Tn) -> Tn {
+    let up = g.linear(w.get(&format!("{p}.up_proj.weight")), x);
+    let h = if cfg.gated() {
+        let gate = g.linear(w.get(&format!("{p}.gate_proj.weight")), x);
+        let gate = g.silu(gate);
+        g.mul(gate, up)
+    } else {
+        let h = g.relu(up);
+        g.sqr(h)
+    };
     g.linear(w.get(&format!("{p}.down_proj.weight")), h)
+}
+
+/// Per-embodiment projection: row `domain` of `{name}.fc` is an
+/// `[in][out]` matrix (`x @ m + b`), row `domain` of `{name}.bias` the bias.
+fn domain_linear(g: &mut Graph, w: &Weights, name: &str, domain: Tn, inp: i64, out: i64, x: Tn) -> Tn {
+    let row = g.get_rows(w.get(&format!("{name}.fc.weight")), domain);
+    let m = g.reshape(row, &[out, inp]);
+    let m = g.permute(m, [1, 0, 2, 3]);
+    let m = g.cont(m);
+    let b = g.get_rows(w.get(&format!("{name}.bias.weight")), domain);
+    let y = g.linear(m, x);
+    g.add(y, b)
 }
 
 /// `q` `[hd, heads, n]`, `k`/`v` `[hd, m, kv heads]`; result `[hd * heads, n]`.
@@ -314,23 +383,33 @@ pub fn build_text(g: &mut Graph, cfg: &Cosmos3Config, w: &Weights, n: i64, exact
         let v = g.linear(wn("to_v"), h);
         let k = g.reshape(k, &[hd, kvh, n]);
         let v = g.reshape(v, &[hd, kvh, n]);
-        let kg = rms(g, w, &format!("{a}.k_norm_und_for_gen.weight"), k, eps);
+        // With query/key norms the generation stream reads the normed keys;
+        // without them, optionally keys under a norm of their own.
+        let k = if cfg.qk_norm_for_text { rms(g, w, &format!("{a}.norm_k.weight"), k, eps) } else { k };
+        let separate = !cfg.qk_norm_for_text && cfg.use_und_k_norm_for_gen;
+        let kg = if separate { rms(g, w, &format!("{a}.k_norm_und_for_gen.weight"), k, eps) } else { k };
         let kg = g.rotate_half_rope(kg, cos3, sin3);
-        keys.push(by_head(g, kg));
+        let kg = by_head(g, kg);
+        keys.push(kg);
         let v = by_head(g, v);
         values.push(v);
         if i + 1 == cfg.num_hidden_layers {
             break;
         }
         let q = g.reshape(q, &[hd, heads, n]);
+        let q = if cfg.qk_norm_for_text { rms(g, w, &format!("{a}.norm_q.weight"), q, eps) } else { q };
         let q = g.rotate_half_rope(q, cos3, sin3);
-        let k = g.rotate_half_rope(k, cos3, sin3);
-        let k = by_head(g, k);
+        let k = if separate {
+            let k = g.rotate_half_rope(k, cos3, sin3);
+            by_head(g, k)
+        } else {
+            kg
+        };
         let o = attend(g, q, k, v, Some(mask), exact);
         let o = g.linear(wn("to_out"), o);
         x = g.add(x, o);
         let h = rms(g, w, &format!("{p}.post_attention_layernorm.weight"), x, eps);
-        let m = relu2_mlp(g, w, &format!("{p}.mlp"), h);
+        let m = mlp(g, cfg, w, &format!("{p}.mlp"), h);
         x = g.add(x, m);
     }
     TextIo { ids, cos, sin, mask, keys, values }
@@ -348,6 +427,28 @@ pub fn causal_mask(n: usize) -> Vec<f32> {
     m
 }
 
+/// Action tokens appended to the generation stream.
+#[derive(Debug, Clone, Copy)]
+pub struct ActionSpan {
+    /// Action tokens (one per action step).
+    pub tokens: i64,
+    /// Leading tokens that are given rather than predicted.
+    pub cond: i64,
+}
+
+/// Inputs and outputs of the action part of the generation stream.
+#[derive(Debug, Clone)]
+pub struct ActionIo {
+    /// Action vectors `[action width, tokens]`.
+    pub values: Tn,
+    /// Timestep features of the action tokens `[256]`.
+    pub time: Tn,
+    /// Embodiment index `[1]` (i32).
+    pub domain: Tn,
+    /// Velocity of the predicted actions `[action width, tokens - cond]`.
+    pub out: Tn,
+}
+
 /// Inputs and outputs of the generation-stream graph.
 #[derive(Debug, Clone)]
 pub struct GenIo {
@@ -355,33 +456,27 @@ pub struct GenIo {
     pub patches: Tn,
     /// Timestep features `[256]`.
     pub time: Tn,
-    /// Rotary cosine table `[head width, tokens]`.
+    /// Rotary cosine table `[head width, tokens]`, video tokens then action
+    /// tokens.
     pub cos: Tn,
     /// Sine table, same layout.
     pub sin: Tn,
     /// Velocity of the noisy tokens `[patch width, tokens - cond]`.
     pub out: Tn,
+    /// The action tokens, when the graph carries them.
+    pub actions: Option<ActionIo>,
 }
 
-/// One evaluation of the generation stream over `n` patch tokens, the first
-/// `cond` of which are clean conditioning tokens (no timestep embedding, no
-/// prediction), attending to the text keys and values in `cache`.
-#[must_use]
-pub fn build_gen(g: &mut Graph, cfg: &Cosmos3Config, w: &Weights, cache: &Weights, n: i64, cond: i64, exact: bool) -> GenIo {
-    let (hd, heads, kvh) = (cfg.head_dim as i64, cfg.num_attention_heads as i64, cfg.num_key_value_heads as i64);
-    let eps = cfg.eps();
-    let patches = g.input(sys::GGML_TYPE_F32, &[cfg.patch_latent_dim as i64, n]);
-    let time = g.input(sys::GGML_TYPE_F32, &[TIME_FEATURES as i64]);
-    let cos = g.input(sys::GGML_TYPE_F32, &[hd, n]);
-    let sin = g.input(sys::GGML_TYPE_F32, &[hd, n]);
-    let cos3 = g.reshape(cos, &[hd, 1, n]);
-    let sin3 = g.reshape(sin, &[hd, 1, n]);
-
+/// Add the timestep embedding of `time` to every column of `x` after the
+/// first `cond`.
+fn add_time(g: &mut Graph, w: &Weights, time: Tn, x: Tn, n: i64, cond: i64) -> Tn {
     let t = g.linear_b(w.get("time_embedder.linear_1.weight"), w.get("time_embedder.linear_1.bias"), time);
     let t = g.silu(t);
     let temb = g.linear_b(w.get("time_embedder.linear_2.weight"), w.get("time_embedder.linear_2.bias"), t);
-    let x = g.linear_b(w.get("proj_in.weight"), w.get("proj_in.bias"), patches);
-    let mut x = if cond > 0 {
+    if cond == n {
+        return x;
+    }
+    if cond > 0 {
         let c = g.view_cols(x, 0, cond);
         let rest = g.view_cols(x, cond, n - cond);
         let rest = g.add(rest, temb);
@@ -389,7 +484,54 @@ pub fn build_gen(g: &mut Graph, cfg: &Cosmos3Config, w: &Weights, cache: &Weight
         g.concat(c, rest, 1)
     } else {
         g.add(x, temb)
-    };
+    }
+}
+
+/// One evaluation of the generation stream over `n` patch tokens, the first
+/// `cond` of which are clean conditioning tokens (no timestep embedding, no
+/// prediction), followed by the action tokens of `actions` if given,
+/// attending to the text keys and values in `cache`. At least one video
+/// token must be predicted.
+///
+/// # Panics
+/// When `actions` is given and the configuration has no action width.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_gen(
+    g: &mut Graph,
+    cfg: &Cosmos3Config,
+    w: &Weights,
+    cache: &Weights,
+    n: i64,
+    cond: i64,
+    actions: Option<ActionSpan>,
+    exact: bool,
+) -> GenIo {
+    let (hd, heads, kvh) = (cfg.head_dim as i64, cfg.num_attention_heads as i64, cfg.num_key_value_heads as i64);
+    let (d, eps) = (cfg.hidden_size as i64, cfg.eps());
+    let na = actions.map_or(0, |a| a.tokens);
+    let total = n + na;
+    let patches = g.input(sys::GGML_TYPE_F32, &[cfg.patch_latent_dim as i64, n]);
+    let time = g.input(sys::GGML_TYPE_F32, &[TIME_FEATURES as i64]);
+    let cos = g.input(sys::GGML_TYPE_F32, &[hd, total]);
+    let sin = g.input(sys::GGML_TYPE_F32, &[hd, total]);
+    let cos3 = g.reshape(cos, &[hd, 1, total]);
+    let sin3 = g.reshape(sin, &[hd, 1, total]);
+
+    let x = g.linear_b(w.get("proj_in.weight"), w.get("proj_in.bias"), patches);
+    let mut x = add_time(g, w, time, x, n, cond);
+    let mut action = None;
+    if let Some(span) = actions {
+        let ad = cfg.action_dim.expect("action width") as i64;
+        let values = g.input(sys::GGML_TYPE_F32, &[ad, span.tokens]);
+        let atime = g.input(sys::GGML_TYPE_F32, &[TIME_FEATURES as i64]);
+        let domain = g.input(sys::GGML_TYPE_I32, &[1]);
+        let xa = domain_linear(g, w, "action_proj_in", domain, ad, d, values);
+        let xa = g.add(xa, w.get("action_modality_embed"));
+        let xa = add_time(g, w, atime, xa, span.tokens, span.cond);
+        x = g.concat(x, xa, 1);
+        action = Some((span, values, atime, domain));
+    }
     for i in 0..cfg.num_hidden_layers {
         let p = format!("layers.{i}");
         let a = format!("{p}.self_attn");
@@ -398,9 +540,9 @@ pub fn build_gen(g: &mut Graph, cfg: &Cosmos3Config, w: &Weights, cache: &Weight
         let q = g.linear(wn("add_q_proj"), h);
         let k = g.linear(wn("add_k_proj"), h);
         let v = g.linear(wn("add_v_proj"), h);
-        let q = g.reshape(q, &[hd, heads, n]);
-        let k = g.reshape(k, &[hd, kvh, n]);
-        let v = g.reshape(v, &[hd, kvh, n]);
+        let q = g.reshape(q, &[hd, heads, total]);
+        let k = g.reshape(k, &[hd, kvh, total]);
+        let v = g.reshape(v, &[hd, kvh, total]);
         let q = rms(g, w, &format!("{a}.norm_added_q.weight"), q, eps);
         let k = rms(g, w, &format!("{a}.norm_added_k.weight"), k, eps);
         let q = g.rotate_half_rope(q, cos3, sin3);
@@ -413,15 +555,25 @@ pub fn build_gen(g: &mut Graph, cfg: &Cosmos3Config, w: &Weights, cache: &Weight
         let o = g.linear(wn("to_add_out"), o);
         x = g.add(x, o);
         let h = rms(g, w, &format!("{p}.post_attention_layernorm_moe_gen.weight"), x, eps);
-        let m = relu2_mlp(g, w, &format!("{p}.mlp_moe_gen"), h);
+        let m = mlp(g, cfg, w, &format!("{p}.mlp_moe_gen"), h);
         x = g.add(x, m);
     }
     let h = rms(g, w, "norm_moe_gen.weight", x, eps);
-    let h = if cond > 0 { g.view_cols(h, cond, n - cond) } else { h };
-    let h = g.cont(h);
-    let out = g.linear_b(w.get("proj_out.weight"), w.get("proj_out.bias"), h);
-    GenIo { patches, time, cos, sin, out }
+    let hv = g.view_cols(h, cond, n - cond);
+    let hv = g.cont(hv);
+    let out = g.linear_b(w.get("proj_out.weight"), w.get("proj_out.bias"), hv);
+    let actions = action.map(|(span, values, time, domain)| {
+        let ad = cfg.action_dim.expect("action width") as i64;
+        let ha = g.view_cols(h, n + span.cond, span.tokens - span.cond);
+        let ha = g.cont(ha);
+        let out = domain_linear(g, w, "action_proj_out", domain, d, ad, ha);
+        ActionIo { values, time, domain, out }
+    });
+    GenIo { patches, time, cos, sin, out, actions }
 }
+
+#[cfg(test)]
+mod parity;
 
 #[cfg(test)]
 mod tests {

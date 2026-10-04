@@ -376,7 +376,7 @@ impl Cosmos3 {
         for ids in if use_cfg { vec![cond_ids, uncond_ids] } else { vec![cond_ids] } {
             let cache = self.text_cache(ids)?;
             let mut g = Graph::new(&self.backend)?;
-            let io = cosmos3::build_gen(&mut g, &self.cfg, &self.tf, &cache, n, cond, self.exact);
+            let io = cosmos3::build_gen(&mut g, &self.cfg, &self.tf, &cache, n, cond, None, self.exact);
             g.finish(&[io.out])?;
             let (cos, sin) = self.cfg.rotary_tables(&self.video_positions(ids.len(), lt, gh, gw, fps));
             passes.push((g, io, cache, cos, sin));
