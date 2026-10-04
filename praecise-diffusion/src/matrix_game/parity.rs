@@ -114,7 +114,7 @@ fn world_dit_parity() {
 
 #[test]
 fn camera_rays_match_reference() {
-    use super::camera::{clip_rays, extrinsic, memory_rays, poses};
+    use super::camera::{clip_rays, extrinsic, memory_rays, poses, select_by_view};
     let dir = root().join("../mg3cam");
     let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
     let u = |v: &Value| usize::try_from(v.as_u64().unwrap()).unwrap();
@@ -138,4 +138,12 @@ fn camera_rays_match_reference() {
     let want = bin(&dir, "mem_rays");
     let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     assert!(err < 1e-4, "memory rays max err {err}");
+    let f = &meta["fov"];
+    let bases: Vec<usize> = f["bases"].as_array().unwrap().iter().map(u).collect();
+    let got = select_by_view(&c2ws, u(&f["start"]), &bases);
+    for ((i, r), (wi, wr)) in got.iter().zip(f["selected"].as_array().unwrap().iter().zip(f["confidence"].as_array().unwrap())) {
+        #[allow(clippy::cast_possible_truncation)]
+        let wr = wr.as_f64().unwrap() as f32;
+        assert!(*i == u(wi) && (r - wr).abs() < 2e-3, "view selection {got:?} vs {f}");
+    }
 }

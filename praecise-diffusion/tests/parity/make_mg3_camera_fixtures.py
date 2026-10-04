@@ -16,7 +16,7 @@ sys.modules["torchvision.transforms"].Lambda = None
 sys.modules.setdefault("utils.conditions", types.ModuleType("utils.conditions")).Bench_actions_universal = None
 sys.modules.setdefault("utils.transform", types.ModuleType("utils.transform")).get_video_transform = None
 from utils.utils import compute_all_poses_from_actions, build_plucker_from_c2ws, build_plucker_from_pose  # noqa: E402
-from utils.cam_utils import get_extrinsics, get_intrinsics, _interpolate_camera_poses_handedness, compute_relative_poses  # noqa: E402
+from utils.cam_utils import get_extrinsics, get_intrinsics, _interpolate_camera_poses_handedness, compute_relative_poses, select_memory_idx_fov  # noqa: E402
 
 out = sys.argv[1]
 os.makedirs(out, exist_ok=True)
@@ -50,10 +50,12 @@ block = ext[a:a + 4]
 pose = _interpolate_camera_poses_handedness(np.linspace(a, a + 3, 4), block[:, :3, :3].numpy(), block[:, :3, 3].numpy(), np.array([a + 3], dtype=np.float32))
 rel = compute_relative_poses(torch.cat([ext[ref_idx:ref_idx + 1], pose.double()], 0), framewise=False)[1:2]
 mrays = build_plucker_from_pose(rel, K, lat_h * s, lat_w * s, lat_h, lat_w)[0]
+fov_start, fov_bases = 17, [28, 20, 12]
+fov_sel, fov_conf = select_memory_idx_fov(ext.float(), fov_start, fov_bases, return_confidence=True, use_gpu=True)
 dump("keyboard", keyboard)
 dump("mouse", mouse)
 dump("poses", torch.from_numpy(poses))
 dump("rays1", rays1)
 dump("rays2", rays2)
 dump("mem_rays", mrays)
-json.dump(dict(frames=frames, lat_h=lat_h, lat_w=lat_w, s=s, clip1=[0, 13, n1], clip2=[9, 21, n2], memory=[mem, ref_idx]), open(os.path.join(out, "meta.json"), "w"))
+json.dump(dict(frames=frames, lat_h=lat_h, lat_w=lat_w, s=s, clip1=[0, 13, n1], clip2=[9, 21, n2], memory=[mem, ref_idx], fov=dict(start=fov_start, bases=fov_bases, selected=[int(i) for i in fov_sel], confidence=[float(c) for c in fov_conf])), open(os.path.join(out, "meta.json"), "w"))

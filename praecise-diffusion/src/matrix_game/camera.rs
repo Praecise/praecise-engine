@@ -318,6 +318,113 @@ pub fn memory_rays(path: &[Mat4], memory_px: usize, reference: usize, lat: (usiz
     plucker(&rel[1..], lat.0, lat.1, s)
 }
 
+/// `n` evenly spaced `f32` values from `a` to `b`, the first half stepped
+/// up from `a` and the second down from `b`.
+fn linspace32(a: f32, b: f32, n: usize) -> Vec<f32> {
+    #[allow(clippy::cast_precision_loss)]
+    let step = (b - a) / (n - 1) as f32;
+    #[allow(clippy::cast_precision_loss)]
+    (0..n).map(|i| if i < n / 2 { a + step * i as f32 } else { b - step * (n - 1 - i) as f32 }).collect()
+}
+
+/// Three-term dot product accumulated with fused multiply-adds.
+fn dot3(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    a[2].mul_add(b[2], a[1].mul_add(b[1], a[0] * b[0]))
+}
+
+/// Memory frames chosen by field of view: for each pixel frame in `bases`,
+/// the earlier frame (from 1 up to `start`, exclusive) whose camera sees the
+/// largest share of a 10x10x10 grid of points sampled through the base
+/// frame's view (depth 0.1 to 30, a 1280x720 image at the fixed field of
+/// view), first on ties, with that share. Before frame 2 every base maps to
+/// frame 0.
+#[must_use]
+pub fn select_by_view(path: &[Mat4], start: usize, bases: &[usize]) -> Vec<(usize, f32)> {
+    if start <= 1 {
+        return vec![(0, 0.0); bases.len()];
+    }
+    let (w, h) = (1280.0f32, 720.0f32);
+    #[allow(clippy::cast_possible_truncation)]
+    let half = (FOV_DEG.to_radians() / 2.0).tan() as f32;
+    let (fx, fy) = (w / (2.0 * half), h / (2.0 * half));
+    let (near, far) = (0.1f32, 30.0f32);
+    let zs = linspace32(near, far, 10);
+    let xs = linspace32(-1.0, 1.0, 10);
+    let mut cam = Vec::with_capacity(1000);
+    for &x in &xs {
+        for &y in &xs {
+            for &z in &zs {
+                cam.push([x * z * (w / (2.0 * fx)), y * z * (h / (2.0 * fy)), z]);
+            }
+        }
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let m32 = |m: &Mat4| -> [[f32; 4]; 4] { m.map(|r| r.map(|v| v as f32)) };
+    let inv: Vec<([[f32; 3]; 3], [f32; 3])> = (1..start)
+        .map(|j| {
+            let e = m32(&path[j]);
+            let rt = [[e[0][0], e[1][0], e[2][0]], [e[0][1], e[1][1], e[2][1]], [e[0][2], e[1][2], e[2][2]]];
+            let t = [e[0][3], e[1][3], e[2][3]];
+            let ti = [0, 1, 2].map(|r| -dot3(&rt[r], &t));
+            (rt, ti)
+        })
+        .collect();
+    bases
+        .iter()
+        .map(|&b| {
+            let e = m32(&path[b]);
+            let world: Vec<[f32; 3]> = cam.iter().map(|p| [0, 1, 2].map(|r| dot3(&[e[r][0], e[r][1], e[r][2]], p) + e[r][3])).collect();
+            let mut best = (0usize, -1.0f32);
+            for (k, (rt, ti)) in inv.iter().enumerate() {
+                let seen = world
+                    .iter()
+                    .filter(|p| {
+                        let q = [0, 1, 2].map(|r| dot3(&rt[r], p) + ti[r]);
+                        let zc = q[2].max(1e-6);
+                        let (u, v) = (q[0] * fx / zc + w / 2.0, q[1] * fy / zc + h / 2.0);
+                        q[2] > near && q[2] < far && (0.0..=w).contains(&u) && (0.0..=h).contains(&v)
+                    })
+                    .count();
+                #[allow(clippy::cast_precision_loss)]
+                let ratio = seen as f32 / cam.len() as f32;
+                if ratio > best.1 {
+                    best = (k + 1, ratio);
+                }
+            }
+            best
+        })
+        .collect()
+}
+
+/// One memory frame of a continuing clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPick {
+    /// Latent frame taken as memory.
+    pub latent: usize,
+    /// Pixel frame it was chosen at (its rays end its four-frame block).
+    pub pixel: usize,
+    /// Pixel frame its rays are taken relative to.
+    pub reference: usize,
+}
+
+/// The `count` memory frames of the clip spanning pixel frames
+/// `start..end`: reference frames every 8 back from `end - 1`, each
+/// matched by field of view among the frames before `start`, the last
+/// slot always the first generated latent frame (pixel frame 4).
+#[must_use]
+pub fn memory_by_view(path: &[Mat4], start: usize, end: usize, count: usize) -> Vec<MemoryPick> {
+    let bases: Vec<usize> = (0..count).map(|k| end - 1 - 8 * k).collect();
+    let mut picked: Vec<usize> = select_by_view(path, start, &bases).into_iter().map(|(i, _)| i).collect();
+    if let Some(last) = picked.last_mut() {
+        *last = 4;
+    }
+    picked
+        .into_iter()
+        .zip(bases)
+        .map(|(pixel, reference)| MemoryPick { latent: if pixel == 0 { 0 } else { (pixel - 1) / 4 + 1 }, pixel, reference })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +439,15 @@ mod tests {
         assert_eq!(dead, [0.0; 5]);
         let diag = next_pose(&[0.0; 5], &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[0.0, 0.0]);
         assert!((diag[0] - 8.73).abs() < 1e-5 && (diag[1] - 8.73).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_still_camera_matches_every_frame_and_pins_the_first_latent() {
+        let path: Vec<Mat4> = (0..40).map(|_| extrinsic(&[0.0; 5])).collect();
+        let picks = memory_by_view(&path, 20, 40, 3);
+        assert_eq!(picks.iter().map(|p| p.reference).collect::<Vec<_>>(), vec![39, 31, 23]);
+        assert_eq!(picks.iter().map(|p| (p.pixel, p.latent)).collect::<Vec<_>>(), vec![(1, 1), (1, 1), (4, 1)]);
+        assert_eq!(memory_by_view(&path, 1, 40, 2)[0], MemoryPick { latent: 0, pixel: 0, reference: 39 });
     }
 
     #[test]
