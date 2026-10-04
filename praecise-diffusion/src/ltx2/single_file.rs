@@ -91,6 +91,44 @@ pub fn component_name(key: &str) -> Option<(Part, String)> {
     None
 }
 
+/// Leading names of the single checkpoint file's sections.
+const SECTIONS: [&str; 5] = ["model.diffusion_model.", "vae.", "audio_vae.", "vocoder.", "text_embedding_projection."];
+
+/// Open a checkpoint as the single file's namespace: either the single file
+/// itself or the same sections split over several files. A GGUF file holds
+/// the diffusion model without its leading `model.diffusion_model.`; a
+/// safetensors file whose names carry no section prefix is the video
+/// autoencoder. Header metadata (the `config` entry) is taken from the first
+/// file that has it, GGUF files first.
+///
+/// # Errors
+/// When a file cannot be opened, a split file mixes sections it cannot be
+/// placed by, or two files hold the same tensor.
+pub fn open_checkpoint(paths: &[std::path::PathBuf]) -> Result<SafeTensors> {
+    let mut parts = Vec::with_capacity(paths.len());
+    for path in paths {
+        let st = SafeTensors::open(std::slice::from_ref(path))?;
+        let gguf = std::fs::File::open(path).and_then(|mut f| {
+            let mut magic = [0u8; 4];
+            std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic == *b"GGUF")
+        })?;
+        let prefixed = st.names().filter(|n| SECTIONS.iter().any(|s| n.starts_with(s))).count();
+        let total = st.names().count();
+        let st = if gguf {
+            st.renamed(|n| Some(format!("model.diffusion_model.{n}")))?
+        } else if prefixed == total {
+            st
+        } else if prefixed == 0 {
+            st.renamed(|n| Some(format!("vae.{n}")))?
+        } else {
+            return Err(Error::Weights(format!("{}: mixes named and unnamed checkpoint sections", path.display())));
+        };
+        parts.push((!gguf, st));
+    }
+    parts.sort_by_key(|p| p.0);
+    SafeTensors::merge(parts.into_iter().map(|p| p.1).collect())
+}
+
 /// Open the single file as one component's tensor namespace.
 ///
 /// # Errors

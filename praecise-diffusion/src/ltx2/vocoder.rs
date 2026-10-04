@@ -16,7 +16,6 @@
 //! convolution is a sum of per-tap matrix products.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -523,8 +522,8 @@ impl Ltx2Vocoder {
     ///
     /// # Errors
     /// On an unsupported layout, missing weights or no usable backend.
-    pub fn load_single_file(path: &Path, opts: LoadOptions) -> Result<Self> {
-        let st = SafeTensors::open(&[path.to_path_buf()])?;
+    pub fn load_single_file(paths: &[std::path::PathBuf], opts: LoadOptions) -> Result<Self> {
+        let st = crate::ltx2::single_file::open_checkpoint(paths)?;
         let header = header_config(&st)?;
         let cfg = VocoderConfig::from_single_file(&header["vocoder"])?;
         let st = open_part(st, Part::Vocoder)?;

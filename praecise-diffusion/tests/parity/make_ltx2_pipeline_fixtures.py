@@ -15,6 +15,7 @@ Usage: python make_ltx2_pipeline_fixtures.py <out dir>
 """
 
 import json
+from types import SimpleNamespace
 import os
 import sys
 
@@ -111,8 +112,9 @@ def prompt_embeds(model, tokens):
     return torch.stack(hs, dim=-1).flatten(2, 3), mask
 
 
-def main():
-    out = sys.argv[1]
+def build(out, scheduler):
+    """The tiny components, the single checkpoint file under `out`, and the
+    reference pipeline over them."""
     os.makedirs(out, exist_ok=True)
     torch.manual_seed(0)
     gemma = text_encoder(out)
@@ -164,13 +166,20 @@ def main():
     sd.update({voc.original_name(k): v.contiguous() for k, v in vocoder.state_dict().items()})
     save_file(sd, os.path.join(out, "single.safetensors"), metadata={"config": json.dumps(HEADER)})
 
+    pipe = LTX2Pipeline(scheduler=scheduler, vae=vae, audio_vae=audio_vae, text_encoder=None, tokenizer=None,
+                        connectors=connectors, transformer=transformer, vocoder=vocoder)
+    pipe._callback_tensor_inputs = pipe._callback_tensor_inputs + ["audio_latents"]
+    return SimpleNamespace(**locals())
+
+
+def main():
+    out = sys.argv[1]
     scheduler = FlowMatchEulerDiscreteScheduler(
         base_image_seq_len=1024, base_shift=0.95, max_image_seq_len=4096, max_shift=2.05, num_train_timesteps=1000,
         shift=1.0, shift_terminal=0.1, time_shift_type="exponential", use_dynamic_shifting=True,
     )
-    pipe = LTX2Pipeline(scheduler=scheduler, vae=vae, audio_vae=audio_vae, text_encoder=None, tokenizer=None,
-                        connectors=connectors, transformer=transformer, vocoder=vocoder)
-    pipe._callback_tensor_inputs = pipe._callback_tensor_inputs + ["audio_latents"]
+    r = build(out, scheduler)
+    pipe, gemma, transformer = r.pipe, r.gemma, r.transformer
 
     lf, lh, lw = (FRAMES - 1) // 8 + 1, HEIGHT // 32, WIDTH // 32
     duration = FRAMES / FPS

@@ -6,11 +6,12 @@
 //! text encoder (Gemma 3) and its tokenizer, which live in a separate
 //! directory as `text_encoder/` and `tokenizer/tokenizer.json`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::audio_vae::Ltx2AudioDecoder;
 use super::connectors::Ltx2Connectors;
+use super::upsampler::Ltx2LatentUpsampler;
 use super::vae::{Ltx2VideoDecoder, Tiling};
 use super::vocoder::Ltx2Vocoder;
 use super::{AvShape, Ltx2Transformer, Pass};
@@ -40,7 +41,26 @@ impl Guidance {
     pub const VIDEO: Self = Self { scale: 3.0, stg: 1.0, modality: 3.0, rescale: 0.7 };
     /// The release's audio defaults.
     pub const AUDIO: Self = Self { scale: 7.0, stg: 1.0, modality: 3.0, rescale: 0.7 };
+    /// No guidance: one conditional pass per step (distilled checkpoints).
+    pub const OFF: Self = Self { scale: 1.0, stg: 0.0, modality: 1.0, rescale: 0.0 };
 }
+
+/// Noise levels of the denoising loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Schedule {
+    /// `steps` levels shifted by the clip's token count (full checkpoints).
+    #[default]
+    Shifted,
+    /// The fixed eight levels distilled checkpoints are trained on; `steps`
+    /// is ignored.
+    Distilled,
+}
+
+/// Noise levels of a distilled checkpoint's first stage.
+pub const DISTILLED_SIGMAS: [f32; 8] = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875];
+/// Noise levels of a distilled checkpoint's refinement stage after latent
+/// upsampling; the upsampled latents are re-noised to the first level.
+pub const DISTILLED_REFINE_SIGMAS: [f32; 3] = [0.909375, 0.725, 0.421875];
 
 /// One audio-video generation.
 #[derive(Debug, Clone)]
@@ -69,6 +89,21 @@ pub struct Ltx2Request {
     pub stg_blocks: Vec<usize>,
     /// Padded prompt length.
     pub max_sequence_length: usize,
+    /// Noise levels of the loop.
+    pub schedule: Schedule,
+    /// Two stages: generate at half the width and height, upsample the
+    /// video latents, re-noise and refine at full size (needs a latent
+    /// upsampler and the distilled schedule).
+    pub upsample: bool,
+}
+
+impl Ltx2Request {
+    /// A request for a distilled checkpoint: the distilled schedule, no
+    /// guidance on either stream, and the two-stage recipe when `upsample`.
+    #[must_use]
+    pub fn distilled(prompt: impl Into<String>, upsample: bool) -> Self {
+        Self { prompt: prompt.into(), schedule: Schedule::Distilled, upsample, video: Guidance::OFF, audio: Guidance::OFF, ..Self::default() }
+    }
 }
 
 impl Default for Ltx2Request {
@@ -86,6 +121,8 @@ impl Default for Ltx2Request {
             audio: Guidance::AUDIO,
             stg_blocks: vec![28],
             max_sequence_length: 1024,
+            schedule: Schedule::Shifted,
+            upsample: false,
         }
     }
 }
@@ -245,6 +282,7 @@ pub struct Ltx2Pipeline {
     video_vae: Ltx2VideoDecoder,
     audio_vae: Ltx2AudioDecoder,
     vocoder: Ltx2Vocoder,
+    upsampler: Option<Ltx2LatentUpsampler>,
 }
 
 impl std::fmt::Debug for Ltx2Pipeline {
@@ -254,59 +292,89 @@ impl std::fmt::Debug for Ltx2Pipeline {
 }
 
 impl Ltx2Pipeline {
-    /// Load the single checkpoint file `checkpoint` and the text encoder
-    /// (`text_encoder/`, and `tokenizer/tokenizer.json` when present) under
-    /// `text`.
+    /// Load the checkpoint `files` and the text encoder (`text_encoder/`,
+    /// and `tokenizer/tokenizer.json` when present) under `text`. The
+    /// checkpoint is the single file or its sections split over several
+    /// files (see [`open_checkpoint`](super::single_file::open_checkpoint)); a latent upsampler file among them is
+    /// loaded as the upsampler.
     ///
     /// # Errors
     /// On an unsupported configuration, missing weights, an unreadable
     /// tokenizer or no usable backend.
-    pub fn load(checkpoint: &Path, text: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
+    pub fn load(files: &[PathBuf], text: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
         let tok_path = text.root.join("tokenizer/tokenizer.json");
         let tokenizer = if tok_path.exists() {
             Some(tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| Error::Tokenizer(format!("{}: {e}", tok_path.display())))?)
         } else {
             None
         };
+        let mut checkpoint = Vec::new();
+        let mut upsampler = None;
+        for f in files {
+            let st = crate::safetensors::SafeTensors::open(std::slice::from_ref(f))?;
+            if Ltx2LatentUpsampler::recognises(&st) {
+                if upsampler.is_some() {
+                    return Err(Error::Weights("more than one latent upsampler file".into()));
+                }
+                upsampler = Some(Ltx2LatentUpsampler::from_files(&st, opts)?);
+            } else {
+                checkpoint.push(f.clone());
+            }
+        }
         // The audio path runs in f32 at every precision: the vocoder's
         // second stage re-analyses its own output through a log-mel, which
         // amplifies reduced-precision mel error into the waveform.
         let audio_opts = LoadOptions { precision: Precision::F32, ..opts };
+        let c = &checkpoint;
         Ok(Self {
             tokenizer,
             text: Gemma3Encoder::load(text, "text_encoder", opts)?,
-            connectors: Ltx2Connectors::load_single_file(checkpoint, opts)?,
-            transformer: Ltx2Transformer::load_single_file(checkpoint, opts)?,
-            video_vae: Ltx2VideoDecoder::load_single_file(checkpoint, opts)?,
-            audio_vae: Ltx2AudioDecoder::load_single_file(checkpoint, audio_opts)?,
-            vocoder: Ltx2Vocoder::load_single_file(checkpoint, audio_opts)?,
+            connectors: Ltx2Connectors::load_single_file(c, opts)?,
+            transformer: Ltx2Transformer::load_single_file(c, opts)?,
+            video_vae: Ltx2VideoDecoder::load_single_file(c, opts)?,
+            audio_vae: Ltx2AudioDecoder::load_single_file(c, audio_opts)?,
+            vocoder: Ltx2Vocoder::load_single_file(c, audio_opts)?,
+            upsampler,
         })
     }
 
-    /// Load from two directories: `checkpoint_root` holds the single
-    /// checkpoint file (its only `.safetensors` file), `text_root` holds
-    /// `text_encoder/` and `tokenizer/tokenizer.json`. The two may be the
-    /// same directory.
+    /// Load from directories: every `.safetensors` and `.gguf` file under
+    /// `checkpoint_roots` (searched recursively, skipping `text_encoder/`
+    /// and `tokenizer/` directories) is a checkpoint file; `text_root` holds
+    /// `text_encoder/` and `tokenizer/tokenizer.json` and may be one of the
+    /// checkpoint roots.
     ///
     /// # Errors
-    /// As [`Self::load`], or when `checkpoint_root` holds no or several
-    /// checkpoint files.
-    pub fn load_dir(checkpoint_root: &Path, text_root: &Path, opts: LoadOptions) -> Result<Self> {
-        let mut found: Vec<_> = std::fs::read_dir(checkpoint_root)
-            .map_err(|e| Error::Weights(format!("{}: {e}", checkpoint_root.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        if found.len() != 1 {
-            return Err(Error::Weights(format!("{}: expected one checkpoint file, found {}", checkpoint_root.display(), found.len())));
+    /// As [`Self::load`], or when no checkpoint file is found.
+    pub fn load_dir(checkpoint_roots: &[PathBuf], text_root: &Path, opts: LoadOptions) -> Result<Self> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+            for e in std::fs::read_dir(dir).map_err(|e| Error::Weights(format!("{}: {e}", dir.display())))? {
+                let p = e?.path();
+                if p.is_dir() {
+                    if !p.file_name().is_some_and(|n| n == "text_encoder" || n == "tokenizer") {
+                        walk(&p, out)?;
+                    }
+                } else if p.extension().is_some_and(|x| x == "safetensors" || x == "gguf") {
+                    out.push(p);
+                }
+            }
+            Ok(())
         }
-        Self::load(&found.remove(0), &CheckpointFiles::new(text_root), opts)
+        let mut found = Vec::new();
+        for r in checkpoint_roots {
+            walk(r, &mut found)?;
+        }
+        found.sort();
+        if found.is_empty() {
+            return Err(Error::Weights("no checkpoint file under the checkpoint directories".into()));
+        }
+        Self::load(&found, &CheckpointFiles::new(text_root), opts)
     }
 
     /// Device bytes held by every component.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        self.text.bytes() + self.connectors.bytes() + self.transformer.bytes() + self.video_vae.bytes() + self.audio_vae.bytes() + self.vocoder.bytes()
+        self.text.bytes() + self.connectors.bytes() + self.transformer.bytes() + self.video_vae.bytes() + self.audio_vae.bytes() + self.vocoder.bytes() + self.upsampler.as_ref().map_or(0, Ltx2LatentUpsampler::bytes)
     }
 
     /// Name of the compute device.
@@ -346,8 +414,16 @@ impl Ltx2Pipeline {
         if req.num_frames == 0 || (req.num_frames - 1) % t != 0 {
             return Err(Error::Request(format!("frames must be one more than a multiple of {t}")));
         }
-        if req.steps < 2 || !(req.fps > 0.0) {
+        if (req.schedule == Schedule::Shifted && req.steps < 2) || !(req.fps > 0.0) {
             return Err(Error::Request("at least two steps and a positive frame rate are required".into()));
+        }
+        if req.upsample {
+            if req.schedule != Schedule::Distilled || self.upsampler.is_none() {
+                return Err(Error::Request("two-stage generation needs the distilled schedule and a latent upsampler".into()));
+            }
+            if req.width % (2 * sp) != 0 || req.height % (2 * sp) != 0 {
+                return Err(Error::Request(format!("two-stage width and height must be multiples of {}", 2 * sp)));
+            }
         }
         let audio = audio_frames(req.num_frames, req.fps, cfg.audio_sampling_rate, cfg.audio_hop_length, cfg.audio_scale_factor);
         if audio == 0 {
@@ -357,19 +433,21 @@ impl Ltx2Pipeline {
         Ok((s, (cfg.in_channels as usize) * s.frames * s.height * s.width))
     }
 
-    /// Generate a clip and its soundtrack.
-    ///
-    /// # Errors
-    /// On a request the model cannot serve, a missing tokenizer, or a
-    /// backend failure.
-    pub fn generate(&self, req: &Ltx2Request) -> Result<Ltx2Output> {
-        let started = Instant::now();
-        let pos = self.tokens(&req.prompt, req.max_sequence_length)?;
-        let neg = self.tokens(&req.negative_prompt, req.max_sequence_length)?;
-        let (s, n_video) = self.check(req)?;
+    /// The first stage's request: half the width and height for two-stage
+    /// generation, else the request itself.
+    fn first_stage(req: &Ltx2Request) -> Ltx2Request {
+        if req.upsample {
+            Ltx2Request { width: req.width / 2, height: req.height / 2, upsample: false, ..req.clone() }
+        } else {
+            req.clone()
+        }
+    }
+
+    /// Packed noise of both streams for shape `s` from `seed`.
+    fn noise(&self, seed: u64, s: AvShape, n_video: usize) -> (Vec<f32>, Vec<f32>) {
         let cfg = self.transformer.config();
         let n_audio = s.audio_frames * cfg.audio_in_channels as usize;
-        let noise = gaussian(req.seed, n_video + n_audio);
+        let noise = gaussian(seed, n_video + n_audio);
         let video = transpose(&noise[..n_video], cfg.in_channels as usize, n_video / cfg.in_channels as usize);
         // Audio noise is drawn `[channels][frames][mel]`; packing puts every
         // frame's channels and mel bins together.
@@ -383,36 +461,94 @@ impl Ltx2Pipeline {
                 }
             }
         }
-        let mut out = self.generate_from(&pos, &neg, video, audio, req)?;
+        (video, audio)
+    }
+
+    /// Generate a clip and its soundtrack.
+    ///
+    /// # Errors
+    /// On a request the model cannot serve, a missing tokenizer, or a
+    /// backend failure.
+    pub fn generate(&self, req: &Ltx2Request) -> Result<Ltx2Output> {
+        let started = Instant::now();
+        let pos = self.tokens(&req.prompt, req.max_sequence_length)?;
+        let neg = self.tokens(&req.negative_prompt, req.max_sequence_length)?;
+        let (full, n_full) = self.check(req)?;
+        let (s, n_video) = self.check(&Self::first_stage(req))?;
+        let (video, audio) = self.noise(req.seed, s, n_video);
+        let refine = req.upsample.then(|| self.noise(req.seed.wrapping_add(1), full, n_full));
+        let mut out = self.generate_from(&pos, &neg, video, audio, refine, req)?;
         out.video.seed = req.seed;
         out.audio.seed = req.seed;
         tracing::debug!(ms = started.elapsed().as_millis() as u64, "audio-video generation done");
         Ok(out)
     }
 
-    /// The final packed latents of both streams for given prompt tokens and
-    /// packed starting noise.
-    pub(crate) fn latents_from(&self, pos: &[u32], neg: &[u32], video: Vec<f32>, audio: Vec<f32>, req: &Ltx2Request) -> Result<(Latents, AvShape, Timings)> {
-        let (s, n_video) = self.check(req)?;
+    /// The final packed latents of both streams for given prompt tokens,
+    /// packed starting noise of the first stage and, for two-stage
+    /// generation, the packed noise the upsampled latents are mixed with.
+    pub(crate) fn latents_from(&self, pos: &[u32], neg: &[u32], video: Vec<f32>, audio: Vec<f32>, refine: Option<(Vec<f32>, Vec<f32>)>, req: &Ltx2Request) -> Result<(Latents, AvShape, Timings)> {
+        let first = Self::first_stage(req);
+        let (s1, n1) = self.check(&first)?;
+        let (s2, n2) = self.check(req)?;
         let cfg = self.transformer.config();
-        if video.len() != n_video || audio.len() != s.audio_frames * cfg.audio_in_channels as usize {
+        let c = cfg.in_channels as usize;
+        let n_audio = s1.audio_frames * cfg.audio_in_channels as usize;
+        if video.len() != n1 || audio.len() != n_audio {
             return Err(Error::Request("starting noise disagrees with the request".into()));
         }
         let mut timings = Timings::default();
         let t0 = Instant::now();
         let p = self.encode(pos, req.max_sequence_length)?;
-        let n = self.encode(neg, req.max_sequence_length)?;
+        // Without classifier-free guidance the negative prompt is never read.
+        let n = if req.video.scale > 1.0 || req.audio.scale > 1.0 { self.encode(neg, req.max_sequence_length)? } else { p.clone() };
         timings.encode_ms = t0.elapsed().as_millis() as u64;
         let t0 = Instant::now();
-        let sig = sigmas(req.steps, s.frames * s.height * s.width);
-        let lat = denoise(&self.transformer, video, audio, &p, &n, s, &sig, req)?;
+        let sig = match req.schedule {
+            Schedule::Shifted => sigmas(req.steps, s1.frames * s1.height * s1.width),
+            Schedule::Distilled => DISTILLED_SIGMAS.iter().copied().chain([0.0]).collect(),
+        };
+        let mut lat = denoise(&self.transformer, video, audio, &p, &n, s1, &sig, &first)?;
+        if !req.upsample {
+            timings.denoise_ms = t0.elapsed().as_millis() as u64;
+            return Ok((lat, s1, timings));
+        }
+        let (nv, na) = refine.ok_or_else(|| Error::Request("two-stage generation needs refinement noise".into()))?;
+        if nv.len() != n2 || na.len() != n_audio {
+            return Err(Error::Request("refinement noise disagrees with the request".into()));
+        }
+        let up = self.upsampler.as_ref().ok_or_else(|| Error::Request("no latent upsampler loaded".into()))?;
+        // The upsampler works on decoder-space latents.
+        let (mean, std) = self.video_vae.latent_stats();
+        let tokens1 = s1.frames * s1.height * s1.width;
+        let mut z = transpose(&lat.video, tokens1, c);
+        for (ch, plane) in z.chunks_exact_mut(tokens1).enumerate() {
+            for v in plane {
+                *v = *v * std[ch] + mean[ch];
+            }
+        }
+        let mut z = up.upsample(&z, s1.frames, s1.height, s1.width)?;
+        let tokens2 = n2 / c;
+        for (ch, plane) in z.chunks_exact_mut(tokens2).enumerate() {
+            for v in plane {
+                *v = (*v - mean[ch]) / std[ch];
+            }
+        }
+        let video = transpose(&z, c, tokens2);
+        let level = DISTILLED_REFINE_SIGMAS[0];
+        let mix = |x: &[f32], noise: &[f32]| -> Vec<f32> { x.iter().zip(noise).map(|(x, e)| level * e + (1.0 - level) * x).collect() };
+        let (video, audio) = (mix(&video, &nv), mix(&lat.audio, &na));
+        let sig: Vec<f32> = DISTILLED_REFINE_SIGMAS.iter().copied().chain([0.0]).collect();
+        let first_evaluations = lat.evaluations;
+        lat = denoise(&self.transformer, video, audio, &p, &n, s2, &sig, req)?;
+        lat.evaluations += first_evaluations;
         timings.denoise_ms = t0.elapsed().as_millis() as u64;
-        Ok((lat, s, timings))
+        Ok((lat, s2, timings))
     }
 
     /// Generate from prompt tokens and packed starting noise.
-    pub(crate) fn generate_from(&self, pos: &[u32], neg: &[u32], video: Vec<f32>, audio: Vec<f32>, req: &Ltx2Request) -> Result<Ltx2Output> {
-        let (lat, s, mut timings) = self.latents_from(pos, neg, video, audio, req)?;
+    pub(crate) fn generate_from(&self, pos: &[u32], neg: &[u32], video: Vec<f32>, audio: Vec<f32>, refine: Option<(Vec<f32>, Vec<f32>)>, req: &Ltx2Request) -> Result<Ltx2Output> {
+        let (lat, s, mut timings) = self.latents_from(pos, neg, video, audio, refine, req)?;
         let t0 = Instant::now();
         let (frames, wave) = self.decode(&lat, s)?;
         timings.decode_ms = t0.elapsed().as_millis() as u64;

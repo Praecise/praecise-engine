@@ -59,7 +59,7 @@ fn run_from(precision: Precision, single_file: bool, min_cos: f64, max_rel: f64)
     let threads = std::thread::available_parallelism().map_or(8, usize::from);
     let opts = LoadOptions { precision, cpu_threads: threads, device: None };
     let tf = if single_file {
-        Ltx2Transformer::load_single_file(&dir().join("single.safetensors"), opts).unwrap()
+        Ltx2Transformer::load_single_file(&[dir().join("single.safetensors")], opts).unwrap()
     } else {
         Ltx2Transformer::load(&CheckpointFiles::new(dir().join("checkpoint")), opts).unwrap()
     };
@@ -103,7 +103,7 @@ fn connectors_run(precision: Precision, single_file: bool, min_cos: f64, max_rel
     let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
     let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
     let c = if single_file {
-        connectors::Ltx2Connectors::load_single_file(&d.join("single.safetensors"), opts).unwrap()
+        connectors::Ltx2Connectors::load_single_file(&[d.join("single.safetensors")], opts).unwrap()
     } else {
         connectors::Ltx2Connectors::load(&CheckpointFiles::new(d.join("checkpoint")), opts).unwrap()
     };
@@ -139,7 +139,7 @@ fn video_decoder_run(precision: Precision, min_cos: f64, max_rel: f64) {
     let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
     let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
     let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
-    let dec = vae::Ltx2VideoDecoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let dec = vae::Ltx2VideoDecoder::load_single_file(&[d.join("single.safetensors")], opts).unwrap();
     let u = |k: &str| m[k].as_u64().unwrap() as usize;
     let frames = u("frames");
     assert_eq!(dec.config().video_frames(frames) as u64, m["out_shape"][1].as_u64().unwrap());
@@ -159,7 +159,7 @@ fn video_decoder_tiled_run(precision: Precision, min_cos: f64, max_rel: f64) {
     let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
     let m = &m["tiled"];
     let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
-    let dec = vae::Ltx2VideoDecoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let dec = vae::Ltx2VideoDecoder::load_single_file(&[d.join("single.safetensors")], opts).unwrap();
     let u = |k: &str| m[k].as_u64().unwrap() as usize;
     let tiling = vae::Tiling {
         spatial: Some(vae::Tile { min: u("min_px"), stride: u("stride_px") }),
@@ -188,7 +188,7 @@ fn audio_decoder_run(precision: Precision, min_cos: f64, max_rel: f64) {
     let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
     let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
     let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
-    let dec = audio_vae::Ltx2AudioDecoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let dec = audio_vae::Ltx2AudioDecoder::load_single_file(&[d.join("single.safetensors")], opts).unwrap();
     let frames = m["frames"].as_u64().unwrap() as usize;
     assert_eq!(dec.config().spectrogram_frames(frames) as u64, m["out_shape"][1].as_u64().unwrap());
     let mel = dec.decode(&read("packed"), frames).unwrap();
@@ -212,7 +212,7 @@ fn vocoder_run(precision: Precision, min_cos: f64, max_rel: f64) {
     let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
     let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
     let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
-    let voc = vocoder::Ltx2Vocoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let voc = vocoder::Ltx2Vocoder::load_single_file(&[d.join("single.safetensors")], opts).unwrap();
     let frames = m["frames"].as_u64().unwrap() as usize;
     assert_eq!(voc.config().samples(frames) as u64, m["out_shape"][1].as_u64().unwrap());
     let wave = voc.synthesize(&read("mel"), frames).unwrap();
@@ -293,7 +293,7 @@ fn pipeline_run(precision: Precision, latents: (f64, f64), frames: (f64, f64), w
     let list = |k: &str| -> Vec<usize> { m[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect() };
     let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
     // The fixture root holds `single.safetensors` as its only checkpoint file.
-    let p = pipeline::Ltx2Pipeline::load_dir(&d, &d.join("text"), opts).unwrap();
+    let p = pipeline::Ltx2Pipeline::load_dir(&[d.clone()], &d.join("text"), opts).unwrap();
     let req = pipeline::Ltx2Request {
         width: u("width"),
         height: u("height"),
@@ -315,7 +315,7 @@ fn pipeline_run(precision: Precision, latents: (f64, f64), frames: (f64, f64), w
         assert!((a - b).abs() < 1e-6, "schedule {sig:?} vs {want:?}");
     }
     let to_u32 = |k: &str| -> Vec<u32> { list(k).into_iter().map(|v| v as u32).collect() };
-    let (out, s, _) = p.latents_from(&to_u32("positive"), &to_u32("negative"), video, audio, &req).unwrap();
+    let (out, s, _) = p.latents_from(&to_u32("positive"), &to_u32("negative"), video, audio, None, &req).unwrap();
     assert_eq!(s.audio_frames, af);
     assert_close("final video latents", &out.video, &read("final_video"), latents.0, latents.1);
     assert_close("final audio latents", &out.audio, &read("final_audio"), latents.0, latents.1);
@@ -364,3 +364,69 @@ fn ltx2_parity_pipeline_bf16() {
     pipeline_run(Precision::Bf16, (0.999_99, 1e-2), (0.999_99, 5e-2), WaveCheck::Spectral(0.03, 0.05));
 }
 
+
+fn distilled_dir() -> (PathBuf, Value) {
+    let d = PathBuf::from(std::env::var("PRAECISE_LTX2_DISTILLED_PARITY").expect("PRAECISE_LTX2_DISTILLED_PARITY names the fixture dir"));
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    (d, m)
+}
+
+fn read_bin(d: &std::path::Path, name: &str) -> Vec<f32> {
+    std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_latent_upsampler_f32() {
+    let (d, m) = distilled_dir();
+    let opts = LoadOptions { precision: Precision::F32, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
+    let up = super::upsampler::Ltx2LatentUpsampler::load(&d.join("ckpt/upsampler.safetensors"), opts).unwrap();
+    let l: Vec<usize> = m["latent1"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let out = up.upsample(&read_bin(&d, "up_in"), l[0], l[1], l[2]).unwrap();
+    assert_close("upsampled latents", &out, &read_bin(&d, "up_out"), 0.999_999, 1e-4);
+}
+
+/// The two-stage distilled recipe over the split checkpoint whose block
+/// weights are partly K-quantised. The backend multiplies K-quantised
+/// weights with activations rounded to 8 bits, so agreement is not exact
+/// (measured: cosine 0.999998, largest relative error 2.3e-3 in f32 and
+/// 2.0e-3 in bf16; the audio stream agrees to 5e-4).
+fn distilled_run(precision: Precision, cos: f64, rel: f64) {
+    let (d, m) = distilled_dir();
+    let u = |k: &str| m[k].as_u64().unwrap() as usize;
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
+    let p = pipeline::Ltx2Pipeline::load_dir(&[d.join("ckpt")], &d.join("text"), opts).unwrap();
+    let req = pipeline::Ltx2Request {
+        width: u("width"),
+        height: u("height"),
+        num_frames: u("frames"),
+        fps: m["fps"].as_f64().unwrap() as f32,
+        max_sequence_length: u("seq_len"),
+        ..pipeline::Ltx2Request::distilled("", true)
+    };
+    let want: Vec<f32> = m["sigmas1"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    let ours: Vec<f32> = pipeline::DISTILLED_SIGMAS.iter().copied().chain([0.0]).collect();
+    assert_eq!(ours, want);
+    let want: Vec<f32> = m["sigmas2"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    let ours: Vec<f32> = pipeline::DISTILLED_REFINE_SIGMAS.iter().copied().chain([0.0]).collect();
+    assert_eq!(ours, want);
+    let pos: Vec<u32> = m["positive"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let refine = Some((read_bin(&d, "refine_video_noise"), read_bin(&d, "refine_audio_noise")));
+    let (out, s, _) = p.latents_from(&pos, &pos, read_bin(&d, "video_start"), read_bin(&d, "audio_start"), refine, &req).unwrap();
+    assert_eq!(out.evaluations, 8 + 3);
+    assert_eq!(s.audio_frames, u("audio_frames"));
+    assert_close("final video latents", &out.video, &read_bin(&d, "final_video"), cos, rel);
+    assert_close("final audio latents", &out.audio, &read_bin(&d, "final_audio"), cos, rel);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_distilled_two_stage_f32() {
+    distilled_run(Precision::F32, 0.999_99, 5e-3);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_distilled_two_stage_bf16() {
+    distilled_run(Precision::Bf16, 0.999_99, 5e-3);
+}

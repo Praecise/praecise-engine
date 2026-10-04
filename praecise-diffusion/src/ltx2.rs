@@ -31,6 +31,7 @@ pub mod audio_vae;
 pub mod connectors;
 pub mod pipeline;
 pub mod single_file;
+pub mod upsampler;
 pub mod vae;
 pub mod vocoder;
 
@@ -761,8 +762,8 @@ impl Ltx2Transformer {
     ///
     /// # Errors
     /// As [`Self::load`].
-    pub fn load_single_file(path: &std::path::Path, opts: LoadOptions) -> Result<Self> {
-        let st = SafeTensors::open(&[path.to_path_buf()])?;
+    pub fn load_single_file(paths: &[std::path::PathBuf], opts: LoadOptions) -> Result<Self> {
+        let st = crate::ltx2::single_file::open_checkpoint(paths)?;
         let header = single_file::header_config(&st)?;
         let key = "model.diffusion_model.audio_patchify_proj.weight";
         let audio_in = st.get(key).and_then(|v| v.shape.get(1).copied()).ok_or_else(|| Error::MissingTensor(key.into()))?;

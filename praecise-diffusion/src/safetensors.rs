@@ -221,6 +221,31 @@ impl SafeTensors {
         Ok(self)
     }
 
+    /// One namespace over several opened sets. Tensor names must be unique
+    /// across them; a metadata key keeps the value of the first set that has
+    /// it.
+    ///
+    /// # Errors
+    /// When a name appears in more than one set.
+    pub fn merge(parts: Vec<Self>) -> Result<Self> {
+        let mut out = Self { maps: Vec::new(), entries: HashMap::new(), metadata: HashMap::new() };
+        for part in parts {
+            let base = out.maps.len();
+            for (name, mut entry) in part.entries {
+                entry.file += base;
+                if out.entries.contains_key(&name) {
+                    return Err(Error::Weights(format!("tensor {name} appears in more than one file")));
+                }
+                out.entries.insert(name, entry);
+            }
+            for (k, v) in part.metadata {
+                out.metadata.entry(k).or_insert(v);
+            }
+            out.maps.extend(part.maps);
+        }
+        Ok(out)
+    }
+
     /// Look up a tensor by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<TensorView<'_>> {

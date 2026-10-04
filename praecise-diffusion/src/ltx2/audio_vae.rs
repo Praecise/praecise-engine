@@ -11,7 +11,6 @@
 //!
 //! Activations are laid out `[mel, time, C]`.
 
-use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -248,8 +247,8 @@ impl Ltx2AudioDecoder {
     ///
     /// # Errors
     /// On an unsupported layout, missing weights or no usable backend.
-    pub fn load_single_file(path: &Path, opts: LoadOptions) -> Result<Self> {
-        let st = SafeTensors::open(&[path.to_path_buf()])?;
+    pub fn load_single_file(paths: &[std::path::PathBuf], opts: LoadOptions) -> Result<Self> {
+        let st = crate::ltx2::single_file::open_checkpoint(paths)?;
         let header = header_config(&st)?;
         let cfg = AudioVaeConfig::from_single_file(&header["audio_vae"])?;
         let st = open_part(st, Part::AudioVae)?;

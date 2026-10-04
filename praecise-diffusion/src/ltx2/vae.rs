@@ -13,7 +13,6 @@
 //! latent frames decode to `8 (T - 1) + 1` video frames. The last convolution
 //! emits `3 x p x p` channels that unfold into `p x p` pixel patches.
 
-use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -276,32 +275,36 @@ impl Net<'_, '_> {
         self.g.add(h, x)
     }
 
-    /// `[W, H, C t s s, T]` to `[W s, H s, C, T t - (t - 1)]`; the channel
-    /// index is `((c t + it) s + ih) s + iw`.
     fn depth_to_space(&mut self, x: Tn, t: i64, s: i64) -> Tn {
-        let (w, h, c, f) = (x.ne(0), x.ne(1), x.ne(2), x.ne(3));
-        let mut x = x;
-        if s > 1 {
-            let r = c / s * f;
-            let a = self.g.reshape(x, &[w, h, s, r]);
-            let a = self.g.permute(a, [1, 2, 0, 3]);
-            let a = self.g.cont(a);
-            let a = self.g.reshape(a, &[s * w, h, s, r / s]);
-            let a = self.g.permute(a, [0, 2, 1, 3]);
-            let a = self.g.cont(a);
-            x = self.g.reshape(a, &[s * w, s * h, c / (s * s), f]);
-        }
-        if t > 1 {
-            let (w, h, c) = (x.ne(0), x.ne(1), x.ne(2));
-            let a = self.g.reshape(x, &[w * h, t, c / t, f]);
-            let a = self.g.permute(a, [0, 2, 1, 3]);
-            let a = self.g.cont(a);
-            let a = self.g.reshape(a, &[w, h, c / t, t * f]);
-            let v = self.g.view_4d(a, [w, h, c / t, t * f - (t - 1)], a.nb(1), a.nb(2), a.nb(3), (t - 1) as usize * a.nb(3));
-            x = self.g.cont(v);
-        }
-        x
+        depth_to_space(self.g, x, t, s)
     }
+}
+
+/// `[W, H, C t s s, T]` to `[W s, H s, C, T t - (t - 1)]`; the channel
+/// index is `((c t + it) s + ih) s + iw`.
+pub(super) fn depth_to_space(g: &mut Graph, x: Tn, t: i64, s: i64) -> Tn {
+    let (w, h, c, f) = (x.ne(0), x.ne(1), x.ne(2), x.ne(3));
+    let mut x = x;
+    if s > 1 {
+        let r = c / s * f;
+        let a = g.reshape(x, &[w, h, s, r]);
+        let a = g.permute(a, [1, 2, 0, 3]);
+        let a = g.cont(a);
+        let a = g.reshape(a, &[s * w, h, s, r / s]);
+        let a = g.permute(a, [0, 2, 1, 3]);
+        let a = g.cont(a);
+        x = g.reshape(a, &[s * w, s * h, c / (s * s), f]);
+    }
+    if t > 1 {
+        let (w, h, c) = (x.ne(0), x.ne(1), x.ne(2));
+        let a = g.reshape(x, &[w * h, t, c / t, f]);
+        let a = g.permute(a, [0, 2, 1, 3]);
+        let a = g.cont(a);
+        let a = g.reshape(a, &[w, h, c / t, t * f]);
+        let v = g.view_4d(a, [w, h, c / t, t * f - (t - 1)], a.nb(1), a.nb(2), a.nb(3), (t - 1) as usize * a.nb(3));
+        x = g.cont(v);
+    }
+    x
 }
 
 fn build(g: &mut Graph, cfg: &VideoVaeConfig, w: &Weights, latent: Tn) -> Tn {
@@ -349,8 +352,8 @@ impl Ltx2VideoDecoder {
     ///
     /// # Errors
     /// On an unsupported layout, missing weights or no usable backend.
-    pub fn load_single_file(path: &Path, opts: LoadOptions) -> Result<Self> {
-        let st = SafeTensors::open(&[path.to_path_buf()])?;
+    pub fn load_single_file(paths: &[std::path::PathBuf], opts: LoadOptions) -> Result<Self> {
+        let st = crate::ltx2::single_file::open_checkpoint(paths)?;
         let header = header_config(&st)?;
         let cfg = VideoVaeConfig::from_single_file(&header["vae"])?;
         let st = open_part(st, Part::VideoVae)?;
@@ -361,6 +364,11 @@ impl Ltx2VideoDecoder {
         let mean = st.require("latents_mean", &[c])?.to_f32();
         let std = st.require("latents_std", &[c])?.to_f32();
         Ok(Self { backend, cfg, w, mean, std })
+    }
+
+    /// Per-channel latent mean and spread the decoder undoes first.
+    pub(crate) fn latent_stats(&self) -> (&[f32], &[f32]) {
+        (&self.mean, &self.std)
     }
 
     /// The decoder configuration.
