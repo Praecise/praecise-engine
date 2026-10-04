@@ -119,6 +119,43 @@ impl UniPcConfig {
     }
 }
 
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+
+    #[test]
+    fn default_flow_sigmas_match_the_scheduler() {
+        let (s, t) = flow_sigmas_schedule(3, 5.0, 1000);
+        assert_eq!(t, vec![999, 909, 714]);
+        assert!((s[0] - 0.999_999).abs() < 1e-6 && (s[1] - 0.909_2).abs() < 1e-4 && (s[2] - 0.714_9).abs() < 1e-4);
+        assert_eq!(s[3], 0.0);
+    }
+}
+
+/// The scheduler's own flow noise levels: `steps` levels linearly spaced
+/// from 1 towards `1 / num_train_timesteps` (endpoint excluded), each mapped
+/// through the rational shift, the first nudged just below 1 so its log-SNR
+/// stays finite; plus the final zero in single precision, and the integer
+/// timesteps the model is told (`level * num_train_timesteps`, truncated).
+#[must_use]
+pub fn flow_sigmas_schedule(steps: usize, shift: f64, num_train_timesteps: u64) -> (Vec<f32>, Vec<i64>) {
+    let n = num_train_timesteps as f64;
+    let end = 1.0 / n;
+    let mut sigmas = Vec::with_capacity(steps + 1);
+    let mut timesteps = Vec::with_capacity(steps);
+    for i in 0..steps {
+        let s = 1.0 + i as f64 * ((end - 1.0) / steps as f64);
+        let mut s = shift * s / (1.0 + (shift - 1.0) * s);
+        if i == 0 && (s - 1.0).abs() < 1e-6 {
+            s -= 1e-6;
+        }
+        timesteps.push((s * n) as i64);
+        sigmas.push(s as f32);
+    }
+    sigmas.push(0.0);
+    (sigmas, timesteps)
+}
+
 /// Linearly spaced flow noise levels from `1 - 1/num_train_timesteps` down
 /// to zero, each mapped through the rational shift `shift * s / (1 + (shift - 1) * s)`:
 /// the `steps` noise levels plus the final zero in single precision, and the

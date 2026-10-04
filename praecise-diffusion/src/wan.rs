@@ -17,7 +17,8 @@
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::ggml::{Graph, HostTensor, Tn, WType, WeightSpec, Weights};
+use crate::ggml::{Backend, Graph, HostTensor, Tn, WType, WeightSpec, Weights};
+use crate::pipeline::RgbImage;
 use crate::safetensors::SafeTensors;
 use llama_cpp_sys_2 as sys;
 
@@ -633,6 +634,101 @@ pub fn build_encoder(g: &mut Graph, cfg: &WanVaeConfig, w: &Weights, cache: &Wei
     let mean = n.g.view_4d(x, [x.ne(0), x.ne(1), z, 1], x.nb(1), x.nb(2), x.nb(3), 0);
     let mean = n.g.cont(mean);
     EncodeIo { pixels, mean }
+}
+
+/// Encode `1 + 4k` frames of one size to normalised latents
+/// `[z][1 + k][H/16][W/16]`: the first frame alone, then four at a time
+/// through the encoder's frame caches.
+///
+/// # Errors
+/// An empty clip, a frame count not `1 + 4k`, or backend failures.
+pub fn encode_frames(backend: &Backend, cfg: &WanVaeConfig, vae: &Weights, frames: &[RgbImage]) -> Result<Vec<f32>> {
+    let Some(head) = frames.first() else {
+        return Err(Error::Request("no frames to encode".into()));
+    };
+    if (frames.len() - 1) % 4 != 0 {
+        return Err(Error::Request(format!("{} frames to encode; the encoder takes 1 + 4k", frames.len())));
+    }
+    let (w, h) = (head.width as usize, head.height as usize);
+    let patched = |img: &RgbImage| {
+        let mut px = vec![0f32; 3 * w * h];
+        for (i, p) in img.rgb.chunks_exact(3).enumerate() {
+            for c in 0..3 {
+                px[c * w * h + i] = f32::from(p[c]) / 127.5 - 1.0;
+            }
+        }
+        patchify(&px, w, h)
+    };
+    let cache = Weights::zeros(&backend, &cfg.encoder_cache_specs(w as i64, h as i64))?;
+    let lt = 1 + (frames.len() - 1) / 4;
+    let mut graphs: Vec<(Graph, EncodeIo)> = Vec::new();
+    for first in [true, false].into_iter().take(lt.min(2)) {
+        let mut g = Graph::new(&backend)?;
+        let io = build_encoder(&mut g, cfg, vae, &cache, w as i64, h as i64, first);
+        g.finish(&[io.mean])?;
+        graphs.push((g, io));
+    }
+    let mut per_frame: Vec<Vec<f32>> = Vec::with_capacity(lt);
+    for t in 0..lt {
+        let chunk: &[RgbImage] = if t == 0 { &frames[..1] } else { &frames[1 + 4 * (t - 1)..1 + 4 * t] };
+        let mut input = Vec::new();
+        for f in chunk {
+            input.extend(patched(f));
+        }
+        let (g, io) = &graphs[usize::from(t > 0)];
+        g.set_f32(io.pixels, &input);
+        g.compute()?;
+        per_frame.push(g.read_f32(io.mean));
+    }
+    let z = cfg.z_dim as usize;
+    let plane = per_frame[0].len() / z;
+    let mut out = vec![0f32; z * lt * plane];
+    for (t, mean) in per_frame.iter().enumerate() {
+        for c in 0..z {
+            let (m, inv) = (cfg.latents_mean[c], 1.0 / cfg.latents_std[c]);
+            for i in 0..plane {
+                out[(c * lt + t) * plane + i] = (mean[c * plane + i] - m) * inv;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode normalised latents `[z][T][H][W]` to frames `[F][3][H*16][W*16]`
+/// in `[-1, 1]`, one latent frame at a time through the decoder's caches.
+///
+/// # Errors
+/// Backend failures.
+pub fn decode(backend: &Backend, cfg: &WanVaeConfig, vae: &Weights, latents: &[f32], (lt, lh, lw): (usize, usize, usize)) -> Result<Vec<f32>> {
+    let z = cfg.z_dim as usize;
+    let plane = lh * lw;
+    let cache = Weights::zeros(&backend, &cfg.decoder_cache_specs(lw as i64, lh as i64))?;
+    let mut out = Vec::new();
+    let mut graphs: Vec<(Graph, DecodeIo)> = Vec::new();
+    for first in [true, false].into_iter().take(lt.min(2)) {
+        let mut g = Graph::new(&backend)?;
+        let io = build_decoder(&mut g, cfg, vae, &cache, lw as i64, lh as i64, first);
+        g.finish(&[io.out])?;
+        graphs.push((g, io));
+    }
+    for t in 0..lt {
+        let mut frame = vec![0f32; z * plane];
+        for c in 0..z {
+            let (m, inv) = (cfg.latents_mean[c], 1.0 / cfg.latents_std[c]);
+            for i in 0..plane {
+                frame[c * plane + i] = latents[(c * lt + t) * plane + i] / inv + m;
+            }
+        }
+        let (g, io) = &graphs[usize::from(t > 0)];
+        g.set_f32(io.latent, &frame);
+        for (tn, ids) in &io.feeds {
+            g.set_i32(*tn, ids);
+        }
+        g.compute()?;
+        let x = g.read_f32(io.out);
+        out.extend(unpatchify(&x, io.out.ne(0) as usize, io.out.ne(1) as usize, io.out.ne(3) as usize));
+    }
+    Ok(out)
 }
 
 /// Inputs and outputs of one streamed decoder chunk.

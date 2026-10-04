@@ -39,6 +39,7 @@ pub mod vae;
 pub mod video;
 pub mod wan;
 pub mod wan_dit;
+pub mod wan_video;
 pub mod zimage;
 
 pub use error::{Error, Result};

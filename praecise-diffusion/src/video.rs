@@ -111,6 +111,22 @@ impl Video {
     }
 }
 
+/// Frames `[F][3][H][W]` in `[-1, 1]` to interleaved 8-bit RGB, and the
+/// frame count.
+pub(crate) fn to_rgb8(px: &[f32], w: usize, h: usize) -> (Vec<u8>, usize) {
+    let frames = px.len() / (3 * w * h);
+    let mut rgb = vec![0u8; frames * w * h * 3];
+    for f in 0..frames {
+        for c in 0..3 {
+            for i in 0..w * h {
+                let v = px[(f * 3 + c) * w * h + i];
+                rgb[(f * w * h + i) * 3 + c] = ((v / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+    }
+    (rgb, frames)
+}
+
 fn rational(fps: f32) -> (u32, u32) {
     let den = 1000u32;
     ((f64::from(fps) * f64::from(den)).round() as u32, den)
@@ -304,55 +320,7 @@ impl Cosmos3 {
     /// `[z][1 + k][H/16][W/16]`: the first frame alone, then four at a time
     /// through the encoder's frame caches.
     pub(crate) fn encode_frames(&self, frames: &[RgbImage]) -> Result<Vec<f32>> {
-        let Some(head) = frames.first() else {
-            return Err(Error::Request("no frames to encode".into()));
-        };
-        if (frames.len() - 1) % 4 != 0 {
-            return Err(Error::Request(format!("{} frames to encode; the encoder takes 1 + 4k", frames.len())));
-        }
-        let (w, h) = (head.width as usize, head.height as usize);
-        let patched = |img: &RgbImage| {
-            let mut px = vec![0f32; 3 * w * h];
-            for (i, p) in img.rgb.chunks_exact(3).enumerate() {
-                for c in 0..3 {
-                    px[c * w * h + i] = f32::from(p[c]) / 127.5 - 1.0;
-                }
-            }
-            wan::patchify(&px, w, h)
-        };
-        let cache = Weights::zeros(&self.backend, &self.vae_cfg.encoder_cache_specs(w as i64, h as i64))?;
-        let lt = 1 + (frames.len() - 1) / 4;
-        let mut graphs: Vec<(Graph, wan::EncodeIo)> = Vec::new();
-        for first in [true, false].into_iter().take(lt.min(2)) {
-            let mut g = Graph::new(&self.backend)?;
-            let io = wan::build_encoder(&mut g, &self.vae_cfg, &self.vae, &cache, w as i64, h as i64, first);
-            g.finish(&[io.mean])?;
-            graphs.push((g, io));
-        }
-        let mut per_frame: Vec<Vec<f32>> = Vec::with_capacity(lt);
-        for t in 0..lt {
-            let chunk: &[RgbImage] = if t == 0 { &frames[..1] } else { &frames[1 + 4 * (t - 1)..1 + 4 * t] };
-            let mut input = Vec::new();
-            for f in chunk {
-                input.extend(patched(f));
-            }
-            let (g, io) = &graphs[usize::from(t > 0)];
-            g.set_f32(io.pixels, &input);
-            g.compute()?;
-            per_frame.push(g.read_f32(io.mean));
-        }
-        let z = self.vae_cfg.z_dim as usize;
-        let plane = per_frame[0].len() / z;
-        let mut out = vec![0f32; z * lt * plane];
-        for (t, mean) in per_frame.iter().enumerate() {
-            for c in 0..z {
-                let (m, inv) = (self.vae_cfg.latents_mean[c], 1.0 / self.vae_cfg.latents_std[c]);
-                for i in 0..plane {
-                    out[(c * lt + t) * plane + i] = (mean[c * plane + i] - m) * inv;
-                }
-            }
-        }
-        Ok(out)
+        wan::encode_frames(&self.backend, &self.vae_cfg, &self.vae, frames)
     }
 
     /// Patch tokens `[tokens][192]` of latents `[z][T][H][W]`, frame-major.
@@ -460,38 +428,10 @@ impl Cosmos3 {
     /// Decode normalised latents `[z][T][H][W]` to frames `[F][3][H*16][W*16]`
     /// in `[-1, 1]`.
     pub(crate) fn decode(&self, latents: &[f32], (lt, lh, lw): (usize, usize, usize)) -> Result<Vec<f32>> {
-        let z = self.vae_cfg.z_dim as usize;
-        let plane = lh * lw;
-        let cache = Weights::zeros(&self.backend, &self.vae_cfg.decoder_cache_specs(lw as i64, lh as i64))?;
-        let mut out = Vec::new();
-        let mut graphs: Vec<(Graph, wan::DecodeIo)> = Vec::new();
-        for first in [true, false].into_iter().take(lt.min(2)) {
-            let mut g = Graph::new(&self.backend)?;
-            let io = wan::build_decoder(&mut g, &self.vae_cfg, &self.vae, &cache, lw as i64, lh as i64, first);
-            g.finish(&[io.out])?;
-            graphs.push((g, io));
-        }
-        for t in 0..lt {
-            let mut frame = vec![0f32; z * plane];
-            for c in 0..z {
-                let (m, inv) = (self.vae_cfg.latents_mean[c], 1.0 / self.vae_cfg.latents_std[c]);
-                for i in 0..plane {
-                    frame[c * plane + i] = latents[(c * lt + t) * plane + i] / inv + m;
-                }
-            }
-            let (g, io) = &graphs[usize::from(t > 0)];
-            g.set_f32(io.latent, &frame);
-            for (tn, ids) in &io.feeds {
-                g.set_i32(*tn, ids);
-            }
-            g.compute()?;
-            let x = g.read_f32(io.out);
-            out.extend(wan::unpatchify(&x, io.out.ne(0) as usize, io.out.ne(1) as usize, io.out.ne(3) as usize));
-        }
-        Ok(out)
+        wan::decode(&self.backend, &self.vae_cfg, &self.vae, latents, (lt, lh, lw))
     }
 
-    fn check(req: &VideoRequest) -> Result<()> {
+    pub(crate) fn check(req: &VideoRequest) -> Result<()> {
         let bad = |m: String| Err(Error::Request(m));
         if req.width == 0 || req.height == 0 || req.width % 32 != 0 || req.height % 32 != 0 {
             return bad("width and height must be positive multiples of 32".into());
@@ -558,16 +498,7 @@ impl Cosmos3 {
         let px = self.decode(&latents, shape)?;
         let decode_ms = t2.elapsed().as_millis() as u64;
         let (w, h) = (req.width as usize, req.height as usize);
-        let frames = px.len() / (3 * w * h);
-        let mut rgb = vec![0u8; frames * w * h * 3];
-        for f in 0..frames {
-            for c in 0..3 {
-                for i in 0..w * h {
-                    let v = px[(f * 3 + c) * w * h + i];
-                    rgb[(f * w * h + i) * 3 + c] = ((v / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
-                }
-            }
-        }
+        let (rgb, frames) = to_rgb8(&px, w, h);
         Ok(Video {
             width: req.width,
             height: req.height,
