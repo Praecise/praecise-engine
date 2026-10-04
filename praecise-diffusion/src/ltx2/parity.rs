@@ -230,3 +230,68 @@ fn ltx2_parity_vocoder_f32() {
 fn ltx2_parity_vocoder_bf16() {
     vocoder_run(Precision::Bf16, 0.999_999, 1e-4);
 }
+
+fn pipeline_run(precision: Precision, latents: (f64, f64), frames: (f64, f64), waveform: (f64, f64)) {
+    let d = PathBuf::from(std::env::var("PRAECISE_LTX2_PIPELINE_PARITY").expect("PRAECISE_LTX2_PIPELINE_PARITY names the fixture dir"));
+    let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let u = |k: &str| m[k].as_u64().unwrap() as usize;
+    let list = |k: &str| -> Vec<usize> { m[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect() };
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from), device: None };
+    let p = pipeline::Ltx2Pipeline::load(&d.join("single.safetensors"), &crate::pipeline::CheckpointFiles::new(d.join("text")), opts).unwrap();
+    let req = pipeline::Ltx2Request {
+        width: u("width"),
+        height: u("height"),
+        num_frames: u("frames"),
+        fps: m["fps"].as_f64().unwrap() as f32,
+        steps: u("steps"),
+        stg_blocks: list("stg_blocks"),
+        max_sequence_length: u("seq_len"),
+        ..Default::default()
+    };
+    // Packed starting latents as the reference loop received them.
+    let (video, audio) = (read("video_start"), read("audio_start"));
+    let n = list("latent").iter().product::<usize>();
+    let af = u("audio_frames");
+    let sig = pipeline::sigmas(req.steps, n);
+    let want: Vec<f32> = m["sigmas"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    assert_eq!(sig.len(), want.len());
+    for (a, b) in sig.iter().zip(&want) {
+        assert!((a - b).abs() < 1e-6, "schedule {sig:?} vs {want:?}");
+    }
+    let to_u32 = |k: &str| -> Vec<u32> { list(k).into_iter().map(|v| v as u32).collect() };
+    let (out, s, _) = p.latents_from(&to_u32("positive"), &to_u32("negative"), video, audio, &req).unwrap();
+    assert_eq!(s.audio_frames, af);
+    assert_close("final video latents", &out.video, &read("final_video"), latents.0, latents.1);
+    assert_close("final audio latents", &out.audio, &read("final_audio"), latents.0, latents.1);
+    let (px, wave) = p.decode(&out, s).unwrap();
+    // Reference frames are `[T][3][H][W]` in [0, 1].
+    let shape = list("frames_shape");
+    let (t, hw) = (shape[0], shape[2] * shape[3]);
+    assert_eq!(px.len(), t * 3 * hw);
+    let mut ours = vec![0.0; px.len()];
+    for c in 0..3 {
+        for f in 0..t {
+            for i in 0..hw {
+                ours[(f * 3 + c) * hw + i] = (px[(c * t + f) * hw + i] / 2.0 + 0.5).clamp(0.0, 1.0);
+            }
+        }
+    }
+    assert_close("frames", &ours, &read("frames"), frames.0, frames.1);
+    assert_close("waveform", &wave, &read("wave"), waveform.0, waveform.1);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_pipeline_f32() {
+    pipeline_run(Precision::F32, (0.999_999, 1e-4), (0.999_999, 1e-4), (0.999_999, 1e-3));
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_pipeline_bf16() {
+    // Reduced-precision mel spectrograms move the waveform most: the
+    // vocoder's second stage re-analyses its own output through a log-mel.
+    pipeline_run(Precision::Bf16, (0.999_99, 1e-2), (0.999_99, 5e-2), (0.999, 0.5));
+}
+

@@ -569,6 +569,12 @@ impl Ltx2Vocoder {
     pub fn config(&self) -> &VocoderConfig {
         &self.cfg
     }
+    /// Output channels.
+    #[must_use]
+    pub fn channels(&self) -> u64 {
+        self.channels
+    }
+
 
     /// Output sample rate.
     #[must_use]

@@ -29,6 +29,7 @@ use llama_cpp_sys_2 as sys;
 
 pub mod audio_vae;
 pub mod connectors;
+pub mod pipeline;
 pub mod single_file;
 pub mod vae;
 pub mod vocoder;
