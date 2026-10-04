@@ -114,7 +114,7 @@ fn checkpoint_name(name: &str) -> String {
                 out.extend(["ups".into(), n.to_string(), "0".into()]);
                 i += 2;
             }
-            ("acts1", Some(d)) | ("acts2", Some(d)) => {
+            ("acts1" | "acts2", Some(d)) => {
                 out.extend(["activations".into(), (2 * d + usize::from(p == "acts2")).to_string()]);
                 i += 2;
             }

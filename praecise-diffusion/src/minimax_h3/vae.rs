@@ -84,7 +84,7 @@ impl H3VideoVaeConfig {
             return bad("norm groups must divide every level width");
         }
         let rot = self.rope_dim();
-        if rot == 0 || rot % 6 != 0 || rot > self.decoder_attention_head_dim {
+        if rot == 0 || !rot.is_multiple_of(6) || rot > self.decoder_attention_head_dim {
             return bad("rotary width must be a positive multiple of 6 within a head");
         }
         let l = self.latent_channels as usize;
@@ -612,7 +612,7 @@ impl H3VideoVae {
         if pad > 0 {
             let tail = cfg.clip_length % tr;
             let before = z.len(1) - pad;
-            let cut: usize = (0..pad).map(|k| if tail != 0 && (before + k) % chunk == 0 { tail } else { tr }).sum();
+            let cut: usize = (0..pad).map(|k| if tail != 0 && (before + k).is_multiple_of(chunk) { tail } else { tr }).sum();
             dec = dec.take(1, 0, dec.len(1).saturating_sub(cut));
         }
         let dims = [dec.len(1), dec.len(2), dec.len(3)];
