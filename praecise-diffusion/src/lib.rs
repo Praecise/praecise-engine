@@ -53,6 +53,7 @@ pub use music::{AceStep, Audio, MusicRequest};
 pub use video::{action_resolution_tier, ActionMode, ActionOutput, ActionRequest, Cosmos3, Embodiment, Video, VideoRequest};
 pub use world::{SessionConfig, WorldChunk, WorldModel, WorldSession};
 pub use zimage::ZImage;
+pub use qwen_image::pipeline::QwenImageEdit;
 pub use ltx2::pipeline::{Guidance as Ltx2Guidance, Ltx2Output, Ltx2Pipeline, Ltx2Request};
 pub use pipeline::{
     CheckpointFiles, Flux2Klein, Image, LoadOptions, MAX_REFERENCE_PIXELS, Precision, Request, RgbImage, Timings,

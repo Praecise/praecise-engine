@@ -16,8 +16,10 @@ use crate::safetensors::SafeTensors;
 use llama_cpp_sys_2 as sys;
 
 /// Per-channel mean the vision tower's inputs are normalised by.
+#[allow(clippy::excessive_precision)]
 pub const IMAGE_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 /// Per-channel standard deviation the vision tower's inputs are normalised by.
+#[allow(clippy::excessive_precision)]
 pub const IMAGE_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
 const VISION_THETA: f64 = 10_000.0;
 
@@ -110,7 +112,7 @@ impl QwenVlConfig {
 
     fn validate(&self) -> Result<()> {
         let bad = |m: String| Err(Error::Config(m));
-        if self.hidden_size % self.num_attention_heads != 0 || self.num_attention_heads % self.num_key_value_heads != 0 {
+        if !self.hidden_size.is_multiple_of(self.num_attention_heads) || !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) {
             return bad("heads do not divide the width".into());
         }
         let s = self.sections()?;
@@ -118,11 +120,11 @@ impl QwenVlConfig {
             return bad(format!("rotary sections {s:?} do not cover the head width {}", self.head_dim()));
         }
         let v = &self.vision_config;
-        if v.hidden_size % v.num_heads != 0 || (v.hidden_size / v.num_heads) % 4 != 0 {
+        if !v.hidden_size.is_multiple_of(v.num_heads) || !(v.hidden_size / v.num_heads).is_multiple_of(4) {
             return bad("vision heads do not split into row and column halves".into());
         }
         let unit = v.patch_size * v.spatial_merge_size;
-        if v.window_size % unit != 0 {
+        if !v.window_size.is_multiple_of(unit) {
             return bad(format!("window {} is not a multiple of the merged patch {unit}", v.window_size));
         }
         if v.fullatt_block_indexes.iter().any(|&i| i >= v.depth) {
@@ -480,12 +482,10 @@ impl QwenVlEncoder {
         let mut out = Vec::with_capacity(tokens.len());
         let mut img = 0;
         for &t in tokens {
-            if t == self.cfg.image_token_id {
-                if let Some(&(gh, gw)) = grids.get(img) {
-                    out.extend(std::iter::repeat_n(t, (gh / m) * (gw / m)));
-                    img += 1;
-                    continue;
-                }
+            if let (true, Some(&(gh, gw))) = (t == self.cfg.image_token_id, grids.get(img)) {
+                out.extend(std::iter::repeat_n(t, (gh / m) * (gw / m)));
+                img += 1;
+                continue;
             }
             out.push(t);
         }
@@ -541,7 +541,7 @@ impl QwenVlEncoder {
                 Some(prev) => g.concat(prev, t, 1),
             });
         }
-        let mut x = x.expect("at least one token");
+        let Some(mut x) = x else { return Err(Error::Request("empty prompt".into())) };
         let cos = g.input(sys::GGML_TYPE_F32, &[hd, 1, ni]);
         let sin = g.input(sys::GGML_TYPE_F32, &[hd, 1, ni]);
         let causal = g.input(sys::GGML_TYPE_F16, &[ni, ni]);

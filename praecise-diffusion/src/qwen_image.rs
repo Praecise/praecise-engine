@@ -12,6 +12,7 @@
 
 #[cfg(test)]
 pub(crate) mod parity;
+pub mod pipeline;
 pub mod vae;
 
 use serde::Deserialize;
