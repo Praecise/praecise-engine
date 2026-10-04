@@ -28,7 +28,7 @@ pub const LATENT_AREA: f64 = 1024.0 * 1024.0;
 
 /// The flow-matching schedule's settings.
 #[derive(Debug, Clone, Deserialize)]
-struct SchedulerConfig {
+pub(crate) struct SchedulerConfig {
     base_image_seq_len: f64,
     max_image_seq_len: f64,
     base_shift: f64,
@@ -39,7 +39,7 @@ struct SchedulerConfig {
 
 impl SchedulerConfig {
     /// `steps` sigmas from 1 shifted for `tokens` image tokens, then 0.
-    fn sigmas(&self, steps: usize, tokens: usize) -> Vec<f32> {
+    pub(crate) fn sigmas(&self, steps: usize, tokens: usize) -> Vec<f32> {
         let m = (self.max_shift - self.base_shift) / (self.max_image_seq_len - self.base_image_seq_len);
         let mu = tokens as f64 * m + (self.base_shift - m * self.base_image_seq_len);
         // The reference builds the linear ramp in float64, then shifts in float32.
@@ -61,7 +61,7 @@ impl SchedulerConfig {
 }
 
 /// Width and height of `area` pixels at aspect `ratio`, multiples of 32.
-fn dimensions(area: f64, ratio: f64) -> (usize, usize) {
+pub(crate) fn dimensions(area: f64, ratio: f64) -> (usize, usize) {
     let w = (area * ratio).sqrt();
     let h = w / ratio;
     (((w / 32.0).round() * 32.0) as usize, ((h / 32.0).round() * 32.0) as usize)
@@ -76,7 +76,7 @@ fn encoder_size(h: usize, w: usize, unit: usize) -> (usize, usize) {
 
 /// Planar `[3][h][w]` pixels in `[0, 1]` from 8-bit RGB, resampled to `h x w`
 /// with a separable bicubic filter (identity when the size is unchanged).
-fn planar(img: &RgbImage, h: usize, w: usize) -> Vec<f32> {
+pub(crate) fn planar(img: &RgbImage, h: usize, w: usize) -> Vec<f32> {
     let (sh, sw) = (img.height as usize, img.width as usize);
     let src: Vec<f32> = (0..3).flat_map(|c| (0..sh * sw).map(move |i| (c, i))).map(|(c, i)| f32::from(img.rgb[i * 3 + c]) / 255.0).collect();
     if (sh, sw) == (h, w) {

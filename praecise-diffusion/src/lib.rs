@@ -56,6 +56,7 @@ pub use video::{action_resolution_tier, ActionMode, ActionOutput, ActionRequest,
 pub use world::{SessionConfig, WorldChunk, WorldModel, WorldSession};
 pub use zimage::ZImage;
 pub use qwen_image::pipeline::QwenImageEdit;
+pub use qwen_image21::pipeline::QwenImage21;
 pub use qwen_image21::QwenImage21Transformer;
 pub use ltx2::pipeline::{Guidance as Ltx2Guidance, Ltx2Output, Ltx2Pipeline, Ltx2Request};
 pub use pipeline::{
