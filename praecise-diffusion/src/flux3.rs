@@ -464,6 +464,7 @@ impl Flux3Transformer {
 }
 
 pub mod packing;
+pub mod policy;
 pub mod sampling;
 pub mod text_encoder;
 pub mod video_vae;
