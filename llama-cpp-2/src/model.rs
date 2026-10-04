@@ -653,11 +653,10 @@ impl LlamaModel {
         &self,
         name: Option<&str>,
     ) -> Result<LlamaChatTemplate, ChatTemplateError> {
-        let name_cstr = name.map(CString::new);
-        let name_ptr = match name_cstr {
-            Some(Ok(name)) => name.as_ptr(),
-            _ => std::ptr::null(),
-        };
+        // Borrow the name: matching by value would drop the CString at the end
+        // of the arm and leave the engine reading freed memory as the key.
+        let name_cstr = name.map(CString::new).transpose()?;
+        let name_ptr = name_cstr.as_ref().map_or(std::ptr::null(), |name| name.as_ptr());
         let result =
             unsafe { llama_cpp_sys_2::llama_model_chat_template(self.model.as_ptr(), name_ptr) };
 
