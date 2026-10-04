@@ -6,7 +6,9 @@
 //! a Qwen3 prompt encoder, decoded by a KL autoencoder. The music family is
 //! ACE-Step 1.5, a flow-matching transformer over 1D audio latents conditioned
 //! on caption, lyrics and timbre, decoded to a waveform by an Oobleck
-//! autoencoder.
+//! autoencoder. The video family is Cosmos3, a joint text-and-video
+//! transformer over patchified 3D latents sampled with UniPC, decoded frame by
+//! frame by a causal video autoencoder.
 //!
 //! Every weight is read from the checkpoint's own safetensors files and made
 //! resident once; the optional 8-bit format is produced from those files at
@@ -16,6 +18,7 @@
 //! backend is built in and initialises: it never falls back to the CPU.
 
 pub mod acestep;
+pub mod cosmos3;
 pub mod error;
 pub mod flux2;
 pub mod ggml;
@@ -25,10 +28,14 @@ pub mod pipeline;
 pub mod qwen3;
 pub mod safetensors;
 pub mod schedule;
+pub mod unipc;
 pub mod vae;
+pub mod video;
+pub mod wan;
 
 pub use error::{Error, Result};
 pub use music::{AceStep, Audio, MusicRequest};
+pub use video::{Cosmos3, Video, VideoRequest};
 pub use pipeline::{
     CheckpointFiles, Flux2Klein, Image, LoadOptions, MAX_REFERENCE_PIXELS, Precision, Request, RgbImage, Timings,
 };

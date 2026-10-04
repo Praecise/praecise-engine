@@ -438,6 +438,23 @@ impl Weights {
         Ok(out)
     }
 
+    /// Resident tensors filled with zeros: state a sequence of graphs carries
+    /// from one run to the next (see [`Graph::copy_into`]).
+    ///
+    /// # Errors
+    /// An allocation failure.
+    pub fn zeros(backend: &Backend, specs: &[WeightSpec]) -> Result<Self> {
+        let mut out = Self::alloc(backend, specs)?;
+        unsafe { sys::ggml_backend_buffer_clear(out.buffer, 0) };
+        out.bytes = unsafe { sys::ggml_backend_buffer_get_size(out.buffer) };
+        Ok(out)
+    }
+
+    /// Set every tensor to zero.
+    pub fn clear(&self) {
+        unsafe { sys::ggml_backend_buffer_clear(self.buffer, 0) };
+    }
+
     fn alloc(backend: &Backend, specs: &[WeightSpec]) -> Result<Self> {
         let params = sys::ggml_init_params {
             mem_size: unsafe { sys::ggml_tensor_overhead() } * (specs.len() + 1),
@@ -870,6 +887,46 @@ impl Graph {
     /// Element-wise sine.
     pub fn sin(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_sin(self.ctx, a.0) })
+    }
+    /// Rotary embedding from tables: `x * cos + rotate_half(x) * sin` for `x`
+    /// `[head width, heads, tokens]` and tables `[head width, 1, tokens]`,
+    /// where `rotate_half` pairs dimension `i` with `i + head width / 2`.
+    pub fn rotate_half_rope(&mut self, x: Tn, cos: Tn, sin: Tn) -> Tn {
+        let (hd, heads, n) = (x.ne(0), x.ne(1), x.ne(2));
+        let half = hd / 2;
+        let es = x.nb(0);
+        let lo = self.view_4d(x, [half, heads, n, 1], x.nb(1), x.nb(2), x.nb(3), 0);
+        let hi = self.view_4d(x, [half, heads, n, 1], x.nb(1), x.nb(2), x.nb(3), half as usize * es);
+        let lo = self.cont(lo);
+        let hi = self.cont(hi);
+        let neg = self.scale_bias(hi, -1.0, 0.0);
+        let rot = self.concat(neg, lo, 0);
+        let a = self.mul(x, cos);
+        let b = self.mul(rot, sin);
+        self.add(a, b)
+    }
+    /// Element-wise hyperbolic tangent.
+    pub fn tanh(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_tanh(self.ctx, a.0) })
+    }
+    /// `a` repeated to the shape `ne`, each dimension a multiple of `a`'s.
+    pub fn repeat_to(&mut self, a: Tn, ne: [i64; 4]) -> Tn {
+        Tn(unsafe { sys::ggml_repeat_4d(self.ctx, a.0, ne[0], ne[1], ne[2], ne[3]) })
+    }
+    /// Element-wise `max(a, 0)`.
+    pub fn relu(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_relu(self.ctx, a.0) })
+    }
+    /// 2-d convolution with stride `s` in both dimensions and no padding.
+    pub fn conv2d_strided(&mut self, kernel: Tn, x: Tn, s: i32) -> Tn {
+        Tn(unsafe { sys::ggml_conv_2d_direct(self.ctx, kernel.0, x.0, s, s, 0, 0, 1, 1) })
+    }
+    /// Copy `src` into the resident tensor `dst` (same element count) when
+    /// the graph runs. Every reader of `dst` in the graph must be an ancestor
+    /// of `src`, so the copy runs after them.
+    pub fn copy_into(&mut self, src: Tn, dst: Tn) {
+        let c = Tn(unsafe { sys::ggml_cpy(self.ctx, src.0, dst.0) });
+        self.expand(c);
     }
     /// Element-wise square.
     pub fn sqr(&mut self, a: Tn) -> Tn {
