@@ -173,13 +173,20 @@ pub fn timestep_features(t: f32, channels: usize) -> Vec<f32> {
 /// axis, each restarting at the axis's first pair.
 #[must_use]
 pub fn rope_freq_factors(cfg: &Flux2Config) -> Vec<f32> {
-    let hd = cfg.attention_head_dim as f64;
-    let mut out = Vec::with_capacity((cfg.attention_head_dim / 2) as usize);
+    axis_rope_freq_factors(&cfg.axes_dims_rope, cfg.attention_head_dim, cfg.rope_theta)
+}
+
+/// [`rope_freq_factors`] for any per-axis split `axes` of a `head_dim`-wide
+/// head with base `theta`.
+#[must_use]
+pub fn axis_rope_freq_factors(axes: &[u64], head_dim: u64, theta: f64) -> Vec<f32> {
+    let hd = head_dim as f64;
+    let mut out = Vec::with_capacity((head_dim / 2) as usize);
     let mut i = 0usize;
-    for &width in &cfg.axes_dims_rope {
+    for &width in axes {
         for j in 0..(width / 2) as usize {
-            let ladder = cfg.rope_theta.powf(-2.0 * i as f64 / hd);
-            let wanted = cfg.rope_theta.powf(-2.0 * j as f64 / width as f64);
+            let ladder = theta.powf(-2.0 * i as f64 / hd);
+            let wanted = theta.powf(-2.0 * j as f64 / width as f64);
             out.push((ladder / wanted) as f32);
             i += 1;
         }

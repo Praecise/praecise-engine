@@ -22,6 +22,7 @@ pub mod acestep;
 pub mod cosmos3;
 pub mod error;
 pub mod flux2;
+pub mod flux3;
 pub mod gemma3;
 pub mod ggml;
 pub mod ltx2;
