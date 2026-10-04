@@ -41,6 +41,11 @@ VISION = dict(
 GRIDS = [(8, 12), (4, 6)]
 
 
+# An intermediate hidden state (as MiniMax-H3 reads hidden_states[50]); this
+# one sits inside the deepstack layers.
+LAYER = 2
+
+
 def save(out, name, t):
     t.detach().to(torch.float32).contiguous().numpy().astype("<f4").tofile(os.path.join(out, name + ".bin"))
 
@@ -114,14 +119,18 @@ def main():
             o = model.model(input_ids=ids_t, attention_mask=torch.ones_like(ids_t), pixel_values=pv,
                             image_grid_thw=thw, mm_token_type_ids=(ids_t == IMAGE).int())
             save(out, "hidden", o.last_hidden_state[0])
+            o = model.model(input_ids=ids_t, attention_mask=torch.ones_like(ids_t), pixel_values=pv,
+                            image_grid_thw=thw, mm_token_type_ids=(ids_t == IMAGE).int(), output_hidden_states=True)
+            save(out, "hidden_at", o.hidden_states[LAYER][0])
             tids = torch.tensor([list(range(20, 33))])
             t = model.model(input_ids=tids, attention_mask=torch.ones_like(tids),
-                            mm_token_type_ids=torch.zeros_like(tids)).last_hidden_state[0]
-            save(out, "hidden_text", t)
+                            mm_token_type_ids=torch.zeros_like(tids), output_hidden_states=True)
+            save(out, "hidden_text", t.last_hidden_state[0])
+            save(out, "hidden_text_at", t.hidden_states[LAYER][0])
     finally:
         handle.remove()
     with open(os.path.join(out, "meta.json"), "w") as f:
-        json.dump(dict(ids=ids, text_ids=tids[0].tolist(), grids=GRIDS), f, indent=1)
+        json.dump(dict(ids=ids, text_ids=tids[0].tolist(), grids=GRIDS, layer=LAYER), f, indent=1)
     print("rows", len(ids), "features", sizes)
 
 

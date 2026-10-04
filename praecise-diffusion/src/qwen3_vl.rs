@@ -265,7 +265,24 @@ impl Qwen3VlEncoder {
     /// # Errors
     /// An unsupported configuration, missing weights or no usable backend.
     pub fn load(files: &CheckpointFiles, dir: &str, opts: LoadOptions) -> Result<Self> {
-        let cfg = Qwen3VlConfig::from_json(files.json(&format!("{dir}/config.json"))?)?;
+        Self::load_layers(files, dir, opts, None)
+    }
+
+    /// Load as [`Self::load`] but keep only the first `layers` decoder
+    /// layers, so [`Self::forward`] returns the hidden state after layer
+    /// `layers` (`hidden_states[layers]` of the reference), before any norm.
+    ///
+    /// # Errors
+    /// As [`Self::load`], or a layer count of zero or beyond the model's.
+    pub fn load_layers(files: &CheckpointFiles, dir: &str, opts: LoadOptions, layers: Option<usize>) -> Result<Self> {
+        let mut cfg = Qwen3VlConfig::from_json(files.json(&format!("{dir}/config.json"))?)?;
+        if let Some(n) = layers {
+            let t = &mut cfg.text_config;
+            if n == 0 || n > t.num_hidden_layers {
+                return Err(Error::Config(format!("Qwen3-VL: cannot stop after {n} of {} layers", t.num_hidden_layers)));
+            }
+            t.num_hidden_layers = n;
+        }
         let st = SafeTensors::open(&files.weights(dir)?)?;
         let backend = opts.backend()?;
         let exact = opts.precision == Precision::F32;
@@ -631,7 +648,9 @@ impl Qwen3VlEncoder {
             });
         }
         let Some(mut x) = x else { return Err(Error::Request("empty prompt".into())) };
-        let n_deep = if images.is_empty() { 0 } else { cfg.vision_config.deepstack_visual_indexes.len() };
+        // The reference records a layer's output before the deepstack
+        // features join it, so the last layer never takes them.
+        let n_deep = if images.is_empty() { 0 } else { cfg.vision_config.deepstack_visual_indexes.len().min(t.num_hidden_layers - 1) };
         let deep: Vec<Tn> = (0..n_deep).map(|_| g.input(sys::GGML_TYPE_F32, &[d, ni])).collect();
         let cos = g.input(sys::GGML_TYPE_F32, &[hd, 1, ni]);
         let sin = g.input(sys::GGML_TYPE_F32, &[hd, 1, ni]);
@@ -757,6 +776,10 @@ mod tests {
         assert_eq!(enc.expand_placeholders(&collapsed, &grids), tokens);
         assert_close("prompt", &enc.forward(&tokens, &images).unwrap(), &bin(&d, "hidden"), min_cos, max_rel);
         assert_close("text prompt", &enc.forward(&ids("text_ids"), &[]).unwrap(), &bin(&d, "hidden_text"), min_cos, max_rel);
+        let at = m["layer"].as_u64().unwrap() as usize;
+        let cut = Qwen3VlEncoder::load_layers(&CheckpointFiles::new(d.join("checkpoint")), "text_encoder", opts, Some(at)).unwrap();
+        assert_close("prompt at a layer", &cut.forward(&tokens, &images).unwrap(), &bin(&d, "hidden_at"), min_cos, max_rel);
+        assert_close("text prompt at a layer", &cut.forward(&ids("text_ids"), &[]).unwrap(), &bin(&d, "hidden_text_at"), min_cos, max_rel);
     }
 
     #[test]
