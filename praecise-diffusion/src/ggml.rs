@@ -1001,6 +1001,10 @@ impl Graph {
     pub fn pad_end(&mut self, a: Tn, p0: i32, p1: i32) -> Tn {
         Tn(unsafe { sys::ggml_pad(self.ctx, a.0, p0, p1, 0, 0) })
     }
+    /// Zero-pad every dimension: `lo[i]` before and `hi[i]` after dimension `i`.
+    pub fn pad_ext(&mut self, a: Tn, lo: [i32; 4], hi: [i32; 4]) -> Tn {
+        Tn(unsafe { sys::ggml_pad_ext(self.ctx, a.0, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]) })
+    }
     /// Nearest-neighbour upscale of dimensions 0 and 1.
     pub fn upscale_nearest(&mut self, a: Tn, factor: i32) -> Tn {
         Tn(unsafe { sys::ggml_upscale(self.ctx, a.0, factor, sys::GGML_SCALE_MODE_NEAREST) })

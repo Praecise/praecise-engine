@@ -18,6 +18,8 @@ use crate::s3dit::S3DitConfig;
 use crate::safetensors::SafeTensors;
 use llama_cpp_sys_2 as sys;
 
+pub mod vae;
+
 /// Modulation rows per timestep: one per modality tag.
 pub const MODALITIES: usize = 3;
 
