@@ -17,7 +17,7 @@ use super::{AvShape, Ltx2Transformer, Pass};
 use crate::error::{Error, Result};
 use crate::gemma3::Gemma3Encoder;
 use crate::music::Audio;
-use crate::pipeline::{CheckpointFiles, LoadOptions, Timings};
+use crate::pipeline::{CheckpointFiles, LoadOptions, Precision, Timings};
 use crate::schedule::gaussian;
 use crate::video::Video;
 
@@ -97,6 +97,14 @@ pub struct Ltx2Output {
     pub video: Video,
     /// The soundtrack.
     pub audio: Audio,
+}
+
+impl Ltx2Output {
+    /// The clip and its soundtrack as one AVI file.
+    #[must_use]
+    pub fn avi(&self) -> Vec<u8> {
+        self.video.avi(&self.audio)
+    }
 }
 
 /// Flow-matching noise levels for `steps` steps over `video_tokens` latent
@@ -260,15 +268,51 @@ impl Ltx2Pipeline {
         } else {
             None
         };
+        // The audio path runs in f32 at every precision: the vocoder's
+        // second stage re-analyses its own output through a log-mel, which
+        // amplifies reduced-precision mel error into the waveform.
+        let audio_opts = LoadOptions { precision: Precision::F32, ..opts };
         Ok(Self {
             tokenizer,
             text: Gemma3Encoder::load(text, "text_encoder", opts)?,
             connectors: Ltx2Connectors::load_single_file(checkpoint, opts)?,
             transformer: Ltx2Transformer::load_single_file(checkpoint, opts)?,
             video_vae: Ltx2VideoDecoder::load_single_file(checkpoint, opts)?,
-            audio_vae: Ltx2AudioDecoder::load_single_file(checkpoint, opts)?,
-            vocoder: Ltx2Vocoder::load_single_file(checkpoint, opts)?,
+            audio_vae: Ltx2AudioDecoder::load_single_file(checkpoint, audio_opts)?,
+            vocoder: Ltx2Vocoder::load_single_file(checkpoint, audio_opts)?,
         })
+    }
+
+    /// Load from two directories: `checkpoint_root` holds the single
+    /// checkpoint file (its only `.safetensors` file), `text_root` holds
+    /// `text_encoder/` and `tokenizer/tokenizer.json`. The two may be the
+    /// same directory.
+    ///
+    /// # Errors
+    /// As [`Self::load`], or when `checkpoint_root` holds no or several
+    /// checkpoint files.
+    pub fn load_dir(checkpoint_root: &Path, text_root: &Path, opts: LoadOptions) -> Result<Self> {
+        let mut found: Vec<_> = std::fs::read_dir(checkpoint_root)
+            .map_err(|e| Error::Weights(format!("{}: {e}", checkpoint_root.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        if found.len() != 1 {
+            return Err(Error::Weights(format!("{}: expected one checkpoint file, found {}", checkpoint_root.display(), found.len())));
+        }
+        Self::load(&found.remove(0), &CheckpointFiles::new(text_root), opts)
+    }
+
+    /// Device bytes held by every component.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.text.bytes() + self.connectors.bytes() + self.transformer.bytes() + self.video_vae.bytes() + self.audio_vae.bytes() + self.vocoder.bytes()
+    }
+
+    /// Name of the compute device.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        self.transformer.device()
     }
 
     /// The prompt's tokens as the reference tokenizes them: special tokens

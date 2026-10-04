@@ -514,6 +514,11 @@ impl std::fmt::Debug for Ltx2Vocoder {
 }
 
 impl Ltx2Vocoder {
+    /// Device bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     /// Load the vocoder of a single-file checkpoint.
     ///
     /// # Errors

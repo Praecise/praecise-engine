@@ -244,6 +244,11 @@ impl std::fmt::Debug for Gemma3Encoder {
 }
 
 impl Gemma3Encoder {
+    /// Device bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     /// Load `dir/` (its `config.json` and safetensors files) of a checkpoint.
     ///
     /// # Errors

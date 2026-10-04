@@ -205,6 +205,11 @@ impl std::fmt::Debug for Ltx2Connectors {
 }
 
 impl Ltx2Connectors {
+    /// Device bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     /// Load `connectors/` of a checkpoint.
     ///
     /// # Errors

@@ -102,6 +102,15 @@ impl Video {
     }
 }
 
+impl Video {
+    /// The frames with `audio` as their soundtrack, as an uncompressed AVI
+    /// (24-bit RGB frames, 16-bit PCM sound interleaved per frame).
+    #[must_use]
+    pub fn avi(&self, audio: &crate::music::Audio) -> Vec<u8> {
+        avi::encode(self, audio)
+    }
+}
+
 fn rational(fps: f32) -> (u32, u32) {
     let den = 1000u32;
     ((f64::from(fps) * f64::from(den)).round() as u32, den)
@@ -538,6 +547,7 @@ impl Cosmos3 {
 }
 
 mod action;
+mod avi;
 pub use action::{action_caption, action_resolution_tier, ActionMode, ActionOutput, ActionRequest, Embodiment};
 
 #[cfg(test)]

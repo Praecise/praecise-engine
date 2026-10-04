@@ -340,6 +340,11 @@ impl std::fmt::Debug for Ltx2VideoDecoder {
 }
 
 impl Ltx2VideoDecoder {
+    /// Device bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     /// Load the video decoder of a single-file checkpoint.
     ///
     /// # Errors

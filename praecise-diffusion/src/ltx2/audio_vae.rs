@@ -239,6 +239,11 @@ impl std::fmt::Debug for Ltx2AudioDecoder {
 }
 
 impl Ltx2AudioDecoder {
+    /// Device bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     /// Load the audio decoder of a single-file checkpoint.
     ///
     /// # Errors

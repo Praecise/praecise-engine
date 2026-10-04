@@ -733,6 +733,16 @@ impl std::fmt::Debug for Ltx2Transformer {
 }
 
 impl Ltx2Transformer {
+    /// Device bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
+    /// Name of the compute device.
+    pub(crate) fn device(&self) -> &str {
+        self.backend.name()
+    }
+
     /// Load `transformer/` of a checkpoint.
     ///
     /// # Errors
