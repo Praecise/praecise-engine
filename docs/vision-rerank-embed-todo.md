@@ -8,7 +8,8 @@ input, so the work can be picked up without re-deriving it.
 
 ## Where things stand
 
-- **Conversion.** `conversion/qwen.py` recognises a vision-language reranker
+- **Conversion.** In the converter (the llama.cpp fork the engine links,
+  `convert_hf_to_gguf.py`), `conversion/qwen.py` recognises a vision-language reranker
   by its README heading or directory name and writes RANK pooling, the yes/no
   classification rows and the rerank prompt template.
   `conversion/qwen3vl.py` (`Qwen3VLTextModel`) writes the text decoder only;
