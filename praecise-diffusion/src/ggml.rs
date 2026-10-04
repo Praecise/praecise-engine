@@ -859,6 +859,10 @@ impl Graph {
         let t = self.scale_bias(t, 0.5, 0.5);
         self.mul(x, t)
     }
+    /// GELU with the exact error function.
+    pub fn gelu_erf(&mut self, a: Tn) -> Tn {
+        Tn(unsafe { sys::ggml_gelu_erf(self.ctx, a.0) })
+    }
     /// Logistic sigmoid.
     pub fn sigmoid(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_sigmoid(self.ctx, a.0) })

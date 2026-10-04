@@ -32,6 +32,7 @@ pub mod oobleck;
 pub mod pipeline;
 pub mod qwen3;
 pub mod qwen_image;
+pub mod qwen_vl;
 pub mod s3dit;
 pub mod safetensors;
 pub mod schedule;

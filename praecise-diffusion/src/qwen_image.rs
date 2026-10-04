@@ -11,7 +11,7 @@
 //! current timestep.
 
 #[cfg(test)]
-mod parity;
+pub(crate) mod parity;
 pub mod vae;
 
 use serde::Deserialize;
