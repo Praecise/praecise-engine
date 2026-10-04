@@ -438,15 +438,7 @@ fn gelu(g: &mut Graph, x: Tn, exact: bool) -> Tn {
     if !exact {
         return g.gelu_tanh(x);
     }
-    // 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))), in float32 throughout.
-    let x2 = g.sqr(x);
-    let x3 = g.mul(x2, x);
-    let c = g.scale_bias(x3, 0.044_715, 0.0);
-    let inner = g.add(x, c);
-    let inner = g.scale_bias(inner, (2.0 / std::f32::consts::PI).sqrt(), 0.0);
-    let t = g.tanh(inner);
-    let t = g.scale_bias(t, 0.5, 0.5);
-    g.mul(x, t)
+    g.gelu_tanh_exact(x)
 }
 
 /// Rotary tables of one attention side, `[head width, heads, tokens]`.

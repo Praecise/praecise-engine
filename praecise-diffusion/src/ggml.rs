@@ -750,6 +750,19 @@ impl Graph {
     pub fn gelu_tanh(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_gelu(self.ctx, a.0) })
     }
+    /// GELU, tanh approximation, evaluated in float32 throughout (ggml's own
+    /// GELU reads a half-precision table on the CPU):
+    /// `0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3)))`.
+    pub fn gelu_tanh_exact(&mut self, x: Tn) -> Tn {
+        let x2 = self.sqr(x);
+        let x3 = self.mul(x2, x);
+        let c = self.scale_bias(x3, 0.044_715, 0.0);
+        let inner = self.add(x, c);
+        let inner = self.scale_bias(inner, (2.0 / std::f32::consts::PI).sqrt(), 0.0);
+        let t = self.tanh(inner);
+        let t = self.scale_bias(t, 0.5, 0.5);
+        self.mul(x, t)
+    }
     /// Logistic sigmoid.
     pub fn sigmoid(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_sigmoid(self.ctx, a.0) })
