@@ -111,3 +111,31 @@ fn world_dit_parity() {
         assert!(run(memory, false) > 0.999);
     }
 }
+
+#[test]
+fn camera_rays_match_reference() {
+    use super::camera::{clip_rays, extrinsic, memory_rays, poses};
+    let dir = root().join("../mg3cam");
+    let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+    let u = |v: &Value| usize::try_from(v.as_u64().unwrap()).unwrap();
+    let (frames, lh, lw, s) = (u(&meta["frames"]), u(&meta["lat_h"]), u(&meta["lat_w"]), u(&meta["s"]));
+    let (path, _) = poses([0.0; 5], &bin(&dir, "keyboard"), 6, &bin(&dir, "mouse"), frames);
+    let want = bin(&dir, "poses");
+    for (p, w) in path.iter().flatten().zip(&want) {
+        assert!((p - w).abs() <= 1e-4 * w.abs().max(1.0), "pose {p} vs {w}");
+    }
+    let c2ws: Vec<_> = path.iter().map(extrinsic).collect();
+    for (key, name, first) in [("clip1", "rays1", true), ("clip2", "rays2", false)] {
+        let c = &meta[key];
+        let (start, end, n) = (u(&c[0]), u(&c[1]), u(&c[2]));
+        let got = clip_rays(&c2ws, start, end, if first { 0 } else { start + 3 }, n, (lh, lw), s);
+        let want = bin(&dir, name);
+        let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(cosine(&got, &want) > 0.999_999 && err < 1e-4, "{name}: cos {} max err {err}", cosine(&got, &want));
+    }
+    let m = &meta["memory"];
+    let got = memory_rays(&c2ws, u(&m[0]), u(&m[1]), (lh, lw), s);
+    let want = bin(&dir, "mem_rays");
+    let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(err < 1e-4, "memory rays max err {err}");
+}
