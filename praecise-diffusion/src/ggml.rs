@@ -461,11 +461,23 @@ impl Weights {
                     return Err(Error::Weights(format!("{}: row order is not a permutation", s.name)));
                 }
             }
-            if s.ty == WType::Q8_0 && s.shape.last().copied().unwrap_or(0) % 32 != 0 {
+            if s.ty == WType::Q8_0 && !matches!(files.get(&s.name).map(|v| v.dtype), Some(Dtype::Quant(_))) && s.shape.last().copied().unwrap_or(0) % 32 != 0 {
                 return Err(Error::Weights(format!("{} rows are not a multiple of 32", s.name)));
             }
         }
-        let mut out = Self::alloc(backend, specs)?;
+        // A block-quantised source keeps its blocks: re-encoding them would
+        // only add error, and every such weight feeds a matrix product.
+        let types = specs
+            .iter()
+            .map(|s| {
+                let name = s.parts.first().unwrap_or(&s.name);
+                match files.get(name).map(|v| v.dtype) {
+                    Some(Dtype::Quant(t)) => t as sys::ggml_type,
+                    _ => s.ty.ggml(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut out = Self::alloc(backend, specs, &types)?;
         for s in specs {
             let stacked;
             let view = if s.parts.is_empty() {
@@ -486,7 +498,7 @@ impl Weights {
                 }
                 None => view,
             };
-            let data = convert(&view, s)?;
+            let data = if matches!(view.dtype, Dtype::Quant(_)) { view.bytes.to_vec() } else { convert(&view, s)? };
             unsafe { sys::ggml_backend_tensor_set(t, data.as_ptr().cast(), 0, data.len()) };
             out.bytes += data.len();
         }
@@ -509,11 +521,12 @@ impl Weights {
                 return Err(Error::Weights(format!("{} rows are not a multiple of 32", s.name)));
             }
         }
-        let mut out = Self::alloc(backend, &specs)?;
+        let types: Vec<_> = specs.iter().map(|s| s.ty.ggml()).collect();
+        let mut out = Self::alloc(backend, &specs, &types)?;
         for (t, s) in tensors.iter().zip(&specs) {
             let bytes: Vec<u8> = t.data.iter().flat_map(|v| v.to_le_bytes()).collect();
             let view = TensorView { dtype: Dtype::F32, shape: &s.shape, bytes: &bytes };
-            let data = convert(&view, s)?;
+            let data = if matches!(view.dtype, Dtype::Quant(_)) { view.bytes.to_vec() } else { convert(&view, s)? };
             unsafe { sys::ggml_backend_tensor_set(out.tensors[&s.name], data.as_ptr().cast(), 0, data.len()) };
             out.bytes += data.len();
         }
@@ -526,7 +539,8 @@ impl Weights {
     /// # Errors
     /// An allocation failure.
     pub fn zeros(backend: &Backend, specs: &[WeightSpec]) -> Result<Self> {
-        let mut out = Self::alloc(backend, specs)?;
+        let types: Vec<_> = specs.iter().map(|s| s.ty.ggml()).collect();
+        let mut out = Self::alloc(backend, specs, &types)?;
         unsafe { sys::ggml_backend_buffer_clear(out.buffer, 0) };
         out.bytes = unsafe { sys::ggml_backend_buffer_get_size(out.buffer) };
         Ok(out)
@@ -537,7 +551,7 @@ impl Weights {
         unsafe { sys::ggml_backend_buffer_clear(self.buffer, 0) };
     }
 
-    fn alloc(backend: &Backend, specs: &[WeightSpec]) -> Result<Self> {
+    fn alloc(backend: &Backend, specs: &[WeightSpec], types: &[sys::ggml_type]) -> Result<Self> {
         let params = sys::ggml_init_params {
             mem_size: unsafe { sys::ggml_tensor_overhead() } * (specs.len() + 1),
             mem_buffer: ptr::null_mut(),
@@ -548,9 +562,9 @@ impl Weights {
             return Err(Error::Backend("ggml_init failed for weights".into()));
         }
         let mut tensors = HashMap::with_capacity(specs.len());
-        for s in specs {
+        for (s, &ty) in specs.iter().zip(types) {
             let ne = ne_of(&s.shape);
-            let t = unsafe { sys::ggml_new_tensor_4d(ctx, s.ty.ggml(), ne[0], ne[1], ne[2], ne[3]) };
+            let t = unsafe { sys::ggml_new_tensor_4d(ctx, ty, ne[0], ne[1], ne[2], ne[3]) };
             let cname = CString::new(s.name.as_str()).map_err(|_| Error::Weights("NUL in tensor name".into()))?;
             unsafe { sys::ggml_set_name(t, cname.as_ptr()) };
             tensors.insert(s.name.clone(), t);
