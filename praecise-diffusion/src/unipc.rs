@@ -102,6 +102,25 @@ impl UniPcConfig {
     }
 }
 
+/// Linearly spaced flow noise levels from `1 - 1/num_train_timesteps` down
+/// to zero, each mapped through the rational shift `shift * s / (1 + (shift - 1) * s)`:
+/// the `steps` noise levels plus the final zero in single precision, and the
+/// integer timesteps the model is told (`level * num_train_timesteps`, truncated).
+#[must_use]
+pub fn shifted_linear_schedule(steps: usize, shift: f64, num_train_timesteps: u64) -> (Vec<f32>, Vec<i64>) {
+    let top = f64::from(1.0f32 - 1.0 / num_train_timesteps as f32);
+    let mut sigmas = Vec::with_capacity(steps + 1);
+    let mut timesteps = Vec::with_capacity(steps);
+    for i in 0..steps {
+        let s = top + i as f64 * ((0.0 - top) / steps as f64);
+        let s = shift * s / (1.0 + (shift - 1.0) * s);
+        timesteps.push((s * num_train_timesteps as f64) as i64);
+        sigmas.push(s as f32);
+    }
+    sigmas.push(0.0);
+    (sigmas, timesteps)
+}
+
 /// `log(alpha) - log(sigma)` for flow noise level `s`.
 fn lambda(s: f32) -> f64 {
     let s = f64::from(s);
@@ -254,6 +273,17 @@ mod tests {
         assert!((s[3] - 0.147 / 1.147).abs() < 1e-6);
         assert_eq!(s[4], 0.0);
         assert_eq!(t[0], 995);
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn the_shifted_schedule_starts_one_tick_below_one() {
+        let (s, t) = shifted_linear_schedule(4, 5.0, 1000);
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[4], 0.0);
+        assert_eq!(t[0], 999);
+        let mid = 0.4995f64;
+        assert!((f64::from(s[2]) - 5.0 * mid / (1.0 + 4.0 * mid)).abs() < 1e-6);
         assert!(s.windows(2).all(|w| w[0] > w[1]));
     }
 

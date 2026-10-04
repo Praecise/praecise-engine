@@ -463,5 +463,8 @@ impl Flux3Transformer {
     }
 }
 
+pub mod packing;
+pub mod sampling;
+
 #[cfg(test)]
 mod parity;
