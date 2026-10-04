@@ -1,7 +1,8 @@
 """Build a small random LTX-2.3 video decoder and reference outputs.
 
 The released decoder runs at widths up to 1024 over full-resolution video, so
-this suite checks the native decoder against the reference one on a random
+this suite checks the native decoder, whole and in blended tiles, against the
+reference one on a random
 checkpoint with the released LTX-2.3 stage list (residual groups between a
 2x2x2, a second 2x2x2, a temporal and a spatial depth-to-space upsampling,
 non-causal frame padding, a 4x4 pixel patch) at tiny widths. The weights are
@@ -61,6 +62,9 @@ def reference_config():
         upsample_type=tuple(KIND[n] for n, _ in reversed(ups)), upsample_residual=(False,) * len(ups),
         upsample_factor=tuple(p["multiplier"] for _, p in ups),
         decoder_causal=False, decoder_spatial_padding_mode="zeros", timestep_conditioning=False,
+        # The decoder's upsampling; the reference otherwise derives it from the
+        # encoder, which this fixture leaves at its defaults.
+        spatial_compression_ratio=32, temporal_compression_ratio=8,
     )
 
 
@@ -108,6 +112,23 @@ def main():
     dump(out, "latent", latent[0])
     dump(out, "video", video[0])
     meta = dict(frames=frames, height=height, width=width, out_shape=list(video.shape[1:]))
+
+    # Tiled decoding: 64 pixel tiles every 32 pixels, 16 frame tiles every 8
+    # frames (two latent rows, columns and frames per tile, one blended),
+    # over a latent long and wide enough to need several tiles on each axis.
+    vae.enable_tiling(
+        tile_sample_min_height=64, tile_sample_min_width=64, tile_sample_min_num_frames=16,
+        tile_sample_stride_height=32, tile_sample_stride_width=32, tile_sample_stride_num_frames=8,
+    )
+    vae.use_framewise_decoding = True
+    tf, th, tw = 5, 4, 5
+    tiled_latent = torch.randn(1, LATENT, tf, th, tw)
+    with torch.no_grad():
+        tiled = vae.decode(tiled_latent * std + mean, return_dict=False)[0]
+    dump(out, "tiled_latent", tiled_latent[0])
+    dump(out, "tiled_video", tiled[0])
+    meta["tiled"] = dict(frames=tf, height=th, width=tw, min_px=64, stride_px=32, min_frames=16, stride_frames=8,
+                         out_shape=list(tiled.shape[1:]))
     with open(os.path.join(out, "meta.json"), "w") as f:
         json.dump(meta, f)
     print(meta)

@@ -134,6 +134,30 @@ fn ltx2_parity_video_decoder_f32() {
     video_decoder_run(Precision::F32, 0.999_999, 1e-4);
 }
 
+fn video_decoder_tiled_run(precision: Precision, min_cos: f64, max_rel: f64) {
+    let d = PathBuf::from(std::env::var("PRAECISE_LTX2_VAE_PARITY").expect("PRAECISE_LTX2_VAE_PARITY names the fixture dir"));
+    let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let m = &m["tiled"];
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from) };
+    let dec = vae::Ltx2VideoDecoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let u = |k: &str| m[k].as_u64().unwrap() as usize;
+    let tiling = vae::Tiling {
+        spatial: Some(vae::Tile { min: u("min_px"), stride: u("stride_px") }),
+        temporal: Some(vae::Tile { min: u("min_frames"), stride: u("stride_frames") }),
+    };
+    let px = dec.decode_tiled(&read("tiled_latent"), u("frames"), u("height"), u("width"), tiling).unwrap();
+    let want = read("tiled_video");
+    assert_eq!(px.len(), want.len(), "tiled output size");
+    assert_close("tiled video decoder", &px, &want, min_cos, max_rel);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_video_decoder_tiled_f32() {
+    video_decoder_tiled_run(Precision::F32, 0.999_999, 1e-4);
+}
+
 #[test]
 #[ignore = "needs the reference fixtures"]
 fn ltx2_parity_video_decoder_bf16() {

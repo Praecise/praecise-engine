@@ -365,32 +365,131 @@ impl Ltx2VideoDecoder {
     }
 
     /// Decode normalised latents `[C][T][H][W]` (as the transformer produces
-    /// them) to pixels `[3][T'][H s][W s]` in about `[-1, 1]`.
+    /// them) to pixels `[3][T'][H s][W s]` in about `[-1, 1]`, as one graph.
     ///
     /// # Errors
     /// A latent size that disagrees with the shape, or a backend failure.
     pub fn decode(&self, latent: &[f32], frames: usize, height: usize, width: usize) -> Result<Vec<f32>> {
+        let z = self.denormalise(latent, frames, height, width)?;
+        Ok(self.run(&z)?.d)
+    }
+
+    /// Decode as [`Self::decode`], in overlapping tiles blended linearly over
+    /// their overlap, so memory follows the tile size rather than the clip.
+    /// Tiles cover `min` samples every `stride` samples on each tiled axis;
+    /// an axis is tiled only when the latent is longer than one tile.
+    ///
+    /// # Errors
+    /// A latent size that disagrees with the shape, a tiling that does not
+    /// divide by the decoder's upsampling, or a backend failure.
+    pub fn decode_tiled(&self, latent: &[f32], frames: usize, height: usize, width: usize, tiling: Tiling) -> Result<Vec<f32>> {
+        let (s, t) = self.cfg.factors();
+        tiling.check(s as usize, t as usize)?;
+        let z = self.denormalise(latent, frames, height, width)?;
+        let out = match tiling.temporal {
+            Some(tt) if frames > tt.min / t as usize => self.temporal_tiled(&z, tiling, tt)?,
+            _ => self.spatial_or_whole(&z, tiling)?,
+        };
+        Ok(out.d)
+    }
+
+    fn denormalise(&self, latent: &[f32], frames: usize, height: usize, width: usize) -> Result<Vol> {
         let c = self.cfg.latent_channels as usize;
         let hw = height * width;
         if frames == 0 || hw == 0 || latent.len() != c * frames * hw {
             return Err(Error::Request("video latent size disagrees with its shape".into()));
         }
-        // [C][T][H][W] denormalised to the graph's [T][C][H][W].
-        let mut z = vec![0f32; latent.len()];
+        let mut d = latent.to_vec();
+        for (ch, plane) in d.chunks_exact_mut(frames * hw).enumerate() {
+            for v in plane {
+                *v = *v * self.std[ch] + self.mean[ch];
+            }
+        }
+        Ok(Vol { c, t: frames, h: height, w: width, d })
+    }
+
+    fn spatial_or_whole(&self, z: &Vol, tiling: Tiling) -> Result<Vol> {
+        let s = self.cfg.factors().0 as usize;
+        match tiling.spatial {
+            Some(ts) if z.w > ts.min / s || z.h > ts.min / s => self.spatial_tiled(z, ts),
+            _ => self.run(z),
+        }
+    }
+
+    fn spatial_tiled(&self, z: &Vol, ts: Tile) -> Result<Vol> {
+        let s = self.cfg.factors().0 as usize;
+        let (lmin, lstride, fade) = (ts.min / s, ts.stride / s, ts.min - ts.stride);
+        let mut rows = Vec::new();
+        for i in (0..z.h).step_by(lstride) {
+            let mut row = Vec::new();
+            for j in (0..z.w).step_by(lstride) {
+                row.push(self.run(&z.crop((0, z.t), (i, i + lmin), (j, j + lmin)))?);
+            }
+            rows.push(row);
+        }
+        // Each tile blends with its already blended upper and left neighbours.
+        let mut bands = Vec::with_capacity(rows.len());
+        for i in 0..rows.len() {
+            let (done, rest) = rows.split_at_mut(i);
+            let row = &mut rest[0];
+            for j in 0..row.len() {
+                if i > 0 {
+                    blend(&done[i - 1][j], &mut row[j], 2, fade);
+                }
+                if j > 0 {
+                    let (left, cur) = row.split_at_mut(j);
+                    blend(&left[j - 1], &mut cur[0], 3, fade);
+                }
+            }
+            let kept: Vec<Vol> = row.iter().map(|tile| tile.crop((0, tile.t), (0, ts.stride), (0, ts.stride))).collect();
+            bands.push(Vol::cat(&kept, 3));
+        }
+        let out = Vol::cat(&bands, 2);
+        Ok(out.crop((0, out.t), (0, z.h * s), (0, z.w * s)))
+    }
+
+    fn temporal_tiled(&self, z: &Vol, tiling: Tiling, tt: Tile) -> Result<Vol> {
+        let t = self.cfg.factors().1 as usize;
+        let (lmin, lstride, blend_frames) = (tt.min / t, tt.stride / t, tt.min - tt.stride);
+        let mut tiles = Vec::new();
+        for i in (0..z.t).step_by(lstride) {
+            let mut d = self.spatial_or_whole(&z.crop((i, i + lmin + 1), (0, z.h), (0, z.w)), tiling)?;
+            if i > 0 {
+                d = d.crop((0, d.t - 1), (0, d.h), (0, d.w));
+            }
+            tiles.push(d);
+        }
+        let mut kept = Vec::with_capacity(tiles.len());
+        for i in 0..tiles.len() {
+            let (done, rest) = tiles.split_at_mut(i);
+            let tile = &mut rest[0];
+            if i > 0 {
+                blend(&done[i - 1], tile, 1, blend_frames);
+                kept.push(tile.crop((0, tt.stride), (0, tile.h), (0, tile.w)));
+            } else {
+                kept.push(tile.crop((0, tt.stride + 1), (0, tile.h), (0, tile.w)));
+            }
+        }
+        let out = Vol::cat(&kept, 1);
+        Ok(out.crop((0, (z.t - 1) * t + 1), (0, out.h), (0, out.w)))
+    }
+
+    /// One decoder graph over denormalised latents.
+    fn run(&self, z: &Vol) -> Result<Vol> {
+        let (c, frames, height, width) = (z.c, z.t, z.h, z.w);
+        let hw = height * width;
+        // [C][T][H][W] to the graph's [T][C][H][W].
+        let mut zt = vec![0f32; z.d.len()];
         for ch in 0..c {
             for t in 0..frames {
-                let src = &latent[(ch * frames + t) * hw..][..hw];
-                let dst = &mut z[(t * c + ch) * hw..][..hw];
-                for (d, s) in dst.iter_mut().zip(src) {
-                    *d = s * self.std[ch] + self.mean[ch];
-                }
+                zt[(t * c + ch) * hw..][..hw].copy_from_slice(&z.d[(ch * frames + t) * hw..][..hw]);
             }
         }
         let mut g = Graph::new(&self.backend)?;
         let input = g.input(sys::GGML_TYPE_F32, &[width as i64, height as i64, c as i64, frames as i64]);
         let out = build(&mut g, &self.cfg, &self.w, input);
         g.finish(&[out])?;
-        g.set_f32(input, &z);
+        g.set_f32(input, &zt);
         g.compute()?;
         let y = g.read_f32(out);
         let (ow, oh, oc, of) = (out.ne(0) as usize, out.ne(1) as usize, out.ne(2) as usize, out.ne(3) as usize);
@@ -410,13 +509,156 @@ impl Ltx2VideoDecoder {
                 }
             }
         }
-        Ok(px)
+        Ok(Vol { c: rgb, t: of, h: ph, w: pw, d: px })
+    }
+}
+
+/// Tile extent and step along one axis, in video samples (frames or pixels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tile {
+    /// Samples one tile covers.
+    pub min: usize,
+    /// Samples between tile starts; `min - stride` samples are blended.
+    pub stride: usize,
+}
+
+/// How [`Ltx2VideoDecoder::decode_tiled`] splits a clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tiling {
+    /// Square tiles over height and width.
+    pub spatial: Option<Tile>,
+    /// Tiles over frames.
+    pub temporal: Option<Tile>,
+}
+
+impl Default for Tiling {
+    /// 512 pixel tiles every 448 pixels, 16 frame tiles every 8 frames.
+    fn default() -> Self {
+        Self { spatial: Some(Tile { min: 512, stride: 448 }), temporal: Some(Tile { min: 16, stride: 8 }) }
+    }
+}
+
+impl Tiling {
+    fn check(self, s: usize, t: usize) -> Result<()> {
+        for (tile, f, axis) in [(self.spatial, s, "spatial"), (self.temporal, t, "temporal")] {
+            if let Some(Tile { min, stride }) = tile {
+                if stride == 0 || stride > min || min % f != 0 || stride % f != 0 {
+                    return Err(Error::Request(format!("{axis} tiles must be multiples of {f} with 0 < stride <= min")));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A `[C][T][H][W]` volume.
+#[derive(Debug, Clone)]
+struct Vol {
+    c: usize,
+    t: usize,
+    h: usize,
+    w: usize,
+    d: Vec<f32>,
+}
+
+impl Vol {
+    fn dims(&self) -> [usize; 4] {
+        [self.c, self.t, self.h, self.w]
+    }
+
+    /// The sub-volume over half-open ranges, each clamped to the volume.
+    fn crop(&self, (t0, t1): (usize, usize), (h0, h1): (usize, usize), (w0, w1): (usize, usize)) -> Vol {
+        let (t1, h1, w1) = (t1.min(self.t), h1.min(self.h), w1.min(self.w));
+        let (t, h, w) = (t1 - t0, h1 - h0, w1 - w0);
+        let mut d = Vec::with_capacity(self.c * t * h * w);
+        for c in 0..self.c {
+            for tt in t0..t1 {
+                for hh in h0..h1 {
+                    let at = ((c * self.t + tt) * self.h + hh) * self.w;
+                    d.extend_from_slice(&self.d[at + w0..at + w1]);
+                }
+            }
+        }
+        Vol { c: self.c, t, h, w, d }
+    }
+
+    /// Concatenation along `axis` (1 = frames, 2 = rows, 3 = columns).
+    fn cat(parts: &[Vol], axis: usize) -> Vol {
+        let mut dims = parts[0].dims();
+        dims[axis] = parts.iter().map(|p| p.dims()[axis]).sum();
+        // Every part splits into `outer` runs of `inner` contiguous values.
+        let outer: usize = dims[..axis].iter().product();
+        let mut d = Vec::with_capacity(dims.iter().product());
+        for o in 0..outer {
+            for p in parts {
+                let inner = p.d.len() / outer;
+                d.extend_from_slice(&p.d[o * inner..][..inner]);
+            }
+        }
+        Vol { c: dims[0], t: dims[1], h: dims[2], w: dims[3], d }
+    }
+}
+
+/// Fade the first `extent` samples of `b` along `axis` in from the last ones
+/// of `a`: `b[k] = a[n - extent + k] (1 - k / extent) + b[k] k / extent`.
+fn blend(a: &Vol, b: &mut Vol, axis: usize, extent: usize) {
+    let (ad, bd) = (a.dims(), b.dims());
+    let extent = extent.min(ad[axis]).min(bd[axis]);
+    for c in 0..bd[0] {
+        for t in 0..bd[1] {
+            for h in 0..bd[2] {
+                for w in 0..bd[3] {
+                    let mut at = [c, t, h, w];
+                    let k = at[axis];
+                    if k >= extent {
+                        continue;
+                    }
+                    at[axis] = ad[axis] - extent + k;
+                    let src = a.d[((at[0] * ad[1] + at[1]) * ad[2] + at[2]) * ad[3] + at[3]];
+                    let f = k as f32 / extent as f32;
+                    let dst = &mut b.d[((c * bd[1] + t) * bd[2] + h) * bd[3] + w];
+                    *dst = src * (1.0 - f) + *dst * f;
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ramp(c: usize, t: usize, h: usize, w: usize) -> Vol {
+        Vol { c, t, h, w, d: (0..c * t * h * w).map(|i| i as f32).collect() }
+    }
+
+    #[test]
+    fn crops_concatenate_back() {
+        let v = ramp(2, 3, 4, 5);
+        for axis in 1..4 {
+            let n = v.dims()[axis];
+            let r = |a: usize, k: usize| if a == axis { (k, k + 2) } else { (0, usize::MAX) };
+            let parts: Vec<Vol> = (0..n).step_by(2).map(|k| v.crop(r(1, k), r(2, k), r(3, k))).collect();
+            assert_eq!(Vol::cat(&parts, axis).d, v.d, "axis {axis}");
+        }
+    }
+
+    #[test]
+    fn blend_fades_linearly() {
+        let a = Vol { c: 1, t: 1, h: 1, w: 4, d: vec![0.0, 0.0, 8.0, 8.0] };
+        let mut b = Vol { c: 1, t: 1, h: 1, w: 3, d: vec![0.0, 4.0, 4.0] };
+        blend(&a, &mut b, 3, 2);
+        assert_eq!(b.d, vec![8.0, 6.0, 4.0]);
+    }
+
+    #[test]
+    fn tiling_must_divide_by_the_upsampling() {
+        assert!(Tiling::default().check(32, 8).is_ok());
+        let bad = Tiling { spatial: Some(Tile { min: 500, stride: 448 }), temporal: None };
+        assert!(bad.check(32, 8).is_err());
+        let bad = Tiling { spatial: None, temporal: Some(Tile { min: 8, stride: 16 }) };
+        assert!(bad.check(32, 8).is_err());
+    }
 
     #[test]
     fn released_layout() {
