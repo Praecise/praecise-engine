@@ -123,6 +123,9 @@ pub enum TrainError {
     /// The selection matched no F32 parameter.
     #[error("no parameter selected")]
     NoParameters,
+    /// A weight is in a CPU extra buffer type (a repacked layout) that only runs the forward pass.
+    #[error("a weight is in a repacked buffer; load the model with use_extra_bufts disabled")]
+    ExtraBufferWeights,
     /// A pass before initialization.
     #[error("the context is not initialized for training")]
     NotTraining,
@@ -194,32 +197,41 @@ impl LlamaContext<'_> {
             -2 => Err(TrainError::NoDifferentiableMemory),
             -3 => Err(TrainError::KvCacheNotF32),
             -4 => Err(TrainError::NoParameters),
+            -6 => Err(TrainError::ExtraBufferWeights),
             other => Err(TrainError::Engine(format!("llama_opt_grad_init returned {other}"))),
         }
     }
 
-    /// Runs one sequence at positions `0..tokens.len()` from an empty memory. `logits` receives
-    /// `tokens.len() x n_vocab` forward logits. With `targets` (`tokens.len() x n_vocab`) the pass
-    /// also adds the gradient of the context's [`GradLoss`] to the parameter gradients.
+    /// Number of floats in the outputs of a pass over `n_tokens`: the logits
+    /// (`n_tokens x n_vocab`) of a generative context; for an embedding context the per-token
+    /// embeddings (no pooling), the rank scores, or the pooled embedding.
+    #[must_use]
+    pub fn grad_output_size(&self, n_tokens: usize) -> usize {
+        let n = i32::try_from(n_tokens).unwrap_or(i32::MAX);
+        usize::try_from(unsafe { llama_cpp_sys_2::llama_opt_grad_output_size(self.context.as_ptr(), n) }).unwrap_or(0)
+    }
+
+    /// Runs one sequence at positions `0..tokens.len()` from an empty memory. `outputs` receives
+    /// the forward outputs ([`Self::grad_output_size`] floats). With `targets` (as many floats) the
+    /// pass also adds the gradient of the context's [`GradLoss`] to the parameter gradients.
     ///
     /// # Errors
     ///
-    /// The refusal reasons of [`TrainError`], and [`TrainError::Length`] for a target or logit
+    /// The refusal reasons of [`TrainError`], and [`TrainError::Length`] for a target or output
     /// buffer of the wrong size.
     pub fn grad_sequence(
         &mut self,
         tokens: &[LlamaToken],
         targets: Option<&[f32]>,
-        logits: Option<&mut [f32]>,
+        outputs: Option<&mut [f32]>,
     ) -> Result<(), TrainError> {
-        let n_vocab = usize::try_from(self.model.n_vocab()).unwrap_or(0);
-        let want = tokens.len() * n_vocab;
+        let want = self.grad_output_size(tokens.len());
         if let Some(t) = targets {
             if t.len() != want {
                 return Err(TrainError::Length { expected: want, got: t.len() });
             }
         }
-        if let Some(l) = logits.as_deref() {
+        if let Some(l) = outputs.as_deref() {
             if l.len() != want {
                 return Err(TrainError::Length { expected: want, got: l.len() });
             }
@@ -232,7 +244,7 @@ impl LlamaContext<'_> {
                 ids.as_ptr(),
                 n_tokens,
                 targets.map_or(std::ptr::null(), <[f32]>::as_ptr),
-                logits.map_or(std::ptr::null_mut(), <[f32]>::as_mut_ptr),
+                outputs.map_or(std::ptr::null_mut(), <[f32]>::as_mut_ptr),
             )
         };
         match rc {
@@ -307,7 +319,7 @@ impl LlamaModel {
             )
         };
         NonNull::new(model)
-            .map(|model| LlamaModel { model })
+            .map(|model| LlamaModel { model, served_lora: None })
             .ok_or_else(|| TrainError::Engine("the metadata does not describe a buildable model".into()))
     }
 }

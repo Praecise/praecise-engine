@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::LlamaModel;
@@ -19,10 +19,12 @@ use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::train::{GgufMetadata, write_lora_gguf};
 use praecise_train::Error;
 use praecise_train::engine::{
+    ContrastivePair, RegressionExample, RerankGroup,
     DistillExample, EngineConfig, LoraTrainer, PreferencePair, Rollout, RolloutGroup, SftExample, StepBatch, init_lora_weights,
     log_softmax_at, sequence_logprobs,
 };
 use praecise_train::hash::sha256;
+use praecise_train::reward::{Reward, TokenFraction};
 use praecise_train::philox::{Philox, uniform_f64};
 use praecise_train::kernel_class::{Backend, KernelClass};
 use praecise_train::recipe::{AdapterSpec, Objective, OptimizerSpec, Precision, Recipe};
@@ -136,7 +138,7 @@ const PROBE: [i32; 8] = [1, 4, 7, 1, 4, 7, 1, 4];
 fn trainer(threads: i32, opt: OptimizerSpec) -> LoraTrainer<'static> {
     let r = recipe(opt);
     let path = adapter_file(&r, 11);
-    LoraTrainer::new(backend(), model(), &path, r, EngineConfig { n_ctx: N_CTX, n_threads: threads, deterministic: Some(Backend::Cpu) }).unwrap()
+    LoraTrainer::new(backend(), model(), &path, r, EngineConfig { n_ctx: N_CTX, n_threads: threads, deterministic: Some(Backend::Cpu), pooling: None }).unwrap()
 }
 
 #[test]
@@ -206,13 +208,13 @@ fn steps_are_bitwise_reproducible() {
 #[test]
 fn refusals() {
     let mut r = recipe(adamw());
-    r.objective = Objective::InfoNce { temperature: 0.05 };
-    let path = adapter_file(&recipe(adamw()), 1);
-    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: None };
-    assert!(matches!(LoraTrainer::new(backend(), model(), &path, r, cfg), Err(Error::Refused(_))));
-    let mut r = recipe(adamw());
     r.adapter = None;
+    let path = adapter_file(&recipe(adamw()), 1);
+    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: None, pooling: None };
     assert!(matches!(LoraTrainer::new(backend(), model(), &path, r, cfg), Err(Error::Refused(_))));
+    // a generative trainer has logits; an embedding trainer refuses them
+    let mut e = trainer_for_pooled(Objective::RerankBce, adamw());
+    assert!(matches!(e.logits(&[1, 2]), Err(Error::Refused(_))));
     let mut t = trainer(2, adamw());
     let empty = StepBatch::Sft(vec![SftExample { tokens: vec![1, 2, 3], target_mask: vec![false, false, false] }]);
     assert!(matches!(t.step(&empty), Err(Error::Refused(_))));
@@ -221,7 +223,7 @@ fn refusals() {
     // leaves the state unchanged
     let r = recipe(adamw());
     let path = adapter_file(&r, 1);
-    let gpu = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: Some(Backend::Cuda) };
+    let gpu = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: Some(Backend::Cuda), pooling: None };
     let mut t = LoraTrainer::new(backend(), model(), &path, r, gpu).unwrap();
     let before = t.state().unwrap().state_root();
     assert!(matches!(t.step(&batch(0)), Err(Error::Refused(m)) if m.contains("deterministic")));
@@ -282,7 +284,7 @@ fn recipe_for(objective: Objective, optimizer: OptimizerSpec) -> Recipe {
 fn trainer_for(objective: Objective, optimizer: OptimizerSpec) -> LoraTrainer<'static> {
     let r = recipe_for(objective, optimizer);
     let path = adapter_file(&r, 23);
-    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 4, deterministic: Some(Backend::Cpu) };
+    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 4, deterministic: Some(Backend::Cpu), pooling: None };
     LoraTrainer::new(backend(), model(), &path, r, cfg).unwrap()
 }
 
@@ -379,7 +381,8 @@ fn grpo_raises_a_verifiable_reward() {
     let mut reference = serving(model());
     let mut t = trainer_for(Objective::Grpo { clip: 0.2, kl_weight: 0.01 }, adamw());
     let prompt = [1, 2];
-    let reward = |seq: &[i32]| seq[2..].iter().filter(|&&x| x == 7).count() as f64 / (seq.len() - 2) as f64;
+    let rewarder = TokenFraction { tokens: vec![7] };
+    let reward = |seq: &[i32]| rewarder.score(&seq[..2], &seq[2..]).unwrap();
     let mut means = Vec::new();
     for step in 0..30u64 {
         let mut rollouts = Vec::new();
@@ -435,4 +438,96 @@ fn distillation_pulls_the_student_to_the_teacher() {
     }
     let kl1 = kl(&mut t, &mut teach);
     assert!(kl1 < 0.7 * kl0, "reverse KL {kl0} -> {kl1}");
+}
+
+fn trainer_for_pooled(objective: Objective, optimizer: OptimizerSpec) -> LoraTrainer<'static> {
+    let r = recipe_for(objective, optimizer);
+    let path = adapter_file(&r, 29);
+    let cfg = EngineConfig { n_ctx: N_CTX, n_threads: 4, deterministic: Some(Backend::Cpu), pooling: Some(LlamaPoolingType::Mean) };
+    LoraTrainer::new(backend(), model(), &path, r, cfg).unwrap()
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    dot / (na * nb)
+}
+
+/// Mean nDCG of the positive document over all queries (one relevant document each).
+fn ndcg(t: &mut LoraTrainer<'_>, pairs: &[ContrastivePair]) -> f64 {
+    let q: Vec<Vec<f32>> = pairs.iter().map(|p| t.outputs(&p.query).unwrap()).collect();
+    let d: Vec<Vec<f32>> = pairs.iter().map(|p| t.outputs(&p.positive).unwrap()).collect();
+    let mut total = 0.0;
+    for i in 0..pairs.len() {
+        let si = cosine(&q[i], &d[i]);
+        let rank = (0..pairs.len()).filter(|&j| j != i && cosine(&q[i], &d[j]) > si).count();
+        total += 1.0 / ((rank + 2) as f64).log2();
+    }
+    total / pairs.len() as f64
+}
+
+#[test]
+fn contrastive_embeddings_raise_retrieval_ndcg() {
+    let pairs: Vec<ContrastivePair> = (0..6)
+        .map(|i: i32| ContrastivePair {
+            query: vec![(i * 5 + 1) % 31 + 1, (i * 7 + 2) % 31 + 1, (i * 3 + 4) % 31 + 1],
+            positive: vec![(i * 11 + 3) % 31 + 1, (i * 13 + 5) % 31 + 1, (i * 17 + 6) % 31 + 1, (i * 2 + 9) % 31 + 1],
+        })
+        .collect();
+    let mut t = trainer_for_pooled(Objective::InfoNce { temperature: 0.1 }, adamw());
+    let before = ndcg(&mut t, &pairs);
+    let batch = StepBatch::Contrastive(pairs.clone());
+    let first = t.step(&batch).unwrap().loss;
+    let mut last = first;
+    for _ in 1..30 {
+        last = t.step(&batch).unwrap().loss;
+    }
+    let after = ndcg(&mut t, &pairs);
+    assert!(after > before && after > 0.9 && last < first, "nDCG {before} -> {after}, loss {first} -> {last}");
+}
+
+#[test]
+fn reranking_learns_the_relevant_candidate() {
+    let groups: Vec<RerankGroup> = (0..3)
+        .map(|g: i32| RerankGroup {
+            candidates: (0..4).map(|c: i32| vec![g + 1, 20, (g * 4 + c) % 8 + 2, if c == g % 4 { 9 } else { 10 }]).collect(),
+            labels: (0..4).map(|c| if c == g % 4 { 1.0 } else { 0.0 }).collect(),
+        })
+        .collect();
+    for objective in [Objective::RerankListwise, Objective::RerankBce] {
+        let mut t = trainer_for_pooled(objective.clone(), adamw());
+        let batch = StepBatch::Rerank(groups.clone());
+        let first = t.step(&batch).unwrap().loss;
+        let mut last = first;
+        for _ in 1..30 {
+            last = t.step(&batch).unwrap().loss;
+        }
+        let mut correct = 0;
+        for grp in &groups {
+            let scores: Vec<f32> = grp.candidates.iter().map(|c| t.outputs(c).unwrap()[0]).collect();
+            let best = (0..scores.len()).max_by(|&a, &b| scores[a].total_cmp(&scores[b])).unwrap();
+            correct += usize::from(grp.labels[best] == 1.0);
+        }
+        assert!(last < 0.5 * first && correct == groups.len(), "{objective:?}: loss {first} -> {last}, top-1 {correct}/3");
+    }
+}
+
+#[test]
+fn quantile_regression_lowers_the_pinball_loss() {
+    let batch: Vec<RegressionExample> = (0..6)
+        .map(|i: i32| {
+            let tokens: Vec<i32> = (0..5).map(|k| if k <= i % 5 { 3 } else { (i + k) % 7 + 4 }).collect();
+            let target = f64::from(tokens.iter().filter(|&&x| x == 3).count() as u8) / 5.0;
+            RegressionExample { tokens, target }
+        })
+        .collect();
+    let mut t = trainer_for_pooled(Objective::Pinball { quantiles: vec![0.1, 0.5, 0.9] }, adamw());
+    let b = StepBatch::Regression(batch);
+    let first = t.step(&b).unwrap().loss;
+    let mut last = first;
+    for _ in 1..40 {
+        last = t.step(&b).unwrap().loss;
+    }
+    assert!(last < 0.5 * first, "pinball {first} -> {last}");
 }

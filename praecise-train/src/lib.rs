@@ -14,6 +14,7 @@
 //! - [`kernel_class`]: kernel classes, deterministic-mode op checks and device
 //!   resolution that refuses a missing accelerator.
 //! - [`recipe`]: the canonical recipe and its hash.
+//! - [`reward`]: rewards for policy optimization and their digest.
 //! - [`update`]: parameter-delta and optimizer-state primitives.
 //! - [`objective`]: token objectives (SFT, DPO, GRPO, distillation) as per-token
 //!   weights, and the Muon orthogonalization.
@@ -32,6 +33,7 @@ pub mod merkle;
 pub mod objective;
 pub mod philox;
 pub mod recipe;
+pub mod reward;
 pub mod sampler;
 pub mod steplog;
 pub mod update;

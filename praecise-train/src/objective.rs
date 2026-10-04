@@ -162,6 +162,105 @@ pub fn newton_schulz(m: &[f32], rows: usize, cols: usize, steps: u32) -> Vec<f32
     }
 }
 
+/// `InfoNCE` with in-batch negatives over cosine similarities divided by `temperature`: query `i`'s
+/// positive is document `i` and every other document is a negative. Returns the mean loss over
+/// queries and its gradients with respect to every query and document embedding.
+///
+/// # Panics
+/// When the batch is empty or the counts or widths differ.
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::type_complexity, clippy::many_single_char_names)]
+pub fn info_nce(queries: &[Vec<f32>], docs: &[Vec<f32>], temperature: f64) -> (f64, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let n = queries.len();
+    assert!(n > 0 && docs.len() == n, "one positive document per query");
+    let unit = |v: &Vec<f32>| -> (Vec<f64>, f64) {
+        let norm = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt().max(1e-12);
+        (v.iter().map(|&x| f64::from(x) / norm).collect(), norm)
+    };
+    let q: Vec<(Vec<f64>, f64)> = queries.iter().map(unit).collect();
+    let d: Vec<(Vec<f64>, f64)> = docs.iter().map(unit).collect();
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let mut loss = 0.0;
+    // gradients with respect to the unit vectors
+    let mut gq: Vec<Vec<f64>> = q.iter().map(|(v, _)| vec![0.0; v.len()]).collect();
+    let mut gd: Vec<Vec<f64>> = d.iter().map(|(v, _)| vec![0.0; v.len()]).collect();
+    for i in 0..n {
+        let s: Vec<f64> = (0..n).map(|j| dot(&q[i].0, &d[j].0) / temperature).collect();
+        let mx = s.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x));
+        let z: f64 = s.iter().map(|x| (x - mx).exp()).sum();
+        loss += (mx + z.ln() - s[i]) / n as f64;
+        for j in 0..n {
+            let ds = ((s[j] - mx).exp() / z - if i == j { 1.0 } else { 0.0 }) / n as f64 / temperature;
+            for k in 0..gq[i].len() {
+                gq[i][k] += ds * d[j].0[k];
+                gd[j][k] += ds * q[i].0[k];
+            }
+        }
+    }
+    // through the normalization: g_v = (g_u - u (u . g_u)) / |v|
+    let back = |g: &mut Vec<f64>, (u, norm): &(Vec<f64>, f64)| {
+        let ug = dot(u, g);
+        for k in 0..g.len() {
+            g[k] = (g[k] - u[k] * ug) / norm;
+        }
+    };
+    for i in 0..n {
+        back(&mut gq[i], &q[i]);
+        back(&mut gd[i], &d[i]);
+    }
+    (loss, gq, gd)
+}
+
+/// Pointwise reranking: mean binary cross entropy of `sigmoid(score)` against labels in `[0, 1]`.
+/// Returns the loss and its gradient with respect to every score.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn rerank_bce(scores: &[f64], labels: &[f64]) -> (f64, Vec<f64>) {
+    let n = scores.len() as f64;
+    let mut loss = 0.0;
+    let mut g = Vec::with_capacity(scores.len());
+    for (&s, &y) in scores.iter().zip(labels) {
+        // y * softplus(-s) + (1 - y) * softplus(s)
+        let sp = |x: f64| if x > 0.0 { x + (-x).exp().ln_1p() } else { x.exp().ln_1p() };
+        loss += (y * sp(-s) + (1.0 - y) * sp(s)) / n;
+        g.push((sigmoid(s) - y) / n);
+    }
+    (loss, g)
+}
+
+/// Listwise reranking: cross entropy between the labels normalized to a distribution and the
+/// softmax of the scores of one candidate list. Returns the loss and its gradient.
+///
+/// # Panics
+/// When the labels do not sum to a positive value.
+#[must_use]
+pub fn rerank_listwise(scores: &[f64], labels: &[f64]) -> (f64, Vec<f64>) {
+    let total: f64 = labels.iter().sum();
+    assert!(total > 0.0, "a list needs a relevant candidate");
+    let mx = scores.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x));
+    let z: f64 = scores.iter().map(|x| (x - mx).exp()).sum();
+    let lse = mx + z.ln();
+    let loss = scores.iter().zip(labels).map(|(s, y)| -(y / total) * (s - lse)).sum();
+    let g = scores.iter().zip(labels).map(|(s, y)| (s - lse).exp() - y / total).collect();
+    (loss, g)
+}
+
+/// Quantile (pinball) loss of predictions for `quantiles` against a target, averaged over the
+/// quantiles. Returns the loss and its gradient with respect to every prediction.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn pinball(preds: &[f64], target: f64, quantiles: &[f64]) -> (f64, Vec<f64>) {
+    let n = quantiles.len() as f64;
+    let mut loss = 0.0;
+    let mut g = Vec::with_capacity(preds.len());
+    for (&p, &q) in preds.iter().zip(quantiles) {
+        let e = target - p;
+        loss += (q * e).max((q - 1.0) * e) / n;
+        g.push(if e > 0.0 { -q } else { 1.0 - q } / n);
+    }
+    (loss, g)
+}
+
 #[cfg(test)]
 #[allow(clippy::many_single_char_names)]
 mod tests {
@@ -245,5 +344,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn fd_check(f: &dyn Fn(&[f64]) -> f64, x: &[f64], g: &[f64], tol: f64) {
+        for k in 0..x.len() {
+            let mut a = x.to_vec();
+            let mut b = x.to_vec();
+            a[k] += 1e-6;
+            b[k] -= 1e-6;
+            let fd = (f(&a) - f(&b)) / 2e-6;
+            assert!((fd - g[k]).abs() < tol, "element {k}: fd {fd} vs {}", g[k]);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn info_nce_gradients() {
+        let q: Vec<Vec<f32>> = vec![vec![0.3, -1.0, 0.5], vec![1.0, 0.2, -0.4], vec![-0.6, 0.9, 0.1]];
+        let d: Vec<Vec<f32>> = vec![vec![0.1, -0.8, 0.7], vec![0.9, 0.5, 0.0], vec![-0.2, 0.4, 0.3]];
+        let (loss, gq, gd) = info_nce(&q, &d, 0.1);
+        assert!(loss > 0.0);
+        for i in 0..3 {
+            for (which, g) in [(0, &gq[i]), (1, &gd[i])] {
+                let base: Vec<f64> = if which == 0 { &q[i] } else { &d[i] }.iter().map(|&x| f64::from(x)).collect();
+                let f = |x: &[f64]| {
+                    let mut q2 = q.clone();
+                    let mut d2 = d.clone();
+                    let v: Vec<f32> = x.iter().map(|&y| y as f32).collect();
+                    if which == 0 { q2[i] = v } else { d2[i] = v }
+                    info_nce(&q2, &d2, 0.1).0
+                };
+                // f32 inputs: compare with a tolerance matching their precision
+                for k in 0..3 {
+                    let mut a = base.clone();
+                    let mut b = base.clone();
+                    a[k] += 1e-3;
+                    b[k] -= 1e-3;
+                    let fd = (f(&a) - f(&b)) / 2e-3;
+                    assert!((fd - g[k]).abs() < 1e-3 * g[k].abs().max(1.0), "{which} {i} {k}: fd {fd} vs {}", g[k]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rerank_and_pinball_gradients() {
+        let s = [0.4, -1.2, 2.0, 0.1];
+        let y = [1.0, 0.0, 0.5, 0.0];
+        let (_, g) = rerank_bce(&s, &y);
+        fd_check(&|x| rerank_bce(x, &y).0, &s, &g, 1e-6);
+        let (_, g) = rerank_listwise(&s, &y);
+        fd_check(&|x| rerank_listwise(x, &y).0, &s, &g, 1e-6);
+        let q = [0.1, 0.5, 0.9];
+        let p = [0.2, 0.55, 1.4];
+        let (l, g) = pinball(&p, 0.6, &q);
+        assert!(l > 0.0);
+        fd_check(&|x| pinball(x, 0.6, &q).0, &p, &g, 1e-6);
     }
 }

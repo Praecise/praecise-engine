@@ -574,6 +574,14 @@ impl LlamaModelParams {
         self
     }
 
+    /// sets `use_extra_bufts`: CPU extra buffer types (repacked weight layouts). A model that
+    /// computes gradients needs them disabled.
+    #[must_use]
+    pub fn with_use_extra_bufts(mut self, use_extra_bufts: bool) -> Self {
+        self.params.use_extra_bufts = use_extra_bufts;
+        self
+    }
+
     /// sets `split_mode`
     #[must_use]
     pub fn with_split_mode(mut self, split_mode: LlamaSplitMode) -> Self {

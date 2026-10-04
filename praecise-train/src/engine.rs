@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{LlamaLoraAdapter, LlamaModel};
@@ -25,7 +25,10 @@ use crate::Error;
 use crate::checkpoint::{Tensor, TrainState};
 use crate::hash::{Digest, domain_hash, sha256};
 use crate::kernel_class::{Backend, check_deterministic};
-use crate::objective::{dlogits, distill_token, dpo, group_advantages, grpo_token, newton_schulz, token_logprobs};
+use crate::objective::{
+    dlogits, distill_token, dpo, group_advantages, grpo_token, info_nce, newton_schulz, pinball, rerank_bce, rerank_listwise,
+    token_logprobs,
+};
 use crate::philox::{Philox, normal_f64};
 use crate::recipe::{AdapterSpec, Objective, OptimizerSpec, Recipe};
 use crate::steplog::{StepResult, StepSpec};
@@ -109,6 +112,33 @@ pub struct DistillExample {
     pub teacher_logprobs: Vec<f64>,
 }
 
+/// A query and its positive document; the other documents of the batch are its negatives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContrastivePair {
+    /// Query tokens.
+    pub query: Vec<i32>,
+    /// Positive document tokens.
+    pub positive: Vec<i32>,
+}
+
+/// Candidates for one query with relevance labels in `[0, 1]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerankGroup {
+    /// Candidate sequences (query and candidate together, as the model scores them).
+    pub candidates: Vec<Vec<i32>>,
+    /// Relevance of each candidate.
+    pub labels: Vec<f64>,
+}
+
+/// A sequence and the value whose quantiles the model predicts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegressionExample {
+    /// Input tokens.
+    pub tokens: Vec<i32>,
+    /// Target value.
+    pub target: f64,
+}
+
 /// The batch of one step, matching the recipe's objective.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepBatch {
@@ -120,6 +150,12 @@ pub enum StepBatch {
     Grpo(Vec<RolloutGroup>),
     /// Student samples with teacher log-probs.
     Distill(Vec<DistillExample>),
+    /// Query and positive pairs for contrastive embeddings.
+    Contrastive(Vec<ContrastivePair>),
+    /// Candidate lists for pointwise or listwise reranking.
+    Rerank(Vec<RerankGroup>),
+    /// Sequences with targets for quantile regression.
+    Regression(Vec<RegressionExample>),
 }
 
 /// Initial adapter weights: `A` from a seeded normal scaled by `1/sqrt(n_in)`, `B` zero, so the
@@ -197,6 +233,10 @@ pub struct EngineConfig {
     /// must be in that backend's deterministic kernel set, or the step is refused before its
     /// update. `None` turns the check off.
     pub deterministic: Option<Backend>,
+    /// Pooling of the embedding context that embedding, reranking and regression objectives
+    /// train; `None` uses the model's own. A score is the first pooled output and the quantile
+    /// predictions are the first outputs, one per quantile.
+    pub pooling: Option<LlamaPoolingType>,
 }
 
 /// `LoRA` training of one model.
@@ -212,6 +252,7 @@ pub struct LoraTrainer<'m> {
     recipe: Recipe,
     n_vocab: usize,
     deterministic: Option<Backend>,
+    embedding: bool,
 }
 
 impl<'m> LoraTrainer<'m> {
@@ -219,8 +260,7 @@ impl<'m> LoraTrainer<'m> {
     /// `model` and makes its tensors the trainable parameters.
     ///
     /// # Errors
-    /// [`Error::Refused`] for a recipe without an adapter, an objective this trainer does not run
-    /// on token log-probs (embedding, reranking and quantile objectives), and engine refusals.
+    /// [`Error::Refused`] for a recipe without an adapter, and engine refusals.
     pub fn new(
         backend: &LlamaBackend,
         model: &'m LlamaModel,
@@ -233,9 +273,12 @@ impl<'m> LoraTrainer<'m> {
         }
         let loss = match recipe.objective {
             Objective::Sft => GradLoss::CrossEntropy,
-            Objective::Dpo { .. } | Objective::Grpo { .. } | Objective::Distill => GradLoss::WeightedSum,
-            _ => return Err(Error::Refused(format!("objective {:?} is not a token objective", recipe.objective))),
+            _ => GradLoss::WeightedSum,
         };
+        let embedding = matches!(
+            recipe.objective,
+            Objective::InfoNce { .. } | Objective::RerankBce | Objective::RerankListwise | Objective::Pinball { .. }
+        );
         let mut adapter = model.lora_adapter_init(adapter_path).map_err(engine)?;
         let params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(config.n_ctx))
@@ -246,7 +289,9 @@ impl<'m> LoraTrainer<'m> {
             .with_n_threads_batch(config.n_threads)
             .with_type_k(KvCacheType::F32)
             .with_type_v(KvCacheType::F32)
-            .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED);
+            .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED)
+            .with_embeddings(embedding)
+            .with_pooling_type(config.pooling.unwrap_or(LlamaPoolingType::Unspecified));
         let mut ctx = model.new_context(backend, params).map_err(engine)?;
         ctx.lora_adapter_set(&mut adapter, 1.0).map_err(engine)?;
         ctx.grad_init(loss, |name| name.ends_with(".lora_a") || name.ends_with(".lora_b")).map_err(engine)?;
@@ -256,7 +301,7 @@ impl<'m> LoraTrainer<'m> {
         let m = params.iter().map(|(_, t)| vec![0.0; t.n_elements()]).collect();
         let v = params.iter().map(|(_, t)| vec![0.0; t.n_elements()]).collect();
         let n_vocab = usize::try_from(model.n_vocab()).map_err(engine)?;
-        Ok(Self { ctx, _adapter: adapter, params, m, v, step: 0, recipe, n_vocab, deterministic: config.deterministic })
+        Ok(Self { ctx, _adapter: adapter, params, m, v, step: 0, recipe, n_vocab, deterministic: config.deterministic, embedding })
     }
 
     /// Optimizer steps taken.
@@ -270,10 +315,49 @@ impl<'m> LoraTrainer<'m> {
     /// # Errors
     /// Engine refusals.
     pub fn logits(&mut self, tokens: &[i32]) -> Result<Vec<f32>, Error> {
+        if self.embedding {
+            return Err(Error::Refused("an embedding trainer has no logits".into()));
+        }
+        self.outputs(tokens)
+    }
+
+    /// Forward outputs of one sequence with the current parameters: the logits of a token
+    /// objective, the pooled outputs of an embedding, reranking or regression objective.
+    ///
+    /// # Errors
+    /// Engine refusals.
+    pub fn outputs(&mut self, tokens: &[i32]) -> Result<Vec<f32>, Error> {
         let toks: Vec<LlamaToken> = tokens.iter().map(|&t| LlamaToken(t)).collect();
-        let mut logits = vec![0.0f32; tokens.len() * self.n_vocab];
-        self.ctx.grad_sequence(&toks, None, Some(&mut logits)).map_err(engine)?;
-        Ok(logits)
+        let mut out = vec![0.0f32; self.ctx.grad_output_size(tokens.len())];
+        self.ctx.grad_sequence(&toks, None, Some(&mut out)).map_err(engine)?;
+        Ok(out)
+    }
+
+    /// Adds the gradient of `sum(d * outputs(tokens))`.
+    fn backward_outputs(&mut self, tokens: &[i32], d: &[f64]) -> Result<(), Error> {
+        #[allow(clippy::cast_possible_truncation)]
+        let d: Vec<f32> = d.iter().map(|&x| x as f32).collect();
+        self.backward(tokens, &d, None)
+    }
+
+    /// The first `n` pooled outputs of every sequence.
+    fn heads(&mut self, seqs: &[Vec<i32>], n: usize) -> Result<Vec<Vec<f64>>, Error> {
+        seqs.iter()
+            .map(|t| {
+                self.check_tokens(t)?;
+                let out = self.outputs(t)?;
+                if out.len() < n {
+                    return Err(Error::Refused(format!("the pooled output has {} values, {n} needed", out.len())));
+                }
+                Ok(out[..n].iter().map(|&x| f64::from(x)).collect())
+            })
+            .collect()
+    }
+
+    fn head_grad(&self, tokens: &[i32], g: &[f64]) -> Vec<f64> {
+        let mut d = vec![0.0; self.ctx.grad_output_size(tokens.len())];
+        d[..g.len()].copy_from_slice(g);
+        d
     }
 
     /// Log-probs of `tokens[1..]` with the current parameters.
@@ -328,6 +412,13 @@ impl<'m> LoraTrainer<'m> {
             (Objective::Dpo { beta }, StepBatch::Dpo(b)) => self.accumulate_dpo(*beta, b)?,
             (Objective::Grpo { clip, kl_weight }, StepBatch::Grpo(b)) => self.accumulate_grpo(*clip, *kl_weight, b)?,
             (Objective::Distill, StepBatch::Distill(b)) => self.accumulate_distill(b)?,
+            (Objective::InfoNce { temperature }, StepBatch::Contrastive(b)) => self.accumulate_contrastive(*temperature, b)?,
+            (Objective::RerankBce, StepBatch::Rerank(b)) => self.accumulate_rerank(false, b)?,
+            (Objective::RerankListwise, StepBatch::Rerank(b)) => self.accumulate_rerank(true, b)?,
+            (Objective::Pinball { quantiles }, StepBatch::Regression(b)) => {
+                let q = quantiles.clone();
+                self.accumulate_regression(&q, b)?
+            }
             _ => return Err(Error::Refused("the batch does not match the recipe's objective".into())),
         };
         let grad_norm = self.apply_update()?;
@@ -465,6 +556,70 @@ impl<'m> LoraTrainer<'m> {
         Ok(loss)
     }
 
+    fn accumulate_contrastive(&mut self, temperature: f64, batch: &[ContrastivePair]) -> Result<f64, Error> {
+        if batch.len() < 2 {
+            return Err(Error::Refused("in-batch negatives need at least two pairs".into()));
+        }
+        let mut q = Vec::with_capacity(batch.len());
+        let mut d = Vec::with_capacity(batch.len());
+        for p in batch {
+            self.check_tokens(&p.query)?;
+            self.check_tokens(&p.positive)?;
+            q.push(self.outputs(&p.query)?);
+            d.push(self.outputs(&p.positive)?);
+        }
+        let (loss, gq, gd) = info_nce(&q, &d, temperature);
+        for (p, (gq, gd)) in batch.iter().zip(gq.iter().zip(&gd)) {
+            self.backward_outputs(&p.query, gq)?;
+            self.backward_outputs(&p.positive, gd)?;
+        }
+        Ok(loss)
+    }
+
+    fn accumulate_rerank(&mut self, listwise: bool, batch: &[RerankGroup]) -> Result<f64, Error> {
+        if batch.is_empty() {
+            return Err(Error::Refused("the batch has no candidate lists".into()));
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let n_groups = batch.len() as f64;
+        let mut loss = 0.0;
+        for grp in batch {
+            if grp.candidates.is_empty() || grp.candidates.len() != grp.labels.len() {
+                return Err(Error::Refused("one label per candidate".into()));
+            }
+            if listwise && grp.labels.iter().sum::<f64>() <= 0.0 {
+                return Err(Error::Refused("a listwise group needs a relevant candidate".into()));
+            }
+            let scores: Vec<f64> = self.heads(&grp.candidates, 1)?.into_iter().map(|h| h[0]).collect();
+            let (l, g) = if listwise { rerank_listwise(&scores, &grp.labels) } else { rerank_bce(&scores, &grp.labels) };
+            loss += l / n_groups;
+            for (c, gi) in grp.candidates.iter().zip(g) {
+                let d = self.head_grad(c, &[gi / n_groups]);
+                self.backward_outputs(c, &d)?;
+            }
+        }
+        Ok(loss)
+    }
+
+    fn accumulate_regression(&mut self, quantiles: &[f64], batch: &[RegressionExample]) -> Result<f64, Error> {
+        if batch.is_empty() || quantiles.is_empty() {
+            return Err(Error::Refused("the batch has no examples or the recipe no quantiles".into()));
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let n = batch.len() as f64;
+        let seqs: Vec<Vec<i32>> = batch.iter().map(|e| e.tokens.clone()).collect();
+        let preds = self.heads(&seqs, quantiles.len())?;
+        let mut loss = 0.0;
+        for (ex, p) in batch.iter().zip(&preds) {
+            let (l, g) = pinball(p, ex.target, quantiles);
+            loss += l / n;
+            let g: Vec<f64> = g.iter().map(|x| x / n).collect();
+            let d = self.head_grad(&ex.tokens, &g);
+            self.backward_outputs(&ex.tokens, &d)?;
+        }
+        Ok(loss)
+    }
+
     /// Reads the gradients, clips them by the global norm and applies the optimizer.
     fn apply_update(&mut self) -> Result<f64, Error> {
         let mut grads = Vec::with_capacity(self.params.len());
@@ -530,7 +685,8 @@ impl<'m> LoraTrainer<'m> {
     }
 
     /// Runs `spec` on `batch` and returns the step result: the new state root, the loss, the
-    /// gradient norm and a digest of the per-token log-probs of `probe` after the step.
+    /// gradient norm and a digest of the per-token log-probs of `probe` after the step (of its
+    /// pooled outputs for an embedding objective).
     ///
     /// # Errors
     /// [`Error::Mismatch`] when the current state is not `spec.state_root`, the step index is not
@@ -547,15 +703,28 @@ impl<'m> LoraTrainer<'m> {
         }
         let out = self.step(batch)?;
         let mut bytes = Vec::with_capacity(probe.len() * 8);
-        for lp in self.token_logprobs(probe)? {
-            bytes.extend_from_slice(&lp.to_le_bytes());
+        if self.embedding {
+            for x in self.outputs(probe)? {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+        } else {
+            for lp in self.token_logprobs(probe)? {
+                bytes.extend_from_slice(&lp.to_le_bytes());
+            }
         }
+        let reward_digest = match batch {
+            StepBatch::Grpo(groups) => {
+                let rewards: Vec<f64> = groups.iter().flat_map(|g| g.rollouts.iter().map(|r| r.reward)).collect();
+                Some(crate::reward::reward_digest(&rewards))
+            }
+            _ => None,
+        };
         Ok(StepResult {
             state_root: self.state()?.state_root(),
             loss: out.loss,
             grad_norm: out.grad_norm,
             probe_digest: domain_hash("praecise.probe.logprobs.v1", &[&bytes]),
-            reward_digest: None,
+            reward_digest,
         })
     }
 
