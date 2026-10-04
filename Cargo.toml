@@ -15,6 +15,7 @@ members = [
   "examples/flux2",
   "examples/ace-step",
   "examples/cosmos3",
+  "examples/wan-world",
 ]
 
 [workspace.dependencies]
