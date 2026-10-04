@@ -33,6 +33,7 @@ pub mod qwen3;
 pub mod s3dit;
 pub mod safetensors;
 pub mod schedule;
+pub mod umt5;
 pub mod unipc;
 pub mod vae;
 pub mod video;
