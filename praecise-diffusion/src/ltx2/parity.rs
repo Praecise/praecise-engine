@@ -139,3 +139,27 @@ fn ltx2_parity_video_decoder_f32() {
 fn ltx2_parity_video_decoder_bf16() {
     video_decoder_run(Precision::Bf16, 0.9999, 2e-2);
 }
+
+fn audio_decoder_run(precision: Precision, min_cos: f64, max_rel: f64) {
+    let d = PathBuf::from(std::env::var("PRAECISE_LTX2_AUDIO_VAE_PARITY").expect("PRAECISE_LTX2_AUDIO_VAE_PARITY names the fixture dir"));
+    let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from) };
+    let dec = audio_vae::Ltx2AudioDecoder::load_single_file(&d.join("single.safetensors"), opts).unwrap();
+    let frames = m["frames"].as_u64().unwrap() as usize;
+    assert_eq!(dec.config().spectrogram_frames(frames) as u64, m["out_shape"][1].as_u64().unwrap());
+    let mel = dec.decode(&read("packed"), frames).unwrap();
+    assert_close("audio decoder", &mel, &read("mel"), min_cos, max_rel);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_audio_decoder_f32() {
+    audio_decoder_run(Precision::F32, 0.999_999, 1e-4);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_audio_decoder_bf16() {
+    audio_decoder_run(Precision::Bf16, 0.9999, 2e-2);
+}
