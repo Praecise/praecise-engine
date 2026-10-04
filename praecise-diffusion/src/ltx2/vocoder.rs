@@ -86,7 +86,29 @@ impl GeneratorConfig {
         Ok(())
     }
 
-    fn total_upsampling(&self) -> u64 {
+    /// An AMP generator with snake-beta activations, no output bias and no
+    /// output tanh.
+    ///
+    /// # Errors
+    /// Stage lists this generator does not compute.
+    pub(crate) fn amp(width: u64, rates: Vec<u64>, kernels: Vec<u64>, res_kernels: Vec<u64>, dilations: Vec<Vec<u64>>) -> Result<Self> {
+        let cfg = Self {
+            upsample_initial_channel: width,
+            upsample_rates: rates,
+            upsample_kernel_sizes: kernels,
+            resblock_kernel_sizes: res_kernels,
+            resblock_dilation_sizes: dilations,
+            resblock: "AMP1".into(),
+            activation: "snakebeta".into(),
+            use_bias_at_final: false,
+            use_tanh_at_final: false,
+            apply_final_activation: true,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub(crate) fn total_upsampling(&self) -> u64 {
         self.upsample_rates.iter().product()
     }
 
@@ -178,20 +200,38 @@ fn hann_sinc(ratio: usize) -> (Vec<f32>, usize, usize) {
     (f, width, 2 * width * ratio)
 }
 
-struct Hosts<'a> {
-    st: &'a SafeTensors,
-    v: Vec<HostTensor>,
-    filters: HashMap<String, Vec<f32>>,
+/// Where generator weights come from, by their names in this module.
+pub(crate) trait WeightSource {
+    /// Values of `name`, checked against `shape`.
+    fn values(&self, name: &str, shape: &[u64]) -> Result<Vec<f32>>;
+    /// Values of `name` whatever its shape.
+    fn any(&self, name: &str) -> Result<Vec<f32>>;
+}
+
+impl WeightSource for SafeTensors {
+    fn values(&self, name: &str, shape: &[u64]) -> Result<Vec<f32>> {
+        Ok(self.require(name, shape)?.to_f32())
+    }
+
+    fn any(&self, name: &str) -> Result<Vec<f32>> {
+        Ok(self.get(name).ok_or_else(|| Error::MissingTensor(name.into()))?.to_f32())
+    }
+}
+
+pub(crate) struct Hosts<'a> {
+    pub(crate) st: &'a dyn WeightSource,
+    pub(crate) v: Vec<HostTensor>,
+    pub(crate) filters: HashMap<String, Vec<f32>>,
 }
 
 impl Hosts<'_> {
-    fn f32(&mut self, name: String, shape: Vec<u64>, data: Vec<f32>) {
+    pub(crate) fn f32(&mut self, name: String, shape: Vec<u64>, data: Vec<f32>) {
         self.v.push(HostTensor { name, shape, ty: WType::F32, data });
     }
 
     /// Kernel `[cout, cin, k]` as per-tap matrices `[k, cout, cin]`.
-    fn conv(&mut self, p: &str, cin: u64, cout: u64, k: u64, bias: bool) -> Result<()> {
-        let w = self.st.require(&format!("{p}.weight"), &[cout, cin, k])?.to_f32();
+    pub(crate) fn conv(&mut self, p: &str, cin: u64, cout: u64, k: u64, bias: bool) -> Result<()> {
+        let w = self.st.values(&format!("{p}.weight"), &[cout, cin, k])?;
         let (ci, co, kk) = (cin as usize, cout as usize, k as usize);
         let mut taps = vec![0f32; w.len()];
         for o in 0..co {
@@ -203,7 +243,7 @@ impl Hosts<'_> {
         }
         self.v.push(HostTensor { name: format!("{p}.taps"), shape: vec![k, cout, cin], ty: WType::F32, data: taps });
         if bias {
-            let b = self.st.require(&format!("{p}.bias"), &[cout])?.to_f32();
+            let b = self.st.values(&format!("{p}.bias"), &[cout])?;
             self.f32(format!("{p}.bias"), vec![cout], b);
         }
         Ok(())
@@ -212,7 +252,7 @@ impl Hosts<'_> {
     /// Transposed kernel `[cin, cout, k]` of stride `s` as `ceil(k / s)`
     /// matrices `[s cout, cin]`: block `b`, row `r cout + o` is tap `s b + r`.
     fn conv_t(&mut self, p: &str, cin: u64, cout: u64, k: u64, s: u64) -> Result<()> {
-        let w = self.st.require(&format!("{p}.weight"), &[cin, cout, k])?.to_f32();
+        let w = self.st.values(&format!("{p}.weight"), &[cin, cout, k])?;
         let (ci, co, kk, ss) = (cin as usize, cout as usize, k as usize, s as usize);
         let nb = kk.div_ceil(ss);
         let mut m = vec![0f32; nb * ss * co * ci];
@@ -230,7 +270,7 @@ impl Hosts<'_> {
             }
         }
         self.v.push(HostTensor { name: format!("{p}.blocks"), shape: vec![nb as u64, s * cout, cin], ty: WType::F32, data: m });
-        let b = self.st.require(&format!("{p}.bias"), &[cout])?.to_f32();
+        let b = self.st.values(&format!("{p}.bias"), &[cout])?;
         self.f32(format!("{p}.bias"), vec![cout], b);
         Ok(())
     }
@@ -238,13 +278,12 @@ impl Hosts<'_> {
     /// An anti-aliased snake activation: per-channel frequency and gain, and
     /// the two low-pass filters (kept on the host as constants).
     fn act(&mut self, p: &str, c: u64) -> Result<()> {
-        let a = self.st.require(&format!("{p}.act.alpha"), &[c])?.to_f32();
-        let b = self.st.require(&format!("{p}.act.beta"), &[c])?.to_f32();
+        let a = self.st.values(&format!("{p}.act.alpha"), &[c])?;
+        let b = self.st.values(&format!("{p}.act.beta"), &[c])?;
         self.f32(format!("{p}.freq"), vec![c], a.iter().map(|x| x.exp()).collect());
         self.f32(format!("{p}.gain"), vec![c], b.iter().map(|x| 1.0 / (x.exp() + SNAKE_EPS)).collect());
         for (key, file) in [("up", "upsample.filter"), ("down", "downsample.lowpass.filter")] {
-            let t = self.st.get(&format!("{p}.{file}")).ok_or_else(|| Error::MissingTensor(format!("{p}.{file}")))?;
-            let mut f = t.to_f32();
+            let mut f = self.st.any(&format!("{p}.{file}"))?;
             if key == "up" {
                 for x in &mut f {
                     *x *= AA_RATIO as f32;
@@ -255,7 +294,7 @@ impl Hosts<'_> {
         Ok(())
     }
 
-    fn generator(&mut self, p: &str, cfg: &GeneratorConfig, cin: u64, cout: u64) -> Result<()> {
+    pub(crate) fn generator(&mut self, p: &str, cfg: &GeneratorConfig, cin: u64, cout: u64) -> Result<()> {
         let mut c = cfg.upsample_initial_channel;
         self.conv(&format!("{p}.conv_pre"), cin, c, 7, true)?;
         let nr = cfg.resblock_kernel_sizes.len();
@@ -277,15 +316,15 @@ impl Hosts<'_> {
     }
 }
 
-struct Net<'a, 'g> {
-    g: &'g mut Graph,
-    w: &'a Weights,
-    filters: &'a HashMap<String, Vec<f32>>,
+pub(crate) struct Net<'a, 'g> {
+    pub(crate) g: &'g mut Graph,
+    pub(crate) w: &'a Weights,
+    pub(crate) filters: &'a HashMap<String, Vec<f32>>,
 }
 
 impl Net<'_, '_> {
     /// `[C, T]` with `left` and `right` zero columns.
-    fn zero_pad(&mut self, x: Tn, left: i64, right: i64) -> Tn {
+    pub(crate) fn zero_pad(&mut self, x: Tn, left: i64, right: i64) -> Tn {
         if left + right == 0 {
             return x;
         }
@@ -310,7 +349,7 @@ impl Net<'_, '_> {
         y
     }
 
-    fn conv(&mut self, p: &str, x: Tn, dil: i64, bias: bool) -> Tn {
+    pub(crate) fn conv(&mut self, p: &str, x: Tn, dil: i64, bias: bool) -> Tn {
         let taps = self.w.get(&format!("{p}.taps"));
         let (cin, cout, k) = (taps.ne(0), taps.ne(1), taps.ne(2));
         let t = x.ne(1);
@@ -430,7 +469,7 @@ impl Net<'_, '_> {
         self.downsample(x, &fl[&format!("{p}.down")])
     }
 
-    fn generator(&mut self, p: &str, cfg: &GeneratorConfig, x: Tn) -> Tn {
+    pub(crate) fn generator(&mut self, p: &str, cfg: &GeneratorConfig, x: Tn) -> Tn {
         let mut x = self.conv(&format!("{p}.conv_pre"), x, 1, true);
         let nr = cfg.resblock_kernel_sizes.len();
         for (i, (s, k)) in cfg.upsample_rates.iter().zip(&cfg.upsample_kernel_sizes).enumerate() {
