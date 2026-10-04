@@ -116,16 +116,9 @@ pub fn rerank(
             "a pair of {longest} tokens does not fit the context of {n_ctx}"
         )));
     }
-    let params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx))
-        .with_n_batch(n_ctx)
-        .with_n_ubatch(n_ctx)
-        .with_n_seq_max(1)
-        .with_n_threads(options.n_threads)
-        .with_n_threads_batch(options.n_threads)
-        .with_embeddings(true)
-        .with_pooling_type(LlamaPoolingType::Rank);
-    let mut ctx = model.new_context(backend, params).map_err(inference)?;
+    let mut ctx = model
+        .new_context(backend, pair_context(n_ctx, n_ctx, options.n_threads))
+        .map_err(inference)?;
     let mut batch = LlamaBatch::new(n_ctx as usize, 1);
     let mut out = Vec::with_capacity(pairs.len());
     for (index, tokens) in pairs.iter().enumerate() {
@@ -133,12 +126,182 @@ pub fn rerank(
         batch.clear();
         batch.add_sequence(tokens, 0, false).map_err(inference)?;
         ctx.decode(&mut batch).map_err(inference)?;
-        let head = ctx.embeddings_seq_ith(0).map_err(inference)?;
-        let score = *head.first().ok_or_else(|| inference("the classification head returned nothing"))?;
         out.push(RerankScore {
             index,
-            score,
+            score: head_score(&ctx)?,
             tokens: tokens.len(),
+        });
+    }
+    Ok(out)
+}
+
+/// Context parameters for scoring one pair at a time in sequence 0.
+fn pair_context(n_ctx: u32, n_ubatch: u32, n_threads: i32) -> LlamaContextParams {
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_n_batch(n_ctx)
+        .with_n_ubatch(n_ubatch)
+        .with_n_seq_max(1)
+        .with_n_threads(n_threads)
+        .with_n_threads_batch(n_threads)
+        .with_embeddings(true)
+        .with_pooling_type(LlamaPoolingType::Rank)
+}
+
+/// The classification head's first output for the pair just decoded.
+fn head_score(ctx: &llama_cpp_2::context::LlamaContext<'_>) -> Result<f32> {
+    let head = ctx.embeddings_seq_ith(0).map_err(inference)?;
+    head.first()
+        .copied()
+        .ok_or_else(|| inference("the classification head returned nothing"))
+}
+
+
+/// A picture in a pair: packed RGB rows, already sized the way the model's
+/// own processor sizes it (the projector keeps a picture whose sides are
+/// multiples of its patch grid and whose area is within its limits).
+#[cfg(feature = "mtmd")]
+#[derive(Debug, Clone)]
+pub struct RerankPicture {
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 3` bytes.
+    pub rgb: Vec<u8>,
+    /// A frame of a video. Consecutive frames whose markers follow each
+    /// other are merged over time by projectors with a temporal patch.
+    pub video_frame: bool,
+}
+
+/// One side of a pair that may carry pictures and video: text in which each
+/// media marker ([`llama_cpp_2::mtmd::mtmd_default_marker`]) stands for the
+/// next entry of `pictures`, in order.
+#[cfg(feature = "mtmd")]
+#[derive(Debug, Clone, Default)]
+pub struct RerankInput {
+    pub text: String,
+    pub pictures: Vec<RerankPicture>,
+}
+
+/// Micro-batch a multimodal pair is decoded in; a longer pair is decoded in
+/// several, which a causal decoder scores the same.
+#[cfg(feature = "mtmd")]
+const MEDIA_UBATCH: u32 = 2048;
+
+/// Score every document against `query`, where either side may carry
+/// pictures and video, with the reranker `model` and its vision projector.
+///
+/// Each pair is written into the model's `rerank` template with the media
+/// markers in place, tokenized into text and media chunks, and evaluated
+/// into a fresh sequence; positions come from the chunk evaluation, so
+/// multi-axis rotary positions are laid out by the projector. A pair's score
+/// does not depend on the other documents in the request.
+///
+/// # Errors
+///
+/// When the model has no classification head or no `rerank` template, the
+/// projector has no vision tower, a side's markers and pictures disagree, a
+/// pair does not fit the context, or the backend fails.
+#[cfg(feature = "mtmd")]
+pub fn rerank_media(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    projector: &llama_cpp_2::mtmd::MtmdContext,
+    query: &RerankInput,
+    documents: &[RerankInput],
+    options: RerankOptions,
+) -> Result<Vec<RerankScore>> {
+    use llama_cpp_2::mtmd::mtmd_default_marker;
+
+    if model.n_cls_out() == 0 {
+        return Err(inference("the model has no classification head to score with"));
+    }
+    let template = model
+        .chat_template(Some("rerank"))
+        .map_err(|_| inference("the model has no rerank template to place pictures in"))?;
+    let template = template.to_str().map_err(inference)?.to_owned();
+    let has_media = !query.pictures.is_empty() || documents.iter().any(|d| !d.pictures.is_empty());
+    if has_media && !projector.support_vision() {
+        return Err(inference("the projector has no vision tower"));
+    }
+    let marker = mtmd_default_marker();
+    for (side, input) in std::iter::once(("the query", query)).chain(documents.iter().map(|d| ("a document", d))) {
+        let markers = input.text.matches(marker).count();
+        if markers != input.pictures.len() {
+            return Err(inference(format!(
+                "{side} has {markers} media markers for {} pictures",
+                input.pictures.len()
+            )));
+        }
+    }
+    let query_first = match (template.find("{query}"), template.find("{document}")) {
+        (Some(q), Some(d)) => q < d,
+        _ => return Err(inference("the rerank template lacks a query or document slot")),
+    };
+
+    let tokenize = |document: &RerankInput| -> Result<llama_cpp_2::mtmd::MtmdInputChunks> {
+        let prompt = template
+            .replace("{query}", &query.text)
+            .replace("{document}", &document.text);
+        let (first, second) = if query_first { (query, document) } else { (document, query) };
+        let bitmaps = first
+            .pictures
+            .iter()
+            .chain(&second.pictures)
+            .map(|p| {
+                let mut bitmap = llama_cpp_2::mtmd::MtmdBitmap::from_image_data(p.width, p.height, &p.rgb)
+                    .map_err(|e| inference(format!("a picture could not be read: {e}")))?;
+                bitmap.set_mergeable(p.video_frame);
+                Ok(bitmap)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
+        projector
+            .tokenize(
+                llama_cpp_2::mtmd::MtmdInputText {
+                    text: prompt,
+                    add_special: false,
+                    parse_special: true,
+                },
+                &refs,
+            )
+            .map_err(|e| inference(format!("multimodal tokenization failed: {e}")))
+    };
+
+    // Size the context to the longest pair, so a request of short pairs does
+    // not reserve the room a long video would need. The micro-batch is the
+    // same for every request, so a pair is split, and scored, identically
+    // whatever else the request carries.
+    let mut lengths = Vec::with_capacity(documents.len());
+    for document in documents {
+        lengths.push(tokenize(document)?.total_tokens());
+    }
+    let longest = lengths.iter().copied().max().unwrap_or(0);
+    let limit = options.n_ctx.min(model.n_ctx_train().max(1));
+    if longest > limit as usize {
+        return Err(inference(format!(
+            "a pair of {longest} tokens does not fit the context of {limit}"
+        )));
+    }
+    let n_ctx = u32::try_from(longest.next_multiple_of(256))
+        .unwrap_or(u32::MAX)
+        .max(MEDIA_UBATCH)
+        .min(limit);
+    let n_ubatch = n_ctx.min(MEDIA_UBATCH);
+    let mut ctx = model
+        .new_context(backend, pair_context(n_ctx, n_ubatch, options.n_threads))
+        .map_err(inference)?;
+    let n_batch = i32::try_from(n_ubatch).map_err(inference)?;
+    let mut out = Vec::with_capacity(documents.len());
+    for (index, document) in documents.iter().enumerate() {
+        let chunks = tokenize(document)?;
+        ctx.clear_kv_cache();
+        chunks
+            .eval_chunks(projector, &mut ctx, 0, 0, n_batch, true)
+            .map_err(|e| inference(format!("the pair could not be evaluated: {e}")))?;
+        out.push(RerankScore {
+            index,
+            score: head_score(&ctx)?,
+            tokens: lengths[index],
         });
     }
     Ok(out)

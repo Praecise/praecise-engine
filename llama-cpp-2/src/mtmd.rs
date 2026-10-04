@@ -641,6 +641,14 @@ impl MtmdBitmap {
         }
         Ok(())
     }
+
+    /// Mark this bitmap as a video frame. Projectors that merge frames over
+    /// time (a temporal patch of two frames) merge it with an adjacent
+    /// mergeable bitmap when the two markers follow each other in the prompt;
+    /// an unmarked bitmap is a still picture.
+    pub fn set_mergeable(&mut self, mergeable: bool) {
+        unsafe { llama_cpp_sys_2::mtmd_bitmap_set_mergeable(self.bitmap.as_ptr(), mergeable) }
+    }
 }
 
 impl Drop for MtmdBitmap {
