@@ -27,6 +27,9 @@ use crate::safetensors::SafeTensors;
 use crate::s3dit::{S3DitConfig, TIME_FEATURES};
 use llama_cpp_sys_2 as sys;
 
+pub mod connectors;
+pub mod single_file;
+
 #[cfg(test)]
 mod parity;
 

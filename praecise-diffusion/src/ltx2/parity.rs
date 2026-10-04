@@ -77,3 +77,40 @@ fn ltx2_parity_transformer_f32() {
 fn ltx2_parity_transformer_bf16() {
     run(Precision::Bf16, 0.9999, 2e-2);
 }
+
+fn connectors_run(precision: Precision, single_file: bool, min_cos: f64, max_rel: f64) {
+    let d = PathBuf::from(std::env::var("PRAECISE_LTX2_CONNECTORS_PARITY").expect("PRAECISE_LTX2_CONNECTORS_PARITY names the fixture dir"));
+    let read = |name: &str| -> Vec<f32> { std::fs::read(d.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let opts = LoadOptions { precision, cpu_threads: std::thread::available_parallelism().map_or(8, usize::from) };
+    let c = if single_file {
+        connectors::Ltx2Connectors::load_single_file(&d.join("single.safetensors"), opts).unwrap()
+    } else {
+        connectors::Ltx2Connectors::load(&CheckpointFiles::new(d.join("checkpoint")), opts).unwrap()
+    };
+    let seq = m["seq_len"].as_u64().unwrap() as usize;
+    for n in m["valid"].as_array().unwrap() {
+        let n = n.as_u64().unwrap();
+        let (v, a) = c.forward(&read(&format!("hidden_{n}")), seq).unwrap();
+        assert_close(&format!("{n} valid video"), &v, &read(&format!("out_video_{n}")), min_cos, max_rel);
+        assert_close(&format!("{n} valid audio"), &a, &read(&format!("out_audio_{n}")), min_cos, max_rel);
+    }
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_connectors_f32() {
+    connectors_run(Precision::F32, false, 0.999_999, 1e-4);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_connectors_single_file_f32() {
+    connectors_run(Precision::F32, true, 0.999_999, 1e-4);
+}
+
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn ltx2_parity_connectors_bf16() {
+    connectors_run(Precision::Bf16, false, 0.9999, 2e-2);
+}

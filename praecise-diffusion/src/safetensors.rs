@@ -62,6 +62,7 @@ struct Entry {
 pub struct SafeTensors {
     maps: Vec<Mmap>,
     entries: HashMap<String, Entry>,
+    metadata: HashMap<String, String>,
 }
 
 impl std::fmt::Debug for SafeTensors {
@@ -126,6 +127,7 @@ impl SafeTensors {
     pub fn open(paths: &[PathBuf]) -> Result<Self> {
         let mut maps = Vec::with_capacity(paths.len());
         let mut entries = HashMap::new();
+        let mut metadata = HashMap::new();
         for (file_idx, path) in paths.iter().enumerate() {
             let map = map_file(path)?;
             if map.len() < 8 {
@@ -140,6 +142,9 @@ impl SafeTensors {
                 .map_err(|e| Error::Weights(format!("{} header: {e}", path.display())))?;
             for (name, meta) in header {
                 if name == "__metadata__" {
+                    if let Value::Object(m) = meta {
+                        metadata.extend(m.into_iter().filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string()))));
+                    }
                     continue;
                 }
                 let entry = parse_entry(&name, &meta, file_idx, data_start, map.len())?;
@@ -149,7 +154,31 @@ impl SafeTensors {
             }
             maps.push(map);
         }
-        Ok(Self { maps, entries })
+        Ok(Self { maps, entries, metadata })
+    }
+
+    /// A string entry of the files' `__metadata__` header.
+    #[must_use]
+    pub fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+
+    /// The same tensors under new names: `rename` gives each tensor's new
+    /// name, or `None` to leave it out.
+    ///
+    /// # Errors
+    /// When two tensors would share a name.
+    pub fn renamed(mut self, rename: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let mut entries = HashMap::with_capacity(self.entries.len());
+        for (name, entry) in self.entries.drain() {
+            if let Some(new) = rename(&name) {
+                if entries.insert(new.clone(), entry).is_some() {
+                    return Err(Error::Weights(format!("two tensors are renamed to {new}")));
+                }
+            }
+        }
+        self.entries = entries;
+        Ok(self)
     }
 
     /// Look up a tensor by name.
