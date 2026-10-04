@@ -26,16 +26,19 @@ pub mod music;
 pub mod oobleck;
 pub mod pipeline;
 pub mod qwen3;
+pub mod s3dit;
 pub mod safetensors;
 pub mod schedule;
 pub mod unipc;
 pub mod vae;
 pub mod video;
 pub mod wan;
+pub mod zimage;
 
 pub use error::{Error, Result};
 pub use music::{AceStep, Audio, MusicRequest};
 pub use video::{Cosmos3, Video, VideoRequest};
+pub use zimage::ZImage;
 pub use pipeline::{
     CheckpointFiles, Flux2Klein, Image, LoadOptions, MAX_REFERENCE_PIXELS, Precision, Request, RgbImage, Timings,
 };

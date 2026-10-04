@@ -1,10 +1,10 @@
-//! The FLUX.2 autoencoder's decoder: latents back to pixels.
+//! KL autoencoders: latents back to pixels, and reference images to latents.
 //!
 //! A KL-autoencoder decoder (residual blocks with group norm, one
-//! self-attention block in the middle, nearest-neighbour upsampling) behind a
-//! 1x1 post-quantisation convolution. The latent normalisation (per-channel
-//! mean and variance over 2x2-patched latents) is undone on the host before the
-//! graph runs.
+//! self-attention block in the middle, nearest-neighbour upsampling), behind a
+//! 1x1 post-quantisation convolution where the checkpoint has one. The latent
+//! normalisation (per-channel statistics over 2x2-patched latents for FLUX.2,
+//! a scale and shift otherwise) is undone on the host before the graph runs.
 
 use serde::Deserialize;
 
@@ -28,10 +28,19 @@ pub struct VaeConfig {
     pub norm_num_groups: u64,
     /// Output channels.
     pub out_channels: u64,
-    /// Latent patch size `[h, w]`.
+    /// Latent patch size `[h, w]` of the latent statistics; empty when the
+    /// latents are scaled and shifted instead.
+    #[serde(default)]
     pub patch_size: Vec<u64>,
     /// Batch-norm epsilon for the latent statistics.
+    #[serde(default)]
     pub batch_norm_eps: f64,
+    /// Latent scale (latents are `(z - shift) * scale`), without statistics.
+    #[serde(default)]
+    pub scaling_factor: Option<f64>,
+    /// Latent shift, without statistics.
+    #[serde(default)]
+    pub shift_factor: Option<f64>,
     /// Whether a 1x1 convolution precedes the decoder.
     pub use_post_quant_conv: bool,
     /// Whether the middle block has attention.
@@ -49,11 +58,11 @@ impl VaeConfig {
     /// # Errors
     /// [`Error::Config`] for an unsupported layout.
     pub fn validate(&self) -> Result<()> {
-        if self.patch_size != [2, 2] {
+        if !self.patch_size.is_empty() && self.patch_size != [2, 2] {
             return Err(Error::Config(format!("latent patch size {:?} is not implemented", self.patch_size)));
         }
-        if !self.use_post_quant_conv || !self.mid_block_add_attention {
-            return Err(Error::Config("expected a post-quantisation convolution and mid-block attention".into()));
+        if !self.mid_block_add_attention {
+            return Err(Error::Config("expected mid-block attention".into()));
         }
         if self.block_out_channels.is_empty() {
             return Err(Error::Config("no decoder levels".into()));
@@ -79,12 +88,13 @@ impl VaeConfig {
         let lc = self.latent_channels;
         let ch = self.decoder_channels();
         let top = ch[0];
-        let mut v = vec![
-            WeightSpec::new("post_quant_conv.weight", &[lc, lc, 1, 1], WType::F16),
-            WeightSpec::new("post_quant_conv.bias", &[lc], WType::F32),
-            WeightSpec::new("decoder.conv_in.weight", &[top, lc, 3, 3], WType::F16),
-            WeightSpec::new("decoder.conv_in.bias", &[top], WType::F32),
-        ];
+        let mut v = Vec::new();
+        if self.use_post_quant_conv {
+            v.push(WeightSpec::new("post_quant_conv.weight", &[lc, lc, 1, 1], WType::F16));
+            v.push(WeightSpec::new("post_quant_conv.bias", &[lc], WType::F32));
+        }
+        v.push(WeightSpec::new("decoder.conv_in.weight", &[top, lc, 3, 3], WType::F16));
+        v.push(WeightSpec::new("decoder.conv_in.bias", &[top], WType::F32));
         mid_specs(&mut v, "decoder", top);
         let mut prev = top;
         for (i, &c) in ch.iter().enumerate() {
@@ -271,7 +281,7 @@ pub struct VaeIo {
 pub fn build_decoder(g: &mut Graph, cfg: &VaeConfig, w: &Weights, lat_w: i64, lat_h: i64) -> VaeIo {
     let groups = cfg.norm_num_groups as i32;
     let latents = g.input(sys::GGML_TYPE_F32, &[lat_w, lat_h, cfg.latent_channels as i64, 1]);
-    let x = conv(g, w, "post_quant_conv", latents, 0);
+    let x = if cfg.use_post_quant_conv { conv(g, w, "post_quant_conv", latents, 0) } else { latents };
     let mut x = conv(g, w, "decoder.conv_in", x, 1);
     x = resnet(g, w, "decoder.mid_block.resnets.0", x, groups);
     x = mid_attention(g, w, "decoder.mid_block.attentions.0", x, groups);

@@ -217,6 +217,9 @@ impl Flux2Klein {
         let te_theta = te_cfg.theta()? as f32;
         let vae_cfg: VaeConfig = parse(files.json("vae/config.json")?, "vae config")?;
         vae_cfg.validate()?;
+        if vae_cfg.patch_size != [2, 2] || !vae_cfg.use_post_quant_conv {
+            return Err(Error::Config("expected patched latent statistics and a post-quantisation convolution".into()));
+        }
         let want_ctx = te_cfg.hidden_size * PROMPT_LAYERS.len() as u64;
         if dit_cfg.joint_attention_dim != want_ctx {
             return Err(Error::Config(format!(
