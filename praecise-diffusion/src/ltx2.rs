@@ -449,11 +449,41 @@ type Rope = (Tn, Tn);
 
 #[allow(clippy::too_many_arguments)]
 fn attention(g: &mut Graph, w: &Weights, a: &str, c: Ctx, (hd, heads): (i64, i64), xq: Tn, xkv: Tn, rope: Option<(Rope, Rope)>) -> Tn {
+    let n = xq.ne(1);
+    let wn = |s: &str| w.get(&format!("{a}.{s}"));
+    let v = g.linear_b(wn("to_v.weight"), wn("to_v.bias"), xkv);
+    let o = mix(g, w, a, c, hd, heads, xq, xkv, v, rope);
+    gated_out(g, w, a, heads, xq, o, hd, n)
+}
+
+/// A self-attention whose mixing is skipped: every token keeps its own value
+/// projection (gates and output projection still apply).
+fn perturbed_attention(g: &mut Graph, w: &Weights, a: &str, (hd, heads): (i64, i64), x: Tn) -> Tn {
+    let wn = |s: &str| w.get(&format!("{a}.{s}"));
+    let v = g.linear_b(wn("to_v.weight"), wn("to_v.bias"), x);
+    let o = g.reshape(v, &[hd, heads, x.ne(1)]);
+    gated_out(g, w, a, heads, x, o, hd, x.ne(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gated_out(g: &mut Graph, w: &Weights, a: &str, heads: i64, xq: Tn, o: Tn, hd: i64, n: i64) -> Tn {
+    let wn = |s: &str| w.get(&format!("{a}.{s}"));
+    let gate = g.linear_b(wn("to_gate_logits.weight"), wn("to_gate_logits.bias"), xq);
+    let gate = g.sigmoid(gate);
+    let gate = g.scale_bias(gate, 2.0, 0.0);
+    let gate = g.reshape(gate, &[1, heads, n]);
+    let o = g.mul(o, gate);
+    let o = g.reshape(o, &[hd * heads, n]);
+    g.linear_b(wn("to_out.0.weight"), wn("to_out.0.bias"), o)
+}
+
+/// Query/key attention over the value projection `v`, `[head width, heads, tokens]` out.
+#[allow(clippy::too_many_arguments)]
+fn mix(g: &mut Graph, w: &Weights, a: &str, c: Ctx, hd: i64, heads: i64, xq: Tn, xkv: Tn, v: Tn, rope: Option<(Rope, Rope)>) -> Tn {
     let (n, m) = (xq.ne(1), xkv.ne(1));
     let wn = |s: &str| w.get(&format!("{a}.{s}"));
     let q = g.linear_b(wn("to_q.weight"), wn("to_q.bias"), xq);
     let k = g.linear_b(wn("to_k.weight"), wn("to_k.bias"), xkv);
-    let v = g.linear_b(wn("to_v.weight"), wn("to_v.bias"), xkv);
     let q = g.rms_norm(q, QK_EPS);
     let q = g.mul(q, wn("norm_q.weight"));
     let k = g.rms_norm(k, QK_EPS);
@@ -478,14 +508,7 @@ fn attention(g: &mut Graph, w: &Weights, a: &str, c: Ctx, (hd, heads): (i64, i64
         let v = g.cast(v, sys::GGML_TYPE_F16);
         g.attention(q, k, v, None, scale, true)
     };
-    let o = g.reshape(o, &[hd, heads, n]);
-    let gate = g.linear_b(wn("to_gate_logits.weight"), wn("to_gate_logits.bias"), xq);
-    let gate = g.sigmoid(gate);
-    let gate = g.scale_bias(gate, 2.0, 0.0);
-    let gate = g.reshape(gate, &[1, heads, n]);
-    let o = g.mul(o, gate);
-    let o = g.reshape(o, &[hd * heads, n]);
-    g.linear_b(wn("to_out.0.weight"), wn("to_out.0.bias"), o)
+    g.reshape(o, &[hd, heads, n])
 }
 
 fn feed_forward(g: &mut Graph, w: &Weights, p: &str, x: Tn, exact: bool) -> Tn {
@@ -515,7 +538,7 @@ struct Ropes {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn block(g: &mut Graph, w: &Weights, b: &str, cfg: &Ltx2Config, c: Ctx, (x, a): (Tn, Tn), (text, atext): (Tn, Tn), m: &Conditioning, r: &Ropes) -> (Tn, Tn) {
+fn block(g: &mut Graph, w: &Weights, b: &str, cfg: &Ltx2Config, c: Ctx, (x, a): (Tn, Tn), (text, atext): (Tn, Tn), m: &Conditioning, r: &Ropes, (perturbed, isolated): (bool, bool)) -> (Tn, Tn) {
     let (d, ad) = (cfg.inner() as i64, cfg.audio_inner() as i64);
     let vh = (cfg.attention_head_dim as i64, cfg.num_attention_heads as i64);
     let ah = (cfg.audio_attention_head_dim as i64, cfg.audio_num_attention_heads as i64);
@@ -528,13 +551,13 @@ fn block(g: &mut Graph, w: &Weights, b: &str, cfg: &Ltx2Config, c: Ctx, (x, a): 
     let (sh, sc, gt) = (vp(g, 0), vp(g, 1), vp(g, 2));
     let h = g.rms_norm(x, c.eps);
     let h = modulate(g, h, sh, sc);
-    let o = attention(g, w, &format!("{b}.attn1"), c, vh, h, h, Some((r.video, r.video)));
+    let o = if perturbed { perturbed_attention(g, w, &format!("{b}.attn1"), vh, h) } else { attention(g, w, &format!("{b}.attn1"), c, vh, h, h, Some((r.video, r.video))) };
     let o = g.mul(o, gt);
     let x = g.add(x, o);
     let (sh, sc, gt) = (ap(g, 0), ap(g, 1), ap(g, 2));
     let h = g.rms_norm(a, c.eps);
     let h = modulate(g, h, sh, sc);
-    let o = attention(g, w, &format!("{b}.audio_attn1"), c, ah, h, h, Some((r.audio, r.audio)));
+    let o = if perturbed { perturbed_attention(g, w, &format!("{b}.audio_attn1"), ah, h) } else { attention(g, w, &format!("{b}.audio_attn1"), c, ah, h, h, Some((r.audio, r.audio))) };
     let o = g.mul(o, gt);
     let a = g.add(a, o);
 
@@ -557,7 +580,31 @@ fn block(g: &mut Graph, w: &Weights, b: &str, cfg: &Ltx2Config, c: Ctx, (x, a): 
     let o = g.mul(o, gt);
     let a = g.add(a, o);
 
-    // Audio to video, then video to audio, both from the same normed inputs.
+    // Audio to video, then video to audio, both from the same normed inputs;
+    // skipped entirely when the streams are isolated.
+    let (x, a) = if isolated { (x, a) } else { exchange(g, w, b, cfg, c, (x, a), m, r) };
+
+    // Feed-forward.
+    let (sh, sc, gt) = (vp(g, 3), vp(g, 4), vp(g, 5));
+    let h = g.rms_norm(x, c.eps);
+    let h = modulate(g, h, sh, sc);
+    let o = feed_forward(g, w, &format!("{b}.ff"), h, c.exact);
+    let o = g.mul(o, gt);
+    let x = g.add(x, o);
+    let (sh, sc, gt) = (ap(g, 3), ap(g, 4), ap(g, 5));
+    let h = g.rms_norm(a, c.eps);
+    let h = modulate(g, h, sh, sc);
+    let o = feed_forward(g, w, &format!("{b}.audio_ff"), h, c.exact);
+    let o = g.mul(o, gt);
+    let a = g.add(a, o);
+    (x, a)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exchange(g: &mut Graph, w: &Weights, b: &str, cfg: &Ltx2Config, c: Ctx, (x, a): (Tn, Tn), m: &Conditioning, r: &Ropes) -> (Tn, Tn) {
+    let (d, ad) = (cfg.inner() as i64, cfg.audio_inner() as i64);
+    let ah = (cfg.audio_attention_head_dim as i64, cfg.audio_num_attention_heads as i64);
+    let t = |s: &str| w.get(&format!("{b}.{s}"));
     let nx = g.rms_norm(x, c.eps);
     let na = g.rms_norm(a, c.eps);
     let (vct, act) = (t("video_a2v_cross_attn_scale_shift_table"), t("audio_a2v_cross_attn_scale_shift_table"));
@@ -582,26 +629,12 @@ fn block(g: &mut Graph, w: &Weights, b: &str, cfg: &Ltx2Config, c: Ctx, (x, a): 
     let o = attention(g, w, &format!("{b}.video_to_audio_attn"), c, ah, q, kv, Some((r.cross_audio, r.cross_video)));
     let o = g.mul(o, v2a_gate);
     let a = g.add(a, o);
-
-    // Feed-forward.
-    let (sh, sc, gt) = (vp(g, 3), vp(g, 4), vp(g, 5));
-    let h = g.rms_norm(x, c.eps);
-    let h = modulate(g, h, sh, sc);
-    let o = feed_forward(g, w, &format!("{b}.ff"), h, c.exact);
-    let o = g.mul(o, gt);
-    let x = g.add(x, o);
-    let (sh, sc, gt) = (ap(g, 3), ap(g, 4), ap(g, 5));
-    let h = g.rms_norm(a, c.eps);
-    let h = modulate(g, h, sh, sc);
-    let o = feed_forward(g, w, &format!("{b}.audio_ff"), h, c.exact);
-    let o = g.mul(o, gt);
-    let a = g.add(a, o);
     (x, a)
 }
 
 /// Build one evaluation over `n_video` video tokens, `n_audio` audio tokens
 /// and `n_text` prompt tokens per stream.
-pub fn build(g: &mut Graph, cfg: &Ltx2Config, w: &Weights, (n_video, n_audio, n_text): (i64, i64, i64), exact: bool) -> Ltx2Io {
+pub fn build(g: &mut Graph, cfg: &Ltx2Config, w: &Weights, (n_video, n_audio, n_text): (i64, i64, i64), exact: bool, pass: &Pass) -> Ltx2Io {
     let (d, ad) = (cfg.inner() as i64, cfg.audio_inner() as i64);
     let c = Ctx { eps: cfg.norm_eps as f32, exact };
     let video = g.input(sys::GGML_TYPE_F32, &[cfg.in_channels as i64, n_video]);
@@ -640,7 +673,8 @@ pub fn build(g: &mut Graph, cfg: &Ltx2Config, w: &Weights, (n_video, n_audio, n_
     let mut x = g.linear_b(w.get("proj_in.weight"), w.get("proj_in.bias"), video);
     let mut a = g.linear_b(w.get("audio_proj_in.weight"), w.get("audio_proj_in.bias"), audio);
     for i in 0..cfg.num_layers {
-        (x, a) = block(g, w, &format!("transformer_blocks.{i}"), cfg, c, (x, a), (text, audio_text), &m, &r);
+        let flags = (pass.perturbed_blocks.contains(&i), pass.isolate_modalities);
+        (x, a) = block(g, w, &format!("transformer_blocks.{i}"), cfg, c, (x, a), (text, audio_text), &m, &r, flags);
     }
     let out = |g: &mut Graph, x: Tn, table: &str, emb: Tn, width: i64, proj: &str| {
         let t = w.get(table);
@@ -656,6 +690,16 @@ pub fn build(g: &mut Graph, cfg: &Ltx2Config, w: &Weights, (n_video, n_audio, n_
     let out_video = out(g, x, "scale_shift_table", emb_v, d, "proj_out");
     let out_audio = out(g, a, "audio_scale_shift_table", emb_a, ad, "audio_proj_out");
     Ltx2Io { video, audio, text, audio_text, time, rope, out_video, out_audio }
+}
+
+/// Which guidance variant of the transformer one evaluation runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pass {
+    /// Blocks whose self-attentions (both streams) skip mixing and pass each
+    /// token's value projection through (spatio-temporal guidance).
+    pub perturbed_blocks: Vec<usize>,
+    /// Skip the audio-to-video and video-to-audio attentions of every block.
+    pub isolate_modalities: bool,
 }
 
 /// Latent grid of one audio-video evaluation.
@@ -727,13 +771,13 @@ impl Ltx2Transformer {
 
     /// One evaluation: velocity for video tokens `[tokens][channels]` and
     /// audio tokens `[tokens][channels]`, given connector outputs for each
-    /// stream `[tokens][width]` and the two streams' timesteps (already
-    /// multiplied by the timestep scale).
+    /// stream `[tokens][width]`, the two streams' timesteps (already
+    /// multiplied by the timestep scale) and the guidance variant.
     ///
     /// # Errors
     /// On mismatched input lengths or a backend failure.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(&self, video: &[f32], audio: &[f32], text: &[f32], audio_text: &[f32], s: AvShape, t_video: f32, t_audio: f32) -> Result<(Vec<f32>, Vec<f32>)> {
+    pub fn forward(&self, video: &[f32], audio: &[f32], text: &[f32], audio_text: &[f32], s: AvShape, (t_video, t_audio): (f32, f32), pass: &Pass) -> Result<(Vec<f32>, Vec<f32>)> {
         let cfg = &self.cfg;
         let n_video = s.frames * s.height * s.width;
         let n_text = text.len() / cfg.inner() as usize;
@@ -744,8 +788,11 @@ impl Ltx2Transformer {
         {
             return Err(Error::Request("audio-video transformer inputs disagree with the shape".into()));
         }
+        if let Some(b) = pass.perturbed_blocks.iter().find(|b| **b >= cfg.num_layers) {
+            return Err(Error::Request(format!("perturbed block {b} beyond the {} blocks", cfg.num_layers)));
+        }
         let mut g = Graph::new(&self.backend)?;
-        let io = build(&mut g, cfg, &self.w, (n_video as i64, s.audio_frames as i64, n_text as i64), self.exact);
+        let io = build(&mut g, cfg, &self.w, (n_video as i64, s.audio_frames as i64, n_text as i64), self.exact, pass);
         g.finish(&[io.out_video, io.out_audio])?;
         let gate = cfg.cross_attn_timestep_scale_multiplier as f32 / cfg.timestep_scale_multiplier as f32;
         let mut time = S3DitConfig::time_features(t_video);
@@ -758,7 +805,12 @@ impl Ltx2Transformer {
         g.set_f32(io.text, text);
         g.set_f32(io.audio_text, audio_text);
         g.set_f32(io.time, &time);
-        for (i, (cos, sin)) in [&rot.video, &rot.audio, &rot.cross_video, &rot.cross_audio].into_iter().enumerate() {
+        // Tables no attention reads are not in the graph: the self-attention
+        // ones when every block is perturbed, the audio-video ones when the
+        // streams are isolated.
+        let self_used = (0..cfg.num_layers).any(|i| !pass.perturbed_blocks.contains(&i));
+        let used = [self_used, self_used, !pass.isolate_modalities, !pass.isolate_modalities];
+        for (i, (cos, sin)) in [&rot.video, &rot.audio, &rot.cross_video, &rot.cross_audio].into_iter().enumerate().filter(|(i, _)| used[*i]) {
             g.set_f32(io.rope[2 * i], cos);
             g.set_f32(io.rope[2 * i + 1], sin);
         }

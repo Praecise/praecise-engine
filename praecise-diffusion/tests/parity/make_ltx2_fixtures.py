@@ -4,7 +4,9 @@ The released LTX-2.3 transformer has 22B parameters (about 46 GB in
 bfloat16), far more than a parity run can hold, so this suite checks the
 native transformer against the reference one on a random checkpoint with the
 released LTX-2.3 layout (gated attention, prompt-side modulation, split
-rotary embeddings, no caption projection) at tiny widths. Weights are rounded
+rotary embeddings, no caption projection) at tiny widths, plain and in the
+two guidance variants the pipeline runs by default (self-attention skipped in
+chosen blocks, audio-video attentions skipped). Weights are rounded
 to bfloat16 before anything runs, so the native loader sees exactly the
 values the reference computed with.
 
@@ -43,6 +45,7 @@ TINY = dict(
     use_prompt_embeddings=False,
     use_prompt_adaln_single=True,
     rope_type="split",
+    perturbed_attn=True,
 )
 SHAPE = {"frames": 3, "height": 4, "width": 5, "audio_frames": 7, "text_tokens": 6, "fps": 24.0}
 HEADER = {
@@ -100,7 +103,14 @@ def original_name(k):
     return "model.diffusion_model." + k
 
 
-TIMES = [("high", 812.5, 812.5), ("split", 640.0, 275.0)]
+# tag, video timestep, audio timestep, perturbed blocks, isolated streams
+TIMES = [
+    ("high", 812.5, 812.5, [], False),
+    ("split", 640.0, 275.0, [], False),
+    ("stg", 640.0, 275.0, [1], False),
+    ("iso", 640.0, 275.0, [], True),
+    ("both", 812.5, 812.5, [0, 1], True),
+]
 
 
 def randomise(module, seed):
@@ -145,7 +155,7 @@ def main():
 
     cases = []
     with torch.no_grad():
-        for tag, tv, ta in TIMES:
+        for tag, tv, ta, stg, iso in TIMES:
             v = torch.tensor([tv])
             a = torch.tensor([ta])
             o = model(
@@ -163,11 +173,13 @@ def main():
                 fps=s["fps"],
                 audio_num_frames=s["audio_frames"],
                 use_cross_timestep=True,
+                isolate_modalities=iso,
+                spatio_temporal_guidance_blocks=stg,
                 return_dict=False,
             )
             save(out, f"out_video_{tag}", o[0][0])
             save(out, f"out_audio_{tag}", o[1][0])
-            cases.append({"tag": tag, "video_t": tv, "audio_t": ta})
+            cases.append({"tag": tag, "video_t": tv, "audio_t": ta, "stg_blocks": stg, "isolate_modalities": iso})
     meta = dict(SHAPE, cases=cases, shapes=shapes)
     with open(os.path.join(out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)

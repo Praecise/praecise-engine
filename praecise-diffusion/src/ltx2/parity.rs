@@ -69,7 +69,11 @@ fn run_from(precision: Precision, single_file: bool, min_cos: f64, max_rel: f64)
     for case in m["cases"].as_array().unwrap() {
         let tag = case["tag"].as_str().unwrap();
         let (tv, ta) = (case["video_t"].as_f64().unwrap() as f32, case["audio_t"].as_f64().unwrap() as f32);
-        let (ov, oa) = tf.forward(&video, &audio, &text, &audio_text, s, tv, ta).unwrap();
+        let pass = Pass {
+            perturbed_blocks: case["stg_blocks"].as_array().map_or_else(Vec::new, |v| v.iter().map(|b| b.as_u64().unwrap() as usize).collect()),
+            isolate_modalities: case["isolate_modalities"].as_bool().unwrap_or(false),
+        };
+        let (ov, oa) = tf.forward(&video, &audio, &text, &audio_text, s, (tv, ta), &pass).unwrap();
         assert_close(&format!("{tag} video"), &ov, &bin(&format!("out_video_{tag}")), min_cos, max_rel);
         assert_close(&format!("{tag} audio"), &oa, &bin(&format!("out_audio_{tag}")), min_cos, max_rel);
     }
