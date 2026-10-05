@@ -159,3 +159,67 @@ fn wan_session_matches_generation() {
     }
     assert!((s.simulated_secs() - f64::from(video.frames + 8 * (lt as u32 - 1)) / f64::from(req.fps)).abs() < 1e-9);
 }
+
+/// Stage outputs of a released checkpoint against the reference's for one
+/// step (prompt states, the velocity after k blocks, the autoencoder round
+/// trip; tests/parity/make_wan_checkpoint_stages.py). Run with
+/// `PRAECISE_WAN_STAGES=<dir> PRAECISE_WAN_CHECKPOINT=<ckpt>
+/// cargo test wan_checkpoint_stages -- --ignored`; set
+/// `PRAECISE_WAN_STAGES_EXACT=1` for the exact graph over bf16 weights.
+#[test]
+#[ignore = "needs a released checkpoint and its reference stage outputs"]
+fn wan_checkpoint_stages() {
+    let d = PathBuf::from(std::env::var("PRAECISE_WAN_STAGES").unwrap());
+    let rd = |name: &str| -> Option<Vec<f32>> {
+        std::fs::read(d.join(format!("{name}.bin"))).ok().map(|b| b.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+    };
+    let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    let exact = std::env::var("PRAECISE_WAN_STAGES_EXACT").is_ok();
+    let threads = std::thread::available_parallelism().map_or(8, usize::from);
+    let opts = LoadOptions { precision: Precision::Bf16, cpu_threads: threads, device: None };
+    let wan = Wan22::load(&CheckpointFiles::new(std::env::var("PRAECISE_WAN_CHECKPOINT").unwrap()), opts).unwrap();
+    let ids: Vec<i32> = m["prompt_ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
+    assert_eq!(wan.tokens(m["prompt"].as_str().unwrap()).unwrap(), ids);
+    let ctx = wan.context(&ids).unwrap();
+    let c = cos(&ctx, &rd("prompt_states").unwrap());
+    println!("prompt states cosine {c:.6}");
+    assert!(c > 0.999, "prompt states {c}");
+    let ctx = rd("prompt_states").unwrap();
+    let (w, h) = (m["width"].as_u64().unwrap() as usize, m["height"].as_u64().unwrap() as usize);
+    let (lt, lh, lw) = (1, h / 16, w / 16);
+    let (rows, cols) = (lh / 2, lw / 2);
+    let n = rows * cols;
+    let (cs, sn) = wan.cfg.rotary_tables(lt, rows, cols);
+    let (_, steps) = flow_sigmas_schedule(30, wan.sched.flow_shift, wan.sched.num_train_timesteps);
+    println!("first timestep {}", steps[0]);
+    let noise = rd("noise").unwrap();
+    for k in [1u64, 2, 4, 8, 15, 30] {
+        let Some(want) = rd(&format!("velocity_k{k}")) else { continue };
+        let mut cfg = wan.cfg.clone();
+        cfg.num_layers = k;
+        let mut g = Graph::new(&wan.backend).unwrap();
+        let io = wan_dit::build(&mut g, &cfg, &wan.tf, &wan.pe, lt as i64, n as i64, TEXT_TOKENS as i64, 1, exact);
+        g.finish(&[io.out]).unwrap();
+        g.set_f32(io.patches, &wan_dit::patchify(&cfg, &noise, lt, lh, lw));
+        g.set_f32(io.time, &wan_dit::time_features(steps[0] as f32));
+        g.set_f32(io.context, &ctx);
+        g.set_f32(io.cos, &cs);
+        g.set_f32(io.sin, &sn);
+        g.compute().unwrap();
+        let v = wan_dit::unpatchify(&cfg, &g.read_f32(io.out), lt, lh, lw);
+        let c = cos(&v, &want);
+        println!("velocity after {k} blocks: cosine {c:.6}");
+        assert!(c > 0.999, "velocity after {k} blocks {c}");
+    }
+    if let (Some(lat), Some(dec)) = (rd("vae_latents"), rd("vae_decoded")) {
+        let img = RgbImage { width: w as u32, height: h as u32, rgb: std::fs::read(d.join("image.rgb")).unwrap() };
+        let z = wan::encode_frames(&wan.backend, &wan.vae_cfg, &wan.vae, std::slice::from_ref(&img)).unwrap();
+        let c = cos(&z, &lat);
+        println!("autoencoder latents cosine {c:.6}");
+        assert!(c > 0.999, "autoencoder latents {c}");
+        let px = wan::decode(&wan.backend, &wan.vae_cfg, &wan.vae, &lat, (1, lh, lw)).unwrap();
+        let c = cos(&px, &dec);
+        println!("autoencoder decode cosine {c:.6}");
+        assert!(c > 0.999, "autoencoder decode {c}");
+    }
+}

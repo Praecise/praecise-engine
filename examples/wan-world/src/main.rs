@@ -21,6 +21,10 @@ use praecise_diffusion::{CheckpointFiles, LoadOptions, MatrixGame, Precision, Rg
 
 #[derive(Parser, Debug)]
 struct Args {
+    /// Run one plain clip of this many frames instead of a session and
+    /// write its frames as a binary PPM strip to `--out`.
+    #[arg(long)]
+    plain_frames: Option<u32>,
     /// Checkpoint directory (holding `model_index.json`).
     #[arg(long)]
     model: PathBuf,
@@ -95,8 +99,20 @@ fn main() -> anyhow::Result<()> {
         };
         return run(&m, &a, Some(&first));
     }
-    let wan = Wan22::load(&CheckpointFiles::new(&a.model), opts)?;
+    let mut wan = Wan22::load(&CheckpointFiles::new(&a.model), opts)?;
     println!("loaded on {} in {:.1}s, {:.2} GB resident", wan.device(), t.elapsed().as_secs_f64(), wan.resident_bytes() as f64 / 1e9);
+    if let Some(n) = a.plain_frames {
+        let req = praecise_diffusion::VideoRequest { prompt: a.prompt.clone(), negative_prompt: Some(a.negative.clone()), image: None, width: a.width, height: a.height, num_frames: n, fps: a.fps, steps: a.steps, guidance_scale: a.guidance, seed: a.seed };
+        let v = wan.generate(&req)?;
+        let px = v.rgb.iter().map(|&b| f64::from(b)).collect::<Vec<_>>();
+        let mean = px.iter().sum::<f64>() / px.len() as f64;
+        let sd = (px.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / px.len() as f64).sqrt();
+        println!("plain: {} frames {}x{} in {:.1}s, {} evaluations, pixel mean {mean:.1} sd {sd:.1}", v.frames, v.width, v.height, t.elapsed().as_secs_f64(), v.evaluations);
+        let mut f = std::fs::File::create(a.out.as_ref().expect("--out names the PPM"))?;
+        write!(f, "P6\n{} {}\n255\n", v.width, v.height * v.frames)?;
+        f.write_all(&v.rgb)?;
+        return Ok(());
+    }
     run(&wan, &a, None)
 }
 
