@@ -16,6 +16,7 @@ members = [
   "examples/ace-step",
   "examples/cosmos3",
   "examples/wan-world",
+  "examples/qwen-image",
 ]
 
 [workspace.dependencies]
