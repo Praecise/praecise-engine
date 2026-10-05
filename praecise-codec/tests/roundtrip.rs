@@ -60,6 +60,11 @@ fn round_trip(codec: VideoCodec, container: Container, sound: bool) {
     let snd = sound.then_some(Sound { sample_rate: 24_000, channels: 2, samples: &samples });
     let opts = EncodeOptions { codec, container, quantizer: 18 };
     let file = encode(opts, w as u32, h as u32, fps, &rgb, snd).unwrap();
+    if let Ok(dir) = std::env::var("PRAECISE_CODEC_OUT") {
+        // For checking the files with other players and tools.
+        let name = format!("{codec:?}-{}{}.{}", if sound { "sound-" } else { "" }, w, container.extension()).to_lowercase();
+        std::fs::write(std::path::Path::new(&dir).join(name), &file).unwrap();
+    }
     let info = probe(&file).unwrap();
     assert_eq!((info.container, info.codec, info.width, info.height, info.frames), (container, codec, w as u32, h as u32, n as u32));
     assert!((info.fps - fps).abs() < 1e-3, "fps {}", info.fps);
