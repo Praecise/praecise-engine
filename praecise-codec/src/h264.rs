@@ -102,7 +102,6 @@ pub(crate) fn decode(d: &Demuxed, sink: &mut Sink<'_>) -> Result<()> {
     let cfg = parse_avcc(&d.config)?;
     let m = d.matrix.unwrap_or(Matrix::BT709);
     let mut dec = Decoder::new().map_err(codec)?;
-    let opts = DecodeOptions::new().flush_after_decode(Flush::NoFlush);
     let mut packet = Vec::new();
     for (i, s) in d.samples.iter().enumerate() {
         packet.clear();
@@ -114,7 +113,7 @@ pub(crate) fn decode(d: &Demuxed, sink: &mut Sink<'_>) -> Result<()> {
         for unit in split_prefixed(s, cfg.len_size)? {
             push_annex_b(&mut packet, unit);
         }
-        if let Some(p) = dec.decode_with_options(&packet, opts).map_err(codec)? {
+        if let Some(p) = dec.decode_with_options(&packet, DecodeOptions::new().flush_after_decode(Flush::NoFlush)).map_err(codec)? {
             emit(sink, &p, m)?;
         }
         if sink.stopped() {
