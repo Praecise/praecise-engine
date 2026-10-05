@@ -125,6 +125,60 @@ pub(crate) fn to_rgb8(px: &[f32], w: usize, h: usize) -> (Vec<u8>, usize) {
     (rgb, frames)
 }
 
+/// How the tokenizer's chat template frames a prompt; the template ships
+/// with the tokenizer and differs between checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplate {
+    /// Edge (Nemotron): a leading newline, the system turn always present,
+    /// and an opened thinking block after the assistant header.
+    Nemotron,
+    /// Nano and Super (Qwen3-VL): the system turn only when used, and a bare
+    /// assistant header.
+    Qwen,
+}
+
+impl ChatTemplate {
+    /// Recognise a chat template from its Jinja source.
+    ///
+    /// # Errors
+    /// [`Error::Config`] for a template that is neither form.
+    pub fn recognise(source: &str) -> Result<Self> {
+        if source.contains("enable_thinking") && source.contains("<|im_start|>assistant\n<think>") {
+            Ok(Self::Nemotron)
+        } else if source.contains("{{- '<|im_start|>assistant\\n' }}") && !source.contains("<think>") {
+            Ok(Self::Qwen)
+        } else {
+            Err(Error::Config("the tokenizer's chat template is not one this pipeline renders".into()))
+        }
+    }
+
+    /// The prompt text before tokenization; `system` is empty when the
+    /// system turn is not used.
+    #[must_use]
+    pub fn render(self, system: &str, text: &str) -> String {
+        match self {
+            Self::Nemotron => format!("\n<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+            Self::Qwen if system.is_empty() => format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"),
+            Self::Qwen => format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"),
+        }
+    }
+}
+
+/// The chat template source of a tokenizer directory: `chat_template.jinja`,
+/// else the `chat_template` entry of `tokenizer_config.json`.
+fn chat_template(dir: &std::path::Path) -> Result<String> {
+    if let Ok(s) = std::fs::read_to_string(dir.join("chat_template.jinja")) {
+        return Ok(s);
+    }
+    let path = dir.join("tokenizer_config.json");
+    let cfg: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?)
+        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    cfg.get("chat_template")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| Error::Config(format!("{} has no chat template", dir.display())))
+}
+
 /// A loaded Cosmos3 pipeline.
 pub struct Cosmos3 {
     backend: Backend,
@@ -137,6 +191,7 @@ pub struct Cosmos3 {
     eos: i32,
     vision_start: i32,
     system_prompt: bool,
+    chat: ChatTemplate,
     /// Float32 attention throughout, for the full-precision format.
     exact: bool,
 }
@@ -201,12 +256,13 @@ impl Cosmos3 {
         let vae = Weights::from_host(&backend, &vae_cfg.host_tensors(&vae_files, exact)?)?;
         drop(vae_files);
 
+        let chat = ChatTemplate::recognise(&chat_template(&files.root.join("text_tokenizer"))?)?;
         let tok_path = files.root.join("text_tokenizer/tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| Error::Tokenizer(format!("{}: {e}", tok_path.display())))?;
         let id = |t: &str| tokenizer.token_to_id(t).map(|i| i as i32).ok_or_else(|| Error::Tokenizer(format!("no {t} token")));
         let eos = id("<|im_end|>")?;
         let vision_start = id("<|vision_start|>")?;
-        Ok(Self { backend, cfg, tf, vae_cfg, vae, sched, tokenizer, eos, vision_start, system_prompt, exact })
+        Ok(Self { backend, cfg, tf, vae_cfg, vae, sched, tokenizer, eos, vision_start, system_prompt, chat, exact })
     }
 
     /// Device bytes held by the weights.
@@ -252,7 +308,7 @@ impl Cosmos3 {
         } else {
             SYSTEM_PROMPT_VIDEO
         };
-        let chat = format!("\n<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n");
+        let chat = self.chat.render(system, text);
         let enc = self.tokenizer.encode(chat, false).map_err(|e| Error::Tokenizer(e.to_string()))?;
         let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
         ids.push(self.eos);
@@ -566,5 +622,25 @@ mod tests {
             let g = img.rgb.iter().skip(1).step_by(3).map(|&x| f64::from(x)).sum::<f64>() / f64::from(w * h);
             assert!((g - f as f64 * 80.0).abs() < 4.0, "frame {f}: mean green {g}");
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn chat_templates_are_recognised_and_rendered() {
+        let nemotron = "{%- if add_generation_prompt %}{%- if enable_thinking %}{{- '<|im_start|>assistant\n<think>\n' }}{%- endif %}{%- endif %}";
+        let qwen = "{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}";
+        assert_eq!(ChatTemplate::recognise(nemotron).unwrap(), ChatTemplate::Nemotron);
+        assert_eq!(ChatTemplate::recognise(qwen).unwrap(), ChatTemplate::Qwen);
+        assert!(ChatTemplate::recognise("{{ messages }}").is_err());
+        assert_eq!(ChatTemplate::Qwen.render("", "hi"), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(
+            ChatTemplate::Qwen.render("S", "hi"),
+            "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert!(ChatTemplate::Nemotron.render("", "hi").starts_with("\n<|im_start|>system\n<|im_end|>"));
     }
 }
