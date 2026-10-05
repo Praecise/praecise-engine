@@ -215,6 +215,9 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `praecise-runtime` — the backend-agnostic acceleration runtime and inference API.
 - `praecise-host` — runtime hosts and the engine set: confined, supervised
   engines, one per model, within one memory budget.
+- `praecise-codec` — in-process video coding: H.264, H.265 and AV1 decoding
+  from MP4 and Matroska/WebM, H.264 and AV1 encoding to MP4 (AV1 also to
+  WebM) with an Opus soundtrack. Generated videos are written as MP4.
 
 ## Consuming Praecise Engine
 
