@@ -1,10 +1,14 @@
 # TODO: image and video input for reranking and embedding
 
-Status: open. The engine ranks and embeds text only. Vision-language
-rerankers and embedders (a text decoder plus a vision tower, scored with a
-yes/no head or pooled at the last token) load and run today on their text
-decoder alone. This document records what is missing for image and video
-input, so the work can be picked up without re-deriving it.
+Status: reranking done, embedding open. `rerank::rerank_media` scores pairs
+whose sides carry pictures and video frames through the projector (items 1,
+2, 4 and 7 below for rerankers); the caller sizes pictures and samples
+frames by the checkpoint's own rule (items 5 and 6) and writes each side with
+media markers. Against the Qwen3-VL Reranker 2B pipeline, with the text model
+in F16 and the projector from the same converter commit, every pair is
+within 0.0065 of the checkpoint's P(yes) (`tests/rerank_media_parity.rs`);
+in Q8_0 the text model alone moves scores by up to 0.055. Pooled embedding
+(item 3) is still text-only in the engine.
 
 ## Where things stand
 
