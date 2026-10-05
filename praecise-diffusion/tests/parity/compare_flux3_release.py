@@ -9,6 +9,7 @@ loads the same released policy with the reference implementation, runs its
 own `predict_action_chunk` on those inputs with that noise, and prints the
 difference.
 """
+import dataclasses
 import json
 import os
 import pathlib
@@ -25,9 +26,22 @@ pkg = types.ModuleType("lerobot.policies")
 pkg.__path__ = [str(src / "lerobot" / "policies")]
 sys.modules["lerobot.policies"] = pkg
 
+from lerobot.utils import import_utils  # noqa: E402
+
+# NATTEN is importable from the path but carries no package metadata.
+import_utils._natten_available = True
+import_utils.require_package = lambda *a, **k: None
+
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature  # noqa: E402
+from lerobot.policies.flux3.configuration_flux3 import Flux3Config  # noqa: E402
 from lerobot.policies.flux3.modeling_flux3 import Flux3Policy  # noqa: E402
 from lerobot.policies.flux3.processor_flux3 import PAST_ACTIONS  # noqa: E402
 from lerobot.utils.constants import OBS_STATE  # noqa: E402
+
+from lerobot.policies.flux3.f3 import video_vae  # noqa: E402
+
+# Backends differ in speed only; let NATTEN pick one that runs on this host.
+video_vae._natten_attention_kwargs = lambda q, k, v: {}
 
 meta = json.loads((dump / "meta.json").read_text())
 
@@ -47,8 +61,18 @@ for f in policy_dir.iterdir():
     if f.is_file() and f.name != "config.json" and not (local / f.name).exists():
         os.symlink(f, local / f.name)
 
+# The config is built directly rather than through the command-line parser.
+fields = {f.name for f in dataclasses.fields(Flux3Config)}
+kw = {k: v for k, v in cfg.items() if k in fields}
+for key in ("input_features", "output_features"):
+    kw[key] = {k: PolicyFeature(type=FeatureType[v["type"]], shape=tuple(v["shape"])) for k, v in cfg[key].items()}
+kw["dtype"] = getattr(torch, cfg["dtype"]) if cfg.get("dtype") else None
+kw["normalization_mapping"] = {k: NormalizationMode[v] for k, v in cfg["normalization_mapping"].items()}
+for key, value in kw.items():
+    if isinstance(value, list) and key.endswith("_hw"):
+        kw[key] = tuple(value)
 t0 = time.time()
-policy = Flux3Policy.from_pretrained(str(local))
+policy = Flux3Policy.from_pretrained(str(local), config=Flux3Config(**kw))
 policy.eval()
 print(f"loaded in {time.time() - t0:.0f}s, dit dtype {next(policy.dit.parameters()).dtype}", flush=True)
 
