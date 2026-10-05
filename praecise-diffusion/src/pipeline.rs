@@ -255,11 +255,11 @@ impl CheckpointFiles {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&d)
             .map_err(|e| Error::Weights(format!("{}: {e}", d.display())))?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors" || x == "gguf"))
             .collect();
         files.sort();
         if files.is_empty() {
-            return Err(Error::Weights(format!("no safetensors files in {}", d.display())));
+            return Err(Error::Weights(format!("no safetensors or GGUF files in {}", d.display())));
         }
         Ok(files)
     }

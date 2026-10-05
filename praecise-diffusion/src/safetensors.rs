@@ -26,6 +26,9 @@ pub enum Dtype {
     /// A non-float type (counters and the like), of the given element size.
     /// Indexed so the file's layout is checked, never loaded as a weight.
     Other(usize),
+    /// float8 e4m3 (finite, no infinities), as scaled weights store it; see
+    /// [`SafeTensors::dequantize_scaled_f8`].
+    F8E4M3,
     /// Block-quantised rows of a GGUF file, by their ggml type. A weight
     /// stored this way keeps its blocks on the device.
     Quant(u32),
@@ -40,7 +43,8 @@ impl Dtype {
             "F64" | "I64" | "U64" => Some(Self::Other(8)),
             "I32" | "U32" => Some(Self::Other(4)),
             "I16" | "U16" => Some(Self::Other(2)),
-            "I8" | "U8" | "BOOL" | "F8_E4M3" | "F8_E5M2" => Some(Self::Other(1)),
+            "F8_E4M3" => Some(Self::F8E4M3),
+            "I8" | "U8" | "BOOL" | "F8_E5M2" => Some(Self::Other(1)),
             _ => None,
         }
     }
@@ -50,6 +54,7 @@ impl Dtype {
             Self::F32 => 4,
             Self::F16 | Self::Bf16 => 2,
             Self::Other(n) => n,
+            Self::F8E4M3 => 1,
             Self::Quant(_) => 0,
         }
     }
@@ -75,9 +80,25 @@ struct Entry {
     end: usize,
 }
 
+/// Tensor bytes: a mapped file, or rows regrouped in memory.
+enum Store {
+    Map(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Store {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Map(m) => m,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
 /// A set of safetensors files addressed as one tensor namespace.
 pub struct SafeTensors {
-    maps: Vec<Mmap>,
+    maps: Vec<Store>,
     entries: HashMap<String, Entry>,
     metadata: HashMap<String, String>,
 }
@@ -115,6 +136,7 @@ impl TensorView<'_> {
     pub fn to_f32(&self) -> Vec<f32> {
         match self.dtype {
             Dtype::Other(_) => Vec::new(),
+            Dtype::F8E4M3 => self.bytes.iter().map(|&b| f8e4m3(b)).collect(),
             Dtype::Quant(t) => {
                 let mut out = vec![0f32; self.numel()];
                 // SAFETY: `t` names a quantised type with a decoder (checked
@@ -170,7 +192,7 @@ impl SafeTensors {
                         return Err(Error::Weights(format!("tensor {name} appears in more than one file")));
                     }
                 }
-                maps.push(map);
+                maps.push(Store::Map(map));
                 continue;
             }
             let header_len = u64::from_le_bytes(map[..8].try_into().expect("8 bytes")) as usize;
@@ -192,7 +214,7 @@ impl SafeTensors {
                     return Err(Error::Weights(format!("tensor {name} appears in more than one file")));
                 }
             }
-            maps.push(map);
+            maps.push(Store::Map(map));
         }
         Ok(Self { maps, entries, metadata })
     }
@@ -218,6 +240,77 @@ impl SafeTensors {
             }
         }
         self.entries = entries;
+        Ok(self)
+    }
+
+    /// Replace tensor `name` by tensors made of its rows (outermost
+    /// dimension): each part takes the listed half-open row ranges in order.
+    /// A part that is one range stays a view of the file; others are copied.
+    /// Rows of a block-quantised tensor are whole blocks, so this works for
+    /// every stored type.
+    ///
+    /// # Errors
+    /// A missing tensor, or ranges outside its rows.
+    pub fn regroup_rows(mut self, name: &str, parts: &[(String, Vec<(u64, u64)>)]) -> Result<Self> {
+        let e = self.entries.remove(name).ok_or_else(|| Error::Weights(format!("missing tensor {name}")))?;
+        let rows = *e.shape.first().ok_or_else(|| Error::Weights(format!("{name} has no rows")))?;
+        let row_bytes = (e.end - e.start) / rows.max(1) as usize;
+        for (new, ranges) in parts {
+            if ranges.iter().any(|&(a, b)| a >= b || b > rows) {
+                return Err(Error::Weights(format!("{name}: row ranges outside its {rows} rows")));
+            }
+            let n: u64 = ranges.iter().map(|&(a, b)| b - a).sum();
+            let mut shape = e.shape.clone();
+            shape[0] = n;
+            let entry = if let [(a, b)] = ranges[..] {
+                Entry { file: e.file, dtype: e.dtype, shape, start: e.start + a as usize * row_bytes, end: e.start + b as usize * row_bytes }
+            } else {
+                let src = &self.maps[e.file];
+                let mut buf = Vec::with_capacity(n as usize * row_bytes);
+                for &(a, b) in ranges {
+                    buf.extend_from_slice(&src[e.start + a as usize * row_bytes..e.start + b as usize * row_bytes]);
+                }
+                let len = buf.len();
+                self.maps.push(Store::Owned(buf));
+                Entry { file: self.maps.len() - 1, dtype: e.dtype, shape, start: 0, end: len }
+            };
+            if self.entries.insert(new.clone(), entry).is_some() {
+                return Err(Error::Weights(format!("tensor {new} already exists")));
+            }
+        }
+        Ok(self)
+    }
+
+    /// Float8 (e4m3) weights `<layer>.weight` stored with a float32 scale
+    /// `<layer>.weight_scale` become bfloat16 tensors of their scaled values.
+    /// The layer's other quantisation tensors (`<layer>.input_scale`, and
+    /// non-float ones) are dropped: the products run at the load precision.
+    ///
+    /// # Errors
+    /// A float8 tensor without a one-element float scale.
+    pub fn dequantize_scaled_f8(mut self) -> Result<Self> {
+        let names: Vec<String> = self.entries.iter().filter(|(_, e)| e.dtype == Dtype::F8E4M3).map(|(n, _)| n.clone()).collect();
+        for name in names {
+            let scale_name = format!("{name}_scale");
+            let scale = match self.get(&scale_name) {
+                Some(v) if v.numel() == 1 && !matches!(v.dtype, Dtype::Other(_) | Dtype::Quant(_)) => v.to_f32()[0],
+                _ => return Err(Error::Weights(format!("float8 tensor {name} has no scale {scale_name}"))),
+            };
+            let e = self.entries.remove(&name).expect("listed");
+            let src = &self.maps[e.file][e.start..e.end];
+            let mut buf = Vec::with_capacity(2 * src.len());
+            for &b in src {
+                buf.extend_from_slice(&half::bf16::from_f32(f8e4m3(b) * scale).to_bits().to_le_bytes());
+            }
+            let len = buf.len();
+            self.maps.push(Store::Owned(buf));
+            self.entries.insert(name.clone(), Entry { file: self.maps.len() - 1, dtype: Dtype::Bf16, shape: e.shape, start: 0, end: len });
+            self.entries.remove(&scale_name);
+            if let Some(layer) = name.strip_suffix(".weight") {
+                let prefix = format!("{layer}.");
+                self.entries.retain(|n, e| !(n.starts_with(&prefix) && (n.ends_with(".input_scale") || matches!(e.dtype, Dtype::Other(_)))));
+            }
+        }
         Ok(self)
     }
 
@@ -279,6 +372,18 @@ impl SafeTensors {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
     }
+}
+
+/// One float8 e4m3 value: 4 exponent bits (bias 7), 3 mantissa bits,
+/// subnormals below exponent 1, `0x7f`/`0xff` NaN, no infinities.
+fn f8e4m3(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = (i32::from((b >> 3) & 0x0f), f32::from(b & 0x07));
+    if e == 0x0f && m == 7.0 {
+        return f32::NAN;
+    }
+    let v = if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) };
+    sign * v
 }
 
 fn map_file(path: &Path) -> Result<Mmap> {
@@ -428,6 +533,15 @@ fn parse_gguf(map: &[u8], file: usize, metadata: &mut HashMap<String, String>) -
 pub(crate) mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn float8_e4m3_decodes() {
+        assert_eq!(f8e4m3(0x38), 1.0);
+        assert_eq!(f8e4m3(0xb8), -1.0);
+        assert_eq!(f8e4m3(0x7e), 448.0);
+        assert_eq!(f8e4m3(0x01), 2f32.powi(-9));
+        assert!(f8e4m3(0x7f).is_nan());
+    }
 
     /// Write a safetensors file holding f32 tensors, for tests.
     pub(crate) fn write_f32(path: &Path, tensors: &[(String, Vec<u64>, Vec<f32>)]) {

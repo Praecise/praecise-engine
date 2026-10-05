@@ -8,6 +8,14 @@
 //! Queries and keys carry per-head RMS norms and a partial rotary embedding
 //! over three position axes (time, row, column) that leaves the tail of each
 //! head unrotated.
+//!
+//! Checkpoints in the single-file layout (`blocks.N`, fused `qkv_proj`,
+//! `mlp.fc1` with the gate half first, `*_patch_proj`, `final_layer.*`) are
+//! renamed and regrouped to the diffusers names on load. A checkpoint that
+//! ships `adaln_t_table` replaces the time embedder by a table of timestep
+//! embedding coordinates: each timestep's embedding is the linear
+//! interpolation of its two nearest rows (`t` in `[0, 1]` over the grid), fed
+//! to the modulation projections without the SiLU.
 
 use serde::Deserialize;
 
@@ -74,10 +82,12 @@ impl MiniMaxH3Config {
         6 * self.rope_freq_dim
     }
 
-    /// Every weight.
+    /// Every weight. `curve_width` is the width of a timestep-embedding
+    /// table that replaces the time embedder, if the checkpoint has one.
     #[must_use]
-    pub fn weight_specs(&self, linear: WType) -> Vec<WeightSpec> {
-        let (d, hd, ff, te) = (self.hidden_size, self.attention_head_dim, self.ffn_dim, self.time_embed_dim);
+    pub fn weight_specs(&self, linear: WType, curve_width: Option<u64>) -> Vec<WeightSpec> {
+        let (d, hd, ff) = (self.hidden_size, self.attention_head_dim, self.ffn_dim);
+        let te = curve_width.unwrap_or(self.time_embed_dim);
         let inner = self.num_attention_heads * hd;
         let f = WType::F32;
         // 8-bit blocks hold 32 columns; narrower rows stay float32.
@@ -92,8 +102,10 @@ impl MiniMaxH3Config {
         lin("proj_in", d, self.patch_dim(), f, true);
         lin("audio_proj_in", d, self.audio_in_channels, f, true);
         lin("context_embedder", d, self.text_dim, q(self.text_dim), true);
-        lin("time_embedder.linear_1", self.time_embed_hidden_dim, self.freq_dim, f, true);
-        lin("time_embedder.linear_2", te, self.time_embed_hidden_dim, f, true);
+        if curve_width.is_none() {
+            lin("time_embedder.linear_1", self.time_embed_hidden_dim, self.freq_dim, f, true);
+            lin("time_embedder.linear_2", te, self.time_embed_hidden_dim, f, true);
+        }
         lin("norm_out.linear", 2 * d, te, f, true);
         lin("proj_out", self.patch_dim(), d, f, true);
         lin("audio_proj_out", self.audio_in_channels, d, f, true);
@@ -266,6 +278,67 @@ pub struct MiniMaxH3Transformer {
     cfg: MiniMaxH3Config,
     w: Weights,
     exact: bool,
+    /// Timestep-embedding table `[grid][width]` replacing the time embedder.
+    curve: Option<(Vec<f32>, usize, usize)>,
+}
+
+/// The single-file layout renamed and regrouped to the diffusers names;
+/// other layouts unchanged.
+fn from_single_file_layout(st: SafeTensors, cfg: &MiniMaxH3Config) -> Result<SafeTensors> {
+    if st.get("video_patch_proj.weight").is_none() {
+        return Ok(st);
+    }
+    let inner = cfg.num_attention_heads * cfg.attention_head_dim;
+    let ff = cfg.ffn_dim;
+    let mut st = st;
+    let blocks = (0..cfg.num_layers).map(|i| (format!("blocks.{i}"), format!("transformer_blocks.{i}")));
+    let refiner = (0..cfg.num_refiner_layers).map(|i| (format!("token_refiner.blocks.{i}"), format!("token_refiner.refiner_blocks.{i}")));
+    for (src, dst) in blocks.chain(refiner) {
+        let qkv = ["to_q", "to_k", "to_v"].iter().enumerate().map(|(j, n)| (format!("{dst}.attn.{n}.weight"), vec![(j as u64 * inner, (j as u64 + 1) * inner)])).collect::<Vec<_>>();
+        st = st.regroup_rows(&format!("{src}.attn.qkv_proj.weight"), &qkv)?;
+        // The fused feed-forward input holds the gate half first; the
+        // diffusers one holds it second.
+        st = st.regroup_rows(&format!("{src}.mlp.fc1.weight"), &[(format!("{dst}.ff.net.0.proj.weight"), vec![(ff, 2 * ff), (0, ff)])])?;
+    }
+    const PREFIXES: [(&str, &str); 9] = [
+        ("video_patch_proj.", "proj_in."),
+        ("audio_patch_proj.", "audio_proj_in."),
+        ("condition_proj.", "context_embedder."),
+        ("final_layer.video_out.", "proj_out."),
+        ("final_layer.audio_out.", "audio_proj_out."),
+        ("final_layer.norm.", "norm_out.norm."),
+        ("final_layer.adaln_proj.linear.", "norm_out.linear."),
+        ("time_embedder.proj_in.", "time_embedder.linear_1."),
+        ("time_embedder.proj_out.", "time_embedder.linear_2."),
+    ];
+    st.renamed(|n| {
+        // The rotary frequencies are recomputed from the config.
+        if n == "rope.inv_freq" {
+            return None;
+        }
+        if let Some((a, b)) = PREFIXES.iter().find(|(a, _)| n.starts_with(a)) {
+            return Some(format!("{b}{}", &n[a.len()..]));
+        }
+        let (rest, pre) = if let Some(t) = n.strip_prefix("token_refiner.blocks.") {
+            (t, "token_refiner.refiner_blocks.")
+        } else if let Some(t) = n.strip_prefix("blocks.") {
+            (t, "transformer_blocks.")
+        } else {
+            return Some(n.to_string());
+        };
+        let rest = rest.replace(".attn.out_proj.", ".attn.to_out.0.").replace(".attn.q_norm.", ".attn.norm_q.").replace(".attn.k_norm.", ".attn.norm_k.").replace(".mlp.fc2.", ".ff.net.2.");
+        Some(format!("{pre}{rest}"))
+    })
+}
+
+/// The timestep embedding interpolated from table `[grid][width]`, as the
+/// reference does it in float32 (`torch.lerp`).
+fn curve_features(table: &[f32], grid: usize, width: usize, t: f32) -> Vec<f32> {
+    let pos = t.clamp(0.0, 1.0) * (grid - 1) as f32;
+    let i0 = (pos.floor() as usize).min(grid - 2);
+    let w = pos - i0 as f32;
+    let (a, b) = (&table[i0 * width..(i0 + 1) * width], &table[(i0 + 1) * width..(i0 + 2) * width]);
+    a.iter().zip(b).map(|(&s, &e)| if w < 0.5 { s + w * (e - s) } else { e - (e - s) * (1.0 - w) }).collect()
 }
 
 impl std::fmt::Debug for MiniMaxH3Transformer {
@@ -293,9 +366,14 @@ impl MiniMaxH3Transformer {
         cfg.validate()?;
         let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "video transformer backend selected");
-        let st = SafeTensors::open(&files.weights(dir)?)?;
-        let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;
-        Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })
+        let st = from_single_file_layout(SafeTensors::open(&files.weights(dir)?)?.dequantize_scaled_f8()?, &cfg)?;
+        let curve = match st.get("adaln_t_table") {
+            Some(t) if t.shape.len() == 2 && t.shape[0] >= 2 => Some((t.to_f32(), t.shape[0] as usize, t.shape[1] as usize)),
+            Some(_) => return Err(Error::Weights("adaln_t_table must be [grid >= 2][width]".into())),
+            None => None,
+        };
+        let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype(), curve.as_ref().map(|c| c.2 as u64)))?;
+        Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32, curve })
     }
 
     /// The layout.
@@ -370,7 +448,8 @@ impl MiniMaxH3Transformer {
         let text = g.input(sys::GGML_TYPE_F32, &[td as i64, nt as i64]);
         let video = (nv > 0).then(|| g.input(sys::GGML_TYPE_F32, &[pd as i64, nv as i64]));
         let audio = (na > 0).then(|| g.input(sys::GGML_TYPE_F32, &[ad as i64, na as i64]));
-        let time = g.input(sys::GGML_TYPE_F32, &[cfg.freq_dim as i64, k as i64]);
+        let time_width = self.curve.as_ref().map_or(cfg.freq_dim as usize, |c| c.2);
+        let time = g.input(sys::GGML_TYPE_F32, &[time_width as i64, k as i64]);
         let perm_t = g.input(sys::GGML_TYPE_I32, &[n as i64]);
         let mod_idx = g.input(sys::GGML_TYPE_I32, &[n as i64]);
         let out_idx = g.input(sys::GGML_TYPE_I32, &[n as i64]);
@@ -398,10 +477,14 @@ impl MiniMaxH3Transformer {
         }
         let mut x = g.get_rows(all, perm_t);
 
-        let te = lin_b(&mut g, w, "time_embedder.linear_1", time);
-        let te = g.silu(te);
-        let te = lin_b(&mut g, w, "time_embedder.linear_2", te);
-        let te = g.silu(te);
+        let te = if self.curve.is_some() {
+            time
+        } else {
+            let te = lin_b(&mut g, w, "time_embedder.linear_1", time);
+            let te = g.silu(te);
+            let te = lin_b(&mut g, w, "time_embedder.linear_2", te);
+            g.silu(te)
+        };
         let d = c.d;
         for i in 0..cfg.num_layers {
             let p = format!("transformer_blocks.{i}");
@@ -462,8 +545,11 @@ impl MiniMaxH3Transformer {
         if let Some(a) = audio {
             g.set_f32(a, inp.audio);
         }
-        let feats: Vec<f32> = inp.timesteps.iter().flat_map(|&s| S3DitConfig::time_features(s)).collect();
-        if feats.len() != k * cfg.freq_dim as usize {
+        let feats: Vec<f32> = match &self.curve {
+            Some((table, grid, width)) => inp.timesteps.iter().flat_map(|&t| curve_features(table, *grid, *width, t)).collect(),
+            None => inp.timesteps.iter().flat_map(|&s| S3DitConfig::time_features(s)).collect(),
+        };
+        if feats.len() != k * time_width {
             return Err(Error::Config("timestep features disagree with the configured width".into()));
         }
         g.set_f32(time, &feats);
@@ -512,12 +598,16 @@ mod tests {
 
     fn run(precision: Precision, min_cos: f64, max_rel: f64) {
         let d = PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_PARITY").expect("PRAECISE_MINIMAX_H3_PARITY names the fixture dir"));
+        run_dir(&d, precision, min_cos, max_rel);
+    }
+
+    fn run_dir(d: &std::path::Path, precision: Precision, min_cos: f64, max_rel: f64) {
         let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
         let threads = std::thread::available_parallelism().map_or(8, usize::from);
         let tf = MiniMaxH3Transformer::load(&CheckpointFiles::new(d.join("checkpoint")), LoadOptions { precision, cpu_threads: threads, device: None }).unwrap();
         let ints = |k: &str| m[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect::<Vec<_>>();
         let (tags, steps, text_at, video_at, audio_at) = (ints("tags"), ints("timestep_indices"), ints("text_indices"), ints("video_indices"), ints("audio_indices"));
-        let pos = bin(&d, "positions");
+        let pos = bin(d, "positions");
         let mut source = vec![H3Source::Text(0); tags.len()];
         for (i, &j) in text_at.iter().enumerate() {
             source[j] = H3Source::Text(i);
@@ -530,10 +620,37 @@ mod tests {
         }
         let tokens: Vec<H3Token> =
             (0..tags.len()).map(|j| H3Token { source: source[j], tag: tags[j], timestep: steps[j], pos: [pos[3 * j], pos[3 * j + 1], pos[3 * j + 2]] }).collect();
-        let (video, audio, text, timesteps) = (bin(&d, "video"), bin(&d, "audio"), bin(&d, "text"), bin(&d, "timesteps"));
+        let (video, audio, text, timesteps) = (bin(d, "video"), bin(d, "audio"), bin(d, "text"), bin(d, "timesteps"));
         let (v, a) = tf.forward(&H3Input { video: &video, audio: &audio, text: &text, timesteps: &timesteps, tokens: &tokens }).unwrap();
-        assert_close("video", &v, &bin(&d, "out_video"), min_cos, max_rel);
-        assert_close("audio", &a, &bin(&d, "out_audio"), min_cos, max_rel);
+        assert_close("video", &v, &bin(d, "out_video"), min_cos, max_rel);
+        assert_close("audio", &a, &bin(d, "out_audio"), min_cos, max_rel);
+    }
+
+    /// The single-file layout as a GGUF with 8-bit linears and a timestep
+    /// table, against the reference on the dequantised weights (ggml rounds
+    /// activations to 8 bits for the products, so not exact).
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_single_file_gguf() {
+        let d = PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_PARITY").expect("PRAECISE_MINIMAX_H3_PARITY names the fixture dir")).join("single");
+        run_dir(&d, Precision::F32, 0.9999, 2e-2);
+    }
+
+    /// The single-file layout as safetensors with scaled float8 linears,
+    /// dequantised to bfloat16 on load.
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_single_file_f8() {
+        let d = PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_PARITY").expect("PRAECISE_MINIMAX_H3_PARITY names the fixture dir")).join("single_f8");
+        run_dir(&d, Precision::F32, 0.9999, 2e-2);
+    }
+
+    #[test]
+    fn curve_interpolates_like_the_reference() {
+        let table: Vec<f32> = (0..3 * 2).map(|v| v as f32).collect();
+        assert_eq!(curve_features(&table, 3, 2, 0.25), vec![1.0, 2.0]);
+        assert_eq!(curve_features(&table, 3, 2, 1.0), vec![4.0, 5.0]);
+        assert_eq!(curve_features(&table, 3, 2, -1.0), vec![0.0, 1.0]);
     }
 
     #[test]
