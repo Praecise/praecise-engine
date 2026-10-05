@@ -18,7 +18,7 @@ use praecise_runtime::embed::{embed, embed_media, EmbedOptions};
 use praecise_runtime::media::{MediaInput, Picture};
 
 /// Least cosine to the reference vector, for every case.
-const BAR: f64 = 0.9999;
+const BAR: f64 = 0.99999;
 
 fn input(dir: &Path, case: &serde_json::Value) -> MediaInput {
     let pictures = case["pictures"]

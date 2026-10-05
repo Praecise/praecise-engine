@@ -6,7 +6,7 @@ pairs whose sides carry pictures and video frames through the projector
 samples frames by the checkpoint's own rule (items 5 and 6) and writes each
 side with media markers. Against the Qwen3-VL Reranker 2B pipeline, with the
 text model in F16 and the projector from the same converter commit, every
-pair is within 0.00032 of the checkpoint's P(yes) (15 pairs,
+pair is within 0.00036 of the checkpoint's P(yes) (15 pairs,
 `tests/rerank_media_parity.rs`); in Q8_0 the text model alone moves scores
 by up to 0.055.
 
@@ -16,20 +16,20 @@ instruction as the system turn, the end-of-text token the tokenizer appends,
 LAST pooling, L2 normalisation; `embed::embed` is the same for text alone.
 Against the Qwen3-VL Embedding 2B pipeline (transformers 5.18, float32;
 `tests/reference/embed_media.py`), F16 text model and projector, on the CPU,
-the token counts are identical and every case is above 0.99999
-(`tests/embed_media_parity.rs`, which requires 0.9999):
+the token counts are identical and every case is above 0.999998
+(`tests/embed_media_parity.rs`, which requires 0.99999):
 
 | input | tokens | cosine |
 | --- | ---: | ---: |
 | text | 27 | 0.9999998 |
 | text with an instruction | 25 | 0.9999993 |
 | empty input | 21 | 0.9999999 |
-| 256x192 picture | 70 | 0.9999905 |
-| picture and text | 74 | 0.9999974 |
-| 32-frame video | 2396 | 0.9999979 |
-| video, picture and text | 2454 | 0.9999982 |
-| 1280x960 picture | 1222 | 0.9999938 |
-| 64-frame video | 4780 | 0.9999983 |
+| 256x192 picture | 70 | 0.9999982 |
+| picture and text | 74 | 0.9999993 |
+| 32-frame video | 2396 | 0.9999995 |
+| video, picture and text | 2454 | 0.9999994 |
+| 1280x960 picture | 1222 | 0.9999990 |
+| 64-frame video | 4780 | 0.9999993 |
 
 Long visual inputs used to drift (0.99983 for the 1280x960 picture, 0.99853
 for the 64-frame video). The cause was the CPU flash-attention kernel: a
@@ -42,8 +42,10 @@ in FP32, as the tiled path for long query chunks already did. Two smaller
 differences were removed with it: the Qwen3-VL patch mergers use the exact
 (erf) GELU, as the checkpoint does, and image tokens carry the temporal
 position in the fourth rotary section, which interleaved M-RoPE reads for
-its last pairs. What remains (about 1e-5) comes from the vision tower on the
-CPU: its F16 weights and the half-precision GELU table.
+its last pairs. The patch convolution now runs in F32: `ggml_conv_2d`
+unfolded its input in half precision whatever the kernel type, so the pixels
+reached the patch embedding rounded to F16, and the vision tower amplifies
+that on some pictures (a 288x192 picture went from 0.99987 to 0.999998).
 
 ## Where things stand
 
