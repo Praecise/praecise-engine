@@ -181,10 +181,10 @@ def write_side(s, prefix, text, files):
     for kind, media in ([("video", s["video"])] if s["video"] else []) + ([("image", s["image"])] if s["image"] else []):
         frames = media if kind == "video" else [media]
         for f in frames:
-            name = f"{prefix}_{n}.rgb"
+            data = f.tobytes()
+            # A picture used by several pairs is stored once.
+            name = files.setdefault(data, f"{prefix}_{n}.rgb")
             n += 1
-            if name not in files:
-                files[name] = f.tobytes()
             pictures.append({"file": name, "width": f.width, "height": f.height, "video_frame": kind == "video"})
     assert text.count(MARKER) == len(pictures), (text, len(pictures))
     return {"text": text, "pictures": pictures}
@@ -211,7 +211,7 @@ def main():
         out_cases.append({"name": name, "query": q_side, "documents": d_sides, "p_yes": p, "n_tokens": n})
     for f in OUT.glob("*.rgb"):
         f.unlink()
-    for name, data in files.items():
+    for data, name in files.items():
         (OUT / name).write_bytes(data)
     meta = {
         "source": {"repo": REPO, "revision": REVISION},

@@ -1,0 +1,423 @@
+{
+ "source": {
+  "repo": "Qwen/Qwen3-VL-Reranker-2B",
+  "revision": "4bd860ac4f15ad1897a214615cccc700f8f71818"
+ },
+ "transformers": "4.57.6",
+ "torch": "2.14.1+cpu",
+ "dtype": "float32",
+ "cases": [
+  {
+   "name": "pictures",
+   "query": {
+    "text": "a red circle",
+    "pictures": []
+   },
+   "documents": [
+    {
+     "text": "<__media__>",
+     "pictures": [
+      {
+       "file": "pictures_d0_0.rgb",
+       "width": 160,
+       "height": 128,
+       "video_frame": false
+      }
+     ]
+    },
+    {
+     "text": "<__media__>",
+     "pictures": [
+      {
+       "file": "pictures_d1_0.rgb",
+       "width": 160,
+       "height": 128,
+       "video_frame": false
+      }
+     ]
+    },
+    {
+     "text": "<__media__>",
+     "pictures": [
+      {
+       "file": "pictures_d2_0.rgb",
+       "width": 160,
+       "height": 128,
+       "video_frame": false
+      }
+     ]
+    }
+   ],
+   "p_yes": [
+    0.23272748291492462,
+    0.6031279563903809,
+    0.255239874124527
+   ],
+   "n_tokens": [
+    91,
+    91,
+    91
+   ]
+  },
+  {
+   "name": "tiny_picture",
+   "query": {
+    "text": "a yellow triangle",
+    "pictures": []
+   },
+   "documents": [
+    {
+     "text": "<__media__>",
+     "pictures": [
+      {
+       "file": "tiny_picture_d0_0.rgb",
+       "width": 64,
+       "height": 64,
+       "video_frame": false
+      }
+     ]
+    },
+    {
+     "text": "a yellow triangle drawn on paper",
+     "pictures": []
+    }
+   ],
+   "p_yes": [
+    0.7458393573760986,
+    0.7001902461051941
+   ],
+   "n_tokens": [
+    75,
+    75
+   ]
+  },
+  {
+   "name": "picture_text",
+   "query": {
+    "text": "<__media__>which shape is this?",
+    "pictures": [
+     {
+      "file": "pictures_d1_0.rgb",
+      "width": 160,
+      "height": 128,
+      "video_frame": false
+     }
+    ]
+   },
+   "documents": [
+    {
+     "text": "a red circle",
+     "pictures": []
+    },
+    {
+     "text": "<__media__>a blue square",
+     "pictures": [
+      {
+       "file": "pictures_d0_0.rgb",
+       "width": 160,
+       "height": 128,
+       "video_frame": false
+      }
+     ]
+    },
+    {
+     "text": "green vertical stripes",
+     "pictures": []
+    }
+   ],
+   "p_yes": [
+    0.6391743421554565,
+    0.36414286494255066,
+    0.3180173933506012
+   ],
+   "n_tokens": [
+    95,
+    117,
+    95
+   ]
+  },
+  {
+   "name": "video_query",
+   "query": {
+    "text": "<0.2 seconds><__media__><__media__><1.2 seconds><__media__><__media__><2.2 seconds><__media__><__media__><3.2 seconds><__media__><__media__><4.2 seconds><__media__><__media__><5.2 seconds><__media__><__media__><6.2 seconds><__media__><__media__><7.2 seconds><__media__><__media__>where does the ball go?",
+    "pictures": [
+     {
+      "file": "video_query_q_0.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_1.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_2.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_3.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_4.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_5.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_6.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_7.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_8.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_9.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_10.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_11.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_12.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_13.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_14.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     },
+     {
+      "file": "video_query_q_15.rgb",
+      "width": 64,
+      "height": 64,
+      "video_frame": true
+     }
+    ]
+   },
+   "documents": [
+    {
+     "text": "a red ball rolls from left to right",
+     "pictures": []
+    },
+    {
+     "text": "a blue square stays still",
+     "pictures": []
+    }
+   ],
+   "p_yes": [
+    0.6226788759231567,
+    0.34058189392089844
+   ],
+   "n_tokens": [
+    175,
+    172
+   ]
+  },
+  {
+   "name": "video_document",
+   "query": {
+    "text": "a blue ball moving to the right",
+    "pictures": []
+   },
+   "documents": [
+    {
+     "text": "<0.2 seconds><__media__><__media__><1.2 seconds><__media__><__media__><2.2 seconds><__media__><__media__><3.2 seconds><__media__><__media__>",
+     "pictures": [
+      {
+       "file": "video_document_d0_0.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_1.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_2.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_3.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_4.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_5.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_6.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_7.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      }
+     ]
+    },
+    {
+     "text": "<__media__>",
+     "pictures": [
+      {
+       "file": "pictures_d2_0.rgb",
+       "width": 160,
+       "height": 128,
+       "video_frame": false
+      }
+     ]
+    },
+    {
+     "text": "<0.2 seconds><__media__><__media__><1.2 seconds><__media__><__media__><2.2 seconds><__media__><__media__><3.2 seconds><__media__><__media__>a blue ball moving to the right",
+     "pictures": [
+      {
+       "file": "video_document_d0_0.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_1.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_2.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_3.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_4.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_5.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_6.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      },
+      {
+       "file": "video_document_d0_7.rgb",
+       "width": 96,
+       "height": 64,
+       "video_frame": true
+      }
+     ]
+    }
+   ],
+   "p_yes": [
+    0.5958598852157593,
+    0.2166021764278412,
+    0.824723482131958
+   ],
+   "n_tokens": [
+    129,
+    95,
+    136
+   ]
+  },
+  {
+   "name": "text",
+   "query": {
+    "text": "What is the capital of France?",
+    "pictures": []
+   },
+   "documents": [
+    {
+     "text": "Paris is the capital and largest city of France.",
+     "pictures": []
+    },
+    {
+     "text": "Berlin is the capital of Germany.",
+     "pictures": []
+    }
+   ],
+   "p_yes": [
+    0.7862740159034729,
+    0.2884455621242523
+   ],
+   "n_tokens": [
+    82,
+    79
+   ]
+  }
+ ]
+}
