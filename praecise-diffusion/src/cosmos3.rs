@@ -33,6 +33,10 @@ pub const TIME_FEATURES: usize = 256;
 pub struct RopeScaling {
     /// Rotary pairs per axis.
     pub mrope_section: Vec<u64>,
+    /// Whether the axes' pairs interleave (older configurations say so;
+    /// the newer ones always do).
+    #[serde(default)]
+    pub mrope_interleaved: Option<bool>,
 }
 
 /// Transformer configuration, read from `transformer/config.json`.
@@ -99,6 +103,22 @@ pub struct Cosmos3Config {
     /// Embodiments with their own action projections.
     #[serde(default = "domains")]
     pub num_embodiment_domains: u64,
+    /// Older configurations: per-head norms on the generation stream's
+    /// queries and keys (always present in the newer layout).
+    #[serde(default)]
+    pub qk_norm_for_diffusion: Option<bool>,
+    /// Older configurations: separate generation-stream weights.
+    #[serde(default)]
+    pub use_moe: Option<bool>,
+    /// Older configurations: how the two streams attend.
+    #[serde(default)]
+    pub joint_attn_implementation: Option<String>,
+    /// Older configurations: the rotary position scheme.
+    #[serde(default)]
+    pub position_embedding_type: Option<String>,
+    /// Older configurations: causal attention across video frames.
+    #[serde(default)]
+    pub video_temporal_causal: Option<bool>,
 }
 
 fn yes() -> bool {
@@ -130,6 +150,24 @@ impl Cosmos3Config {
         }
         if self.patch_latent_dim != self.latent_channel * self.latent_patch_size * self.latent_patch_size {
             return bad("patch width is not channels times the patch area".into());
+        }
+        if self.qk_norm_for_diffusion == Some(false) {
+            return bad("a generation stream without query/key norms is not implemented".into());
+        }
+        if self.use_moe == Some(false) {
+            return bad("a generation stream sharing the text stream's weights is not implemented".into());
+        }
+        if self.joint_attn_implementation.as_deref().is_some_and(|j| j != "two_way") {
+            return bad(format!("joint attention {:?} is not implemented", self.joint_attn_implementation));
+        }
+        if self.position_embedding_type.as_deref().is_some_and(|p| p != "unified_3d_mrope") {
+            return bad(format!("position embedding {:?} is not implemented", self.position_embedding_type));
+        }
+        if self.video_temporal_causal == Some(true) {
+            return bad("frame-causal video attention is not implemented".into());
+        }
+        if self.rope_scaling.as_ref().is_some_and(|r| r.mrope_interleaved == Some(false)) {
+            return bad("rotary sections laid out in blocks are not implemented".into());
         }
         let axes = self.axes()?;
         let half = self.head_dim / 2;
@@ -604,6 +642,66 @@ mod tests {
     #[test]
     fn the_released_layout_validates() {
         cfg().validate().unwrap();
+    }
+
+    /// The Nano transformer configuration as released (older layout); Super
+    /// differs only in widths and depth.
+    fn nano() -> serde_json::Value {
+        serde_json::from_str(
+            r#"{
+            "_class_name": "Cosmos3OmniTransformer", "_diffusers_version": "0.37.1",
+            "action_dim": 64, "action_gen": true, "attention_bias": false, "attention_dropout": 0.0,
+            "base_fps": 24, "dtype": "bfloat16", "enable_fps_modulation": true, "freeze_und": false,
+            "head_dim": 128, "hidden_act": "silu", "hidden_size": 4096, "initializer_range": 0.02,
+            "intermediate_size": 12288, "joint_attn_implementation": "two_way", "latent_channel": 48,
+            "latent_patch_size": 2, "max_action_dim": 64, "max_position_embeddings": 262144,
+            "model_type": "qwen3_vl_text", "num_attention_heads": 32, "num_embodiment_domains": 32,
+            "num_hidden_layers": 36, "num_key_value_heads": 8, "patch_latent_dim": 192,
+            "position_embedding_type": "unified_3d_mrope", "qk_norm": false, "qk_norm_for_diffusion": true,
+            "qk_norm_for_text": true, "rms_norm_eps": 1e-06,
+            "rope_scaling": {"mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default"},
+            "rope_theta": 5000000, "sound_dim": 64, "sound_gen": true, "sound_latent_fps": 25,
+            "temporal_compression_factor_sound": 1, "timestep_scale": 0.001,
+            "unified_3d_mrope_reset_spatial_ids": true, "unified_3d_mrope_temporal_modality_margin": 15000,
+            "use_cache": true, "use_moe": true, "video_temporal_causal": false, "vocab_size": 151936
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_older_nano_and_super_layouts_validate() {
+        let c: Cosmos3Config = serde_json::from_value(nano()).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.axes().unwrap(), [24, 20, 20]);
+        assert!(c.qk_norm_for_text && !c.use_und_k_norm_for_gen);
+        let mut sup = nano();
+        for (k, v) in [("hidden_size", 5120), ("intermediate_size", 25600), ("num_attention_heads", 64), ("num_hidden_layers", 64)] {
+            sup[k] = v.into();
+        }
+        let c: Cosmos3Config = serde_json::from_value(sup).unwrap();
+        c.validate().unwrap();
+        // Query width 64 x 128 is not the model width.
+        let specs = c.weight_specs(WType::Bf16);
+        let q = specs.iter().find(|s| s.name == "layers.0.self_attn.to_q.weight").unwrap();
+        assert_eq!(q.shape, vec![8192, 5120]);
+    }
+
+    #[test]
+    fn older_settings_this_implementation_does_not_follow_are_refused() {
+        for (k, v) in [
+            ("qk_norm_for_diffusion", serde_json::json!(false)),
+            ("use_moe", serde_json::json!(false)),
+            ("joint_attn_implementation", serde_json::json!("one_way")),
+            ("position_embedding_type", serde_json::json!("rope")),
+            ("video_temporal_causal", serde_json::json!(true)),
+            ("rope_scaling", serde_json::json!({"mrope_interleaved": false, "mrope_section": [24, 20, 20]})),
+        ] {
+            let mut j = nano();
+            j[k] = v;
+            let c: Cosmos3Config = serde_json::from_value(j).unwrap();
+            assert!(matches!(c.validate(), Err(Error::Config(_))), "{k} accepted");
+        }
     }
 
     #[test]

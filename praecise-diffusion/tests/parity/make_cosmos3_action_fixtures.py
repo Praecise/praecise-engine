@@ -4,11 +4,11 @@ A policy run (video and actions from a first frame) and a forward-dynamics run
 (video from a first frame and given actions), each saving the starting noise
 the reference drew so the native pipeline can start from the same values.
 
-Usage: python make_cosmos3_action_fixtures.py <out_dir> <released_checkpoint_dir>
+Usage: python make_cosmos3_action_fixtures.py [--layout nano|super] <out_dir> <released_checkpoint_dir>
        python make_cosmos3_action_fixtures.py --checkpoint <checkpoint_dir> <out_dir>
 
 The first form builds a small random checkpoint with action projections (see
-make_cosmos3_fixtures.py); the second runs a released action checkpoint in
+make_cosmos3_fixtures.py, also for `--layout`); the second runs a released action checkpoint in
 float32 and links `<out_dir>/checkpoint` to it.
 """
 
@@ -122,9 +122,12 @@ def main():
         pipe = Cosmos3OmniPipeline.from_pretrained(ckpt, torch_dtype=torch.float32, enable_safety_checker=False)
         reference(pipe, out, REAL)
     else:
-        out, released = sys.argv[1], sys.argv[2]
+        args, layout = sys.argv[1:], "edge"
+        if args[0] == "--layout":
+            layout, args = args[1], args[2:]
+        out, released = args[0], args[1]
         os.makedirs(out, exist_ok=True)
-        pipe = build(out, released, action_gen=True, action_dim=12, num_embodiment_domains=9)
+        pipe = build(out, released, layout, action_gen=True, action_dim=12, num_embodiment_domains=9)
         reference(pipe, out, SMALL)
 
 

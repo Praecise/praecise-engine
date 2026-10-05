@@ -25,6 +25,10 @@ use crate::schedule;
 use crate::unipc::{UniPc, UniPcConfig};
 use crate::wan::{self, WanVaeConfig};
 
+/// Pipeline classes in `model_index.json`: the current layout, then the older
+/// one of the Nano and Super checkpoints.
+pub const PIPELINE_CLASSES: [&str; 2] = ["Cosmos3OmniPipeline", "Cosmos3OmniDiffusersPipeline"];
+
 /// Longest templated prompt, in tokens.
 pub const MAX_PROMPT_TOKENS: usize = 4096;
 const SYSTEM_PROMPT_VIDEO: &str = "You are a helpful assistant who will generate videos from a give prompt.";
@@ -162,16 +166,19 @@ fn grid_of(num_frames: u32, height: u32, width: u32) -> (usize, usize, usize) {
 }
 
 impl Cosmos3 {
-    /// Load a checkpoint in the diffusers layout. Refuses to run on the CPU
-    /// when the host has GPU hardware this build cannot drive.
+    /// Load a checkpoint in the diffusers layout: the current one (Edge) or
+    /// the older one the Nano and Super checkpoints ship in (another pipeline
+    /// class name, no pipeline flags, extra vision-encoder and sound
+    /// components, which video generation does not read). Refuses to run on
+    /// the CPU when the host has GPU hardware this build cannot drive.
     ///
     /// # Errors
     /// Configuration, weight or backend failures, each named.
     pub fn load(files: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
         let index = files.json("model_index.json")?;
         let class = index.get("_class_name").and_then(Value::as_str).unwrap_or_default();
-        if class != "Cosmos3OmniPipeline" {
-            return Err(Error::Config(format!("pipeline class {class:?} is not Cosmos3OmniPipeline")));
+        if !PIPELINE_CLASSES.contains(&class) {
+            return Err(Error::Config(format!("pipeline class {class:?} is not one of {PIPELINE_CLASSES:?}")));
         }
         let system_prompt = index.get("default_use_system_prompt").and_then(Value::as_bool).unwrap_or(true);
         let cfg: Cosmos3Config = parse(files.json("transformer/config.json")?, "transformer config")?;

@@ -6,11 +6,18 @@ reference implementation on a CPU in seconds. Weights are rounded to bfloat16
 before anything runs, so the native loader sees exactly the values the
 reference computed with.
 
-Usage: python make_cosmos3_fixtures.py <out_dir> <released_checkpoint_dir>
+Usage: python make_cosmos3_fixtures.py [--layout nano|super] <out_dir> <released_checkpoint_dir>
        python make_cosmos3_fixtures.py --checkpoint <checkpoint_dir> <out_dir>
 
 Only the tokenizer and the scheduler configuration are taken from the
-released checkpoint in the first form. With --checkpoint, the reference
+released checkpoint in the first form. `--layout nano` or `--layout super`
+builds the joint transformer of those checkpoints (gated SiLU feed-forward,
+query/key norms on the text stream, sound projections; Super's query width
+differs from its model width) and writes the checkpoint in their older
+repository layout (pipeline class, transformer configuration keys, extra
+components); the released directory is then the Nano or Super one, for its
+Qwen tokenizer. The reference pipeline runs with that layout's defaults
+(system prompt on, the scheduler's own sigmas). With --checkpoint, the reference
 outputs are computed from the released checkpoint itself in float32, over a
 short low-resolution clip, and `<out_dir>/checkpoint` links to it.
 """
@@ -54,7 +61,59 @@ def save(out, name, t):
     return list(a.shape)
 
 
-def build(out, released, **extra):
+LAYOUTS = {
+    "edge": dict(hidden_size=64, intermediate_size=96, num_attention_heads=2, num_key_value_heads=1,
+                 rms_norm_eps=1e-5, rope_theta=100000000.0, vocab_size=131072, hidden_act="relu2",
+                 qk_norm_for_text=False, use_und_k_norm_for_gen=True),
+    "nano": dict(hidden_size=256, intermediate_size=192, num_attention_heads=2, num_key_value_heads=1,
+                 rms_norm_eps=1e-6, rope_theta=5000000.0, vocab_size=151936, hidden_act="silu",
+                 qk_norm_for_text=True, use_und_k_norm_for_gen=False, sound_gen=True, sound_dim=64),
+    "super": dict(hidden_size=160, intermediate_size=320, num_attention_heads=4, num_key_value_heads=1,
+                  rms_norm_eps=1e-6, rope_theta=5000000.0, vocab_size=151936, hidden_act="silu",
+                  qk_norm_for_text=True, use_und_k_norm_for_gen=False, sound_gen=True, sound_dim=64),
+}
+
+
+def older_layout(ckpt):
+    """Rewrite a saved checkpoint into the repository layout of the released
+    Nano and Super checkpoints."""
+    path = os.path.join(ckpt, "transformer", "config.json")
+    with open(path) as f:
+        cfg = json.load(f)
+    section = cfg.pop("rope_axes_dim", None) or cfg["rope_scaling"]["mrope_section"]
+    cfg.pop("use_und_k_norm_for_gen", None)
+    cfg.update(
+        _diffusers_version="0.37.1", dtype="bfloat16", freeze_und=False, initializer_range=0.02,
+        joint_attn_implementation="two_way", max_action_dim=cfg.get("action_dim") or 64,
+        max_position_embeddings=262144, model_type="qwen3_vl_text",
+        position_embedding_type="unified_3d_mrope", qk_norm=False, qk_norm_for_diffusion=True,
+        rope_scaling={"mrope_interleaved": True, "mrope_section": section, "rope_type": "default"},
+        temporal_compression_factor_sound=1, use_cache=True, use_moe=True, video_temporal_causal=False,
+    )
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    index = {
+        "_class_name": "Cosmos3OmniDiffusersPipeline",
+        "_diffusers_version": "0.37.1",
+        "scheduler": ["diffusers", "UniPCMultistepScheduler"],
+        "text_tokenizer": ["transformers", "Qwen2TokenizerFast"],
+        "transformer": ["diffusers", "Cosmos3OmniTransformer"],
+        "vae": ["diffusers", "AutoencoderKLWan"],
+        "vision_encoder": ["transformers", "Qwen3VLVisionModel"],
+        "sound_tokenizer": ["diffusers", "Cosmos3AVAEAudioTokenizer"],
+    }
+    with open(os.path.join(ckpt, "model_index.json"), "w") as f:
+        json.dump(index, f, indent=2)
+    for sub in ("scheduler", "vae"):
+        p = os.path.join(ckpt, sub, "config.json" if sub == "vae" else "scheduler_config.json")
+        with open(p) as f:
+            c = json.load(f)
+        c["_diffusers_version"] = "0.37.1"
+        with open(p, "w") as f:
+            json.dump(c, f, indent=2, sort_keys=True)
+
+
+def build(out, released, layout="edge", **extra):
     """The small checkpoint; `extra` adds transformer settings."""
     ckpt = os.path.join(out, "checkpoint")
     os.makedirs(ckpt, exist_ok=True)
@@ -62,26 +121,17 @@ def build(out, released, **extra):
     transformer = Cosmos3OmniTransformer(
         attention_bias=False,
         head_dim=128,
-        hidden_size=64,
-        intermediate_size=96,
         base_fps=24,
         enable_fps_modulation=True,
         latent_channel=Z,
         latent_patch_size=2,
-        num_attention_heads=2,
         num_hidden_layers=2,
-        num_key_value_heads=1,
         patch_latent_dim=4 * Z,
-        rms_norm_eps=1e-5,
         rope_scaling={"mrope_section": [24, 20, 20]},
-        rope_theta=100000000.0,
         timestep_scale=0.001,
-        vocab_size=131072,
-        hidden_act="relu2",
-        qk_norm_for_text=False,
-        use_und_k_norm_for_gen=True,
         unified_3d_mrope_reset_spatial_ids=True,
         unified_3d_mrope_temporal_modality_margin=15000,
+        **LAYOUTS[layout],
         **extra,
     )
     randomise(transformer, 1)
@@ -110,8 +160,8 @@ def build(out, released, **extra):
         vae=vae,
         scheduler=UniPCMultistepScheduler.from_pretrained(os.path.join(released, "scheduler")),
         enable_safety_checker=False,
-        default_use_system_prompt=False,
-        use_native_flow_schedule=True,
+        default_use_system_prompt=layout != "edge",
+        use_native_flow_schedule=layout == "edge",
     )
     pipe.save_pretrained(ckpt, safe_serialization=True)
     # Store the checkpoint in bfloat16 like the real one.
@@ -124,6 +174,8 @@ def build(out, released, **extra):
                 p = os.path.join(d, f)
                 sd = load_file(p)
                 save_file({k: (v.to(torch.bfloat16) if v.is_floating_point() else v) for k, v in sd.items()}, p)
+    if layout != "edge":
+        older_layout(ckpt)
     return pipe
 
 
@@ -196,9 +248,12 @@ def main():
         pipe = Cosmos3OmniPipeline.from_pretrained(ckpt, torch_dtype=torch.float32, enable_safety_checker=False)
         reference(pipe, out, REAL)
     else:
-        out, released = sys.argv[1], sys.argv[2]
+        args, layout = sys.argv[1:], "edge"
+        if args[0] == "--layout":
+            layout, args = args[1], args[2:]
+        out, released = args[0], args[1]
         os.makedirs(out, exist_ok=True)
-        reference(build(out, released), out, SMALL)
+        reference(build(out, released, layout), out, SMALL)
 
 
 if __name__ == "__main__":
