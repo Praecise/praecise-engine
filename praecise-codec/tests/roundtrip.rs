@@ -107,6 +107,17 @@ fn mp4_layout_is_playable_while_downloading() {
 }
 
 #[test]
+fn encoding_is_reproducible() {
+    let rgb = clip(64, 48, 6);
+    let samples = tone(24_000, 0.25, 1);
+    for codec in [VideoCodec::H264, VideoCodec::Av1] {
+        let opts = EncodeOptions { codec, container: Container::Mp4, quantizer: 20 };
+        let snd = || Some(Sound { sample_rate: 24_000, channels: 1, samples: &samples });
+        assert_eq!(encode(opts, 64, 48, 24.0, &rgb, snd()).unwrap(), encode(opts, 64, 48, 24.0, &rgb, snd()).unwrap(), "{codec:?}");
+    }
+}
+
+#[test]
 fn decoding_can_stop_early() {
     let file = encode(EncodeOptions::default(), 32, 32, 30.0, &clip(32, 32, 8), None).unwrap();
     let mut seen = Vec::new();

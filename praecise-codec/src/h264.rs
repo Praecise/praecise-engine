@@ -40,7 +40,10 @@ impl Encoder {
             .qp(QpRange::new(quantizer, quantizer))
             .skip_frames(false)
             .intra_frame_period(IntraFramePeriod::from_num_frames((fps * 2.0).round().max(1.0) as u32))
-            .vui(VuiConfig::bt709());
+            .vui(VuiConfig::bt709())
+            // One thread: the bitstream, and so the file's hash, is then the
+            // same on every machine.
+            .num_threads(1);
         let enc = openh264::encoder::Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(codec)?;
         Ok(Self { enc, sps: None, pps: None, samples: Vec::new() })
     }
