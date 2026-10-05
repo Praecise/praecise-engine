@@ -46,13 +46,30 @@ pub struct VisionConfig {
     pub window_size: u64,
     /// Blocks that attend over the whole image instead of a window.
     pub fullatt_block_indexes: Vec<usize>,
-    /// Input channels.
-    #[serde(default = "three", alias = "in_chans")]
-    pub in_channels: u64,
+    /// Input channels. Released configs may carry both this key and the
+    /// older `in_chans`; read [`VisionConfig::in_channels`].
+    #[serde(default)]
+    in_channels: Option<u64>,
+    /// Input channels under the older key.
+    #[serde(default)]
+    in_chans: Option<u64>,
 }
 
-fn three() -> u64 {
-    3
+impl VisionConfig {
+    /// Input channels (3 when the config names none).
+    #[must_use]
+    pub fn in_channels(&self) -> u64 {
+        self.in_channels.or(self.in_chans).unwrap_or(3)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let (Some(a), Some(b)) = (self.in_channels, self.in_chans) {
+            if a != b {
+                return Err(Error::Config(format!("vision config: in_channels {a} and in_chans {b} disagree")));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Multi-axis rotary sections.
@@ -120,6 +137,7 @@ impl QwenVlConfig {
             return bad(format!("rotary sections {s:?} do not cover the head width {}", self.head_dim()));
         }
         let v = &self.vision_config;
+        v.validate()?;
         if !v.hidden_size.is_multiple_of(v.num_heads) || !(v.hidden_size / v.num_heads).is_multiple_of(4) {
             return bad("vision heads do not split into row and column halves".into());
         }
@@ -189,7 +207,7 @@ impl QwenVlConfig {
 
     fn patch_in(&self) -> u64 {
         let v = &self.vision_config;
-        v.in_channels * v.temporal_patch_size * v.patch_size * v.patch_size
+        v.in_channels() * v.temporal_patch_size * v.patch_size * v.patch_size
     }
 }
 
@@ -245,7 +263,7 @@ impl QwenVlEncoder {
         let w = Weights::load(&backend, &st, &cfg.weight_specs(embed, opts.precision.wtype()))?;
         let v = &cfg.vision_config;
         let name = "visual.patch_embed.proj.weight";
-        let shape = [v.hidden_size, v.in_channels, v.temporal_patch_size, v.patch_size, v.patch_size];
+        let shape = [v.hidden_size, v.in_channels(), v.temporal_patch_size, v.patch_size, v.patch_size];
         let data = st.require(name, &shape)?.to_f32();
         let patch = Weights::from_host(
             &backend,
@@ -628,6 +646,26 @@ mod tests {
 
     use super::*;
     use crate::qwen_image::parity::{assert_close, bin};
+
+    fn vision(extra: Value) -> Result<VisionConfig> {
+        let mut v = serde_json::json!({
+            "depth": 2, "hidden_size": 64, "intermediate_size": 128, "num_heads": 4, "out_hidden_size": 32,
+            "patch_size": 14, "spatial_merge_size": 2, "temporal_patch_size": 2, "window_size": 112,
+            "fullatt_block_indexes": [1]
+        });
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let c: VisionConfig = serde_json::from_value(v).map_err(|e| Error::Config(e.to_string()))?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    #[test]
+    fn vision_config_reads_either_channel_key() {
+        assert_eq!(vision(serde_json::json!({"in_channels": 3, "in_chans": 3})).unwrap().in_channels(), 3);
+        assert_eq!(vision(serde_json::json!({"in_chans": 4})).unwrap().in_channels(), 4);
+        assert_eq!(vision(serde_json::json!({})).unwrap().in_channels(), 3);
+        assert!(vision(serde_json::json!({"in_channels": 3, "in_chans": 4})).is_err());
+    }
 
     fn dir() -> PathBuf {
         PathBuf::from(std::env::var("PRAECISE_QWEN_VL_PARITY").expect("PRAECISE_QWEN_VL_PARITY names the fixture dir"))
