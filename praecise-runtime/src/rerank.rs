@@ -157,31 +157,6 @@ fn head_score(ctx: &llama_cpp_2::context::LlamaContext<'_>) -> Result<f32> {
 }
 
 
-/// A picture in a pair: packed RGB rows, already sized the way the model's
-/// own processor sizes it (the projector keeps a picture whose sides are
-/// multiples of its patch grid and whose area is within its limits).
-#[cfg(feature = "mtmd")]
-#[derive(Debug, Clone)]
-pub struct RerankPicture {
-    pub width: u32,
-    pub height: u32,
-    /// `width * height * 3` bytes.
-    pub rgb: Vec<u8>,
-    /// A frame of a video. Consecutive frames whose markers follow each
-    /// other are merged over time by projectors with a temporal patch.
-    pub video_frame: bool,
-}
-
-/// One side of a pair that may carry pictures and video: text in which each
-/// media marker ([`llama_cpp_2::mtmd::mtmd_default_marker`]) stands for the
-/// next entry of `pictures`, in order.
-#[cfg(feature = "mtmd")]
-#[derive(Debug, Clone, Default)]
-pub struct RerankInput {
-    pub text: String,
-    pub pictures: Vec<RerankPicture>,
-}
-
 /// Micro-batch a multimodal pair is decoded in; a longer pair is decoded in
 /// several, which a causal decoder scores the same.
 #[cfg(feature = "mtmd")]
@@ -206,12 +181,10 @@ pub fn rerank_media(
     backend: &LlamaBackend,
     model: &LlamaModel,
     projector: &llama_cpp_2::mtmd::MtmdContext,
-    query: &RerankInput,
-    documents: &[RerankInput],
+    query: &crate::media::MediaInput,
+    documents: &[crate::media::MediaInput],
     options: RerankOptions,
 ) -> Result<Vec<RerankScore>> {
-    use llama_cpp_2::mtmd::mtmd_default_marker;
-
     if model.n_cls_out() == 0 {
         return Err(inference("the model has no classification head to score with"));
     }
@@ -223,37 +196,21 @@ pub fn rerank_media(
     if has_media && !projector.support_vision() {
         return Err(inference("the projector has no vision tower"));
     }
-    let marker = mtmd_default_marker();
     for (side, input) in std::iter::once(("the query", query)).chain(documents.iter().map(|d| ("a document", d))) {
-        let markers = input.text.matches(marker).count();
-        if markers != input.pictures.len() {
-            return Err(inference(format!(
-                "{side} has {markers} media markers for {} pictures",
-                input.pictures.len()
-            )));
-        }
+        input.check(side)?;
     }
     let query_first = match (template.find("{query}"), template.find("{document}")) {
         (Some(q), Some(d)) => q < d,
         _ => return Err(inference("the rerank template lacks a query or document slot")),
     };
 
-    let tokenize = |document: &RerankInput| -> Result<llama_cpp_2::mtmd::MtmdInputChunks> {
+    let tokenize = |document: &crate::media::MediaInput| -> Result<llama_cpp_2::mtmd::MtmdInputChunks> {
         let prompt = template
             .replace("{query}", &query.text)
             .replace("{document}", &document.text);
         let (first, second) = if query_first { (query, document) } else { (document, query) };
-        let bitmaps = first
-            .pictures
-            .iter()
-            .chain(&second.pictures)
-            .map(|p| {
-                let mut bitmap = llama_cpp_2::mtmd::MtmdBitmap::from_image_data(p.width, p.height, &p.rgb)
-                    .map_err(|e| inference(format!("a picture could not be read: {e}")))?;
-                bitmap.set_mergeable(p.video_frame);
-                Ok(bitmap)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut bitmaps = first.bitmaps()?;
+        bitmaps.extend(second.bitmaps()?);
         let refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
         projector
             .tokenize(

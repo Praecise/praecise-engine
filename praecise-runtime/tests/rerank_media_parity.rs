@@ -16,21 +16,22 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{MtmdContext, MtmdContextParams};
-use praecise_runtime::rerank::{rerank_media, RerankInput, RerankOptions, RerankPicture};
+use praecise_runtime::media::{MediaInput, Picture};
+use praecise_runtime::rerank::{rerank_media, RerankOptions};
 
-fn side(dir: &Path, v: &serde_json::Value) -> RerankInput {
+fn side(dir: &Path, v: &serde_json::Value) -> MediaInput {
     let pictures = v["pictures"]
         .as_array()
         .expect("pictures")
         .iter()
-        .map(|p| RerankPicture {
+        .map(|p| Picture {
             width: u32::try_from(p["width"].as_u64().expect("width")).expect("width"),
             height: u32::try_from(p["height"].as_u64().expect("height")).expect("height"),
             rgb: std::fs::read(dir.join(p["file"].as_str().expect("file"))).expect("picture"),
             video_frame: p["video_frame"].as_bool().expect("video_frame"),
         })
         .collect();
-    RerankInput {
+    MediaInput {
         text: v["text"].as_str().expect("text").to_owned(),
         pictures,
     }
@@ -75,7 +76,7 @@ fn multimodal_reranker_scores_match_the_source_checkpoint() {
             continue;
         }
         let query = side(dir, &case["query"]);
-        let documents: Vec<RerankInput> = case["documents"]
+        let documents: Vec<MediaInput> = case["documents"]
             .as_array()
             .expect("documents")
             .iter()

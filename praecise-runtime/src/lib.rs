@@ -99,6 +99,15 @@ pub mod speculative;
 #[cfg(feature = "bundled-llama")]
 pub mod rerank;
 
+/// Pooled embeddings of text, pictures and video. Compiled only with a
+/// bundled backend.
+#[cfg(feature = "bundled-llama")]
+pub mod embed;
+
+/// Pictures and video frames as input. Compiled only with `mtmd`.
+#[cfg(feature = "mtmd")]
+pub mod media;
+
 /// Speech synthesis through an audio projector. Compiled only with `mtmd`.
 #[cfg(feature = "mtmd")]
 pub mod speech;
