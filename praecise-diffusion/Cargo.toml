@@ -16,6 +16,7 @@ memmap2 = "0.9"
 rand = "0.9"
 rand_chacha = "0.9"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+praecise-codec = { path = "../praecise-codec" }
 
 [features]
 default = []

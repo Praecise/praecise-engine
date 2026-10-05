@@ -149,10 +149,12 @@ pub struct H3Output {
 }
 
 impl H3Output {
-    /// The clip and its soundtrack as one AVI file.
-    #[must_use]
-    pub fn avi(&self) -> Vec<u8> {
-        self.video.avi(&self.audio)
+    /// The clip and its soundtrack as one MP4 file.
+    ///
+    /// # Errors
+    /// As [`crate::Video::mp4`].
+    pub fn mp4(&self) -> crate::Result<Vec<u8>> {
+        self.video.mp4(Some(&self.audio))
     }
 }
 

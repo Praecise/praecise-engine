@@ -65,4 +65,8 @@ pub enum Error {
     /// Filesystem error.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Video encoding or decoding failed.
+    #[error("video: {0}")]
+    Video(#[from] praecise_codec::Error),
 }

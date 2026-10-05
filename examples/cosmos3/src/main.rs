@@ -5,7 +5,7 @@
 //! ```text
 //! cargo run --release -p cosmos3 --features cuda -- \
 //!     --model <checkpoint dir> --prompt "a red kite over a beach" \
-//!     --image first.ppm --frames 121 --runs 2 --out out.y4m
+//!     --image first.ppm --frames 121 --runs 2 --out out.mp4
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ struct Args {
     /// Number of generations; the first is reported as warm-up.
     #[arg(long, default_value_t = 2)]
     runs: u32,
-    /// Where to write the last result (YUV4MPEG2).
+    /// Where to write the last result (MP4).
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -137,7 +137,7 @@ fn main() -> anyhow::Result<()> {
         last = Some(video);
     }
     if let (Some(path), Some(video)) = (args.out, last) {
-        std::fs::write(path, video.y4m())?;
+        std::fs::write(path, video.mp4(None)?)?;
     }
     Ok(())
 }

@@ -79,36 +79,30 @@ pub struct Video {
 }
 
 impl Video {
-    /// The video as an uncompressed YUV4MPEG2 stream (full-resolution
-    /// chroma, BT.601 full range).
-    #[must_use]
-    pub fn y4m(&self) -> Vec<u8> {
-        let (w, h) = (self.width as usize, self.height as usize);
-        let (num, den) = rational(self.fps);
-        let mut out = format!("YUV4MPEG2 W{w} H{h} F{num}:{den} Ip A1:1 C444 XCOLORRANGE=FULL\n").into_bytes();
-        for f in self.rgb.chunks_exact(w * h * 3) {
-            out.extend_from_slice(b"FRAME\n");
-            let mut planes = vec![0u8; 3 * w * h];
-            for (i, px) in f.chunks_exact(3).enumerate() {
-                let (r, g, b) = (f32::from(px[0]), f32::from(px[1]), f32::from(px[2]));
-                let y = 0.299 * r + 0.587 * g + 0.114 * b;
-                planes[i] = y.round().clamp(0.0, 255.0) as u8;
-                planes[w * h + i] = (128.0 + 0.564 * (b - y)).round().clamp(0.0, 255.0) as u8;
-                planes[2 * w * h + i] = (128.0 + 0.713 * (r - y)).round().clamp(0.0, 255.0) as u8;
-            }
-            out.extend_from_slice(&planes);
-        }
-        out
+    /// The video as an MP4 file (H.264, BT.709), with `sound` as its
+    /// soundtrack (Opus) when given.
+    ///
+    /// # Errors
+    /// An odd width or height, or an encoder failure.
+    pub fn mp4(&self, sound: Option<&crate::music::Audio>) -> Result<Vec<u8>> {
+        let sound = sound.map(|a| praecise_codec::Sound { sample_rate: a.sample_rate, channels: a.channels, samples: &a.samples });
+        Ok(praecise_codec::encode(praecise_codec::EncodeOptions::default(), self.width, self.height, self.fps, &self.rgb, sound)?)
     }
 }
 
-impl Video {
-    /// The frames with `audio` as their soundtrack, as an uncompressed AVI
-    /// (24-bit RGB frames, 16-bit PCM sound interleaved per frame).
-    #[must_use]
-    pub fn avi(&self, audio: &crate::music::Audio) -> Vec<u8> {
-        avi::encode(self, audio)
-    }
+/// The frames of a video file (MP4 or Matroska/WebM; H.264, H.265 or AV1)
+/// in display order, and its frame rate.
+///
+/// # Errors
+/// A file that is not one of those formats, or fails to decode.
+pub fn frames_from_video(bytes: &[u8]) -> Result<(Vec<RgbImage>, f32)> {
+    let mut frames = Vec::new();
+    let info = praecise_codec::decode_each(bytes, |_, rgb| {
+        frames.push(rgb.to_vec());
+        true
+    })?;
+    let images = frames.into_iter().map(|rgb| RgbImage { width: info.width, height: info.height, rgb }).collect();
+    Ok((images, info.fps))
 }
 
 /// Frames `[F][3][H][W]` in `[-1, 1]` to interleaved 8-bit RGB, and the
@@ -125,11 +119,6 @@ pub(crate) fn to_rgb8(px: &[f32], w: usize, h: usize) -> (Vec<u8>, usize) {
         }
     }
     (rgb, frames)
-}
-
-fn rational(fps: f32) -> (u32, u32) {
-    let den = 1000u32;
-    ((f64::from(fps) * f64::from(den)).round() as u32, den)
 }
 
 /// A loaded Cosmos3 pipeline.
@@ -513,7 +502,6 @@ impl Cosmos3 {
 }
 
 mod action;
-mod avi;
 pub use action::{action_caption, action_resolution_tier, ActionMode, ActionOutput, ActionRequest, Embodiment};
 
 #[cfg(test)]
@@ -557,11 +545,19 @@ mod tests {
     }
 
     #[test]
-    fn y4m_has_a_header_and_one_plane_set_per_frame() {
-        let v = Video { width: 2, height: 2, frames: 2, fps: 24.0, rgb: vec![255; 24], seed: 0, evaluations: 0, timings: Timings::default() };
-        let y = v.y4m();
-        let header = b"YUV4MPEG2 W2 H2 F24000:1000 Ip A1:1 C444 XCOLORRANGE=FULL\n";
-        assert!(y.starts_with(header));
-        assert_eq!(y.len(), header.len() + 2 * (6 + 12));
+    fn mp4_round_trips_every_frame() {
+        let (w, h, n) = (32u32, 32u32, 3usize);
+        let rgb: Vec<u8> = (0..n).flat_map(|f| (0..w * h).flat_map(move |i| [(i % 32 * 8) as u8, (f * 80) as u8, 128])).collect();
+        let v = Video { width: w, height: h, frames: n as u32, fps: 24.0, rgb, seed: 0, evaluations: 0, timings: Timings::default() };
+        let file = v.mp4(None).unwrap();
+        let (frames, fps) = frames_from_video(&file).unwrap();
+        assert_eq!(frames.len(), n);
+        assert!((fps - 24.0).abs() < 1e-3);
+        for (f, img) in frames.iter().enumerate() {
+            assert_eq!((img.width, img.height), (w, h));
+            // Frame order: the green channel steps by frame.
+            let g = img.rgb.iter().skip(1).step_by(3).map(|&x| f64::from(x)).sum::<f64>() / f64::from(w * h);
+            assert!((g - f as f64 * 80.0).abs() < 4.0, "frame {f}: mean green {g}");
+        }
     }
 }

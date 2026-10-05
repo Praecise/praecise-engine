@@ -4,11 +4,11 @@
 //! runs on the Wan2.2 checkpoint's text encoder and autoencoder, from a
 //! first frame (a P6 PPM, or a plain horizon) and a scripted walk that
 //! moves forward and turns. Reports per-chunk timings and pixel
-//! statistics and writes the stream as Y4M.
+//! statistics and writes the stream as MP4.
 //!
 //! ```text
 //! cargo run --release -p wan-world -- --model <checkpoint dir> \
-//!     --prompt "a car driving down a coastal road" --chunks 3 --out out.y4m
+//!     --prompt "a car driving down a coastal road" --chunks 3 --out out.mp4
 //! ```
 
 use std::io::Write;
@@ -64,7 +64,7 @@ struct Args {
     /// Weight precision: bf16, q8_0 or f32.
     #[arg(long, default_value = "bf16")]
     precision: String,
-    /// Y4M output.
+    /// MP4 output.
     #[arg(long)]
     out: Option<PathBuf>,
     /// Action world-model checkpoint directory; `--model` then gives the
@@ -165,11 +165,7 @@ fn run<M: WorldModel>(model: &M, a: &Args, first: Option<&RgbImage>) -> anyhow::
     };
     let mut s = WorldSession::start(model, cfg, &a.prompt, &a.negative, first)?;
     let mut out = match &a.out {
-        Some(p) => {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
-            write!(f, "YUV4MPEG2 W{} H{} F{}:1 Ip A1:1 C444\n", a.width, a.height, a.fps.round() as u32)?;
-            Some(f)
-        }
+        Some(_) => Some(praecise_diffusion::codec::VideoWriter::new(praecise_diffusion::codec::EncodeOptions::default(), a.width, a.height, a.fps)?),
         None => None,
     };
     for _ in 0..a.chunks {
@@ -188,25 +184,14 @@ fn run<M: WorldModel>(model: &M, a: &Args, first: Option<&RgbImage>) -> anyhow::
             t.elapsed().as_secs_f64(),
             c.evaluations
         );
-        if let Some(f) = out.as_mut() {
-            let plane = (a.width * a.height) as usize;
-            for fr in c.rgb.chunks_exact(plane * 3) {
-                f.write_all(b"FRAME\n")?;
-                for ch in 0..3 {
-                    let rgb_to = |p: &[u8]| -> u8 {
-                        let (r, g, b) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
-                        let v = match ch {
-                            0 => 0.299 * r + 0.587 * g + 0.114 * b,
-                            1 => 128.0 - 0.168_736 * r - 0.331_264 * g + 0.5 * b,
-                            _ => 128.0 + 0.5 * r - 0.418_688 * g - 0.081_312 * b,
-                        };
-                        v.round().clamp(0.0, 255.0) as u8
-                    };
-                    let row: Vec<u8> = fr.chunks_exact(3).map(rgb_to).collect();
-                    f.write_all(&row)?;
-                }
+        if let Some(w) = out.as_mut() {
+            for fr in c.rgb.chunks_exact((a.width * a.height) as usize * 3) {
+                w.push(fr)?;
             }
         }
+    }
+    if let (Some(w), Some(p)) = (out, &a.out) {
+        std::fs::write(p, w.finish(None)?)?;
     }
     println!("simulated {:.3}s over {} chunks, memory {:?}", s.simulated_secs(), s.chunks(), s.memory().map(|f| f.index).collect::<Vec<_>>());
     Ok(())
