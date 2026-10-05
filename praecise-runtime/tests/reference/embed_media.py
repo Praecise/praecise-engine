@@ -24,7 +24,8 @@ from qwen3_vl_embedding import Qwen3VLEmbedder  # noqa: E402
 
 os.makedirs(OUT, exist_ok=True)
 torch.manual_seed(0)
-emb = Qwen3VLEmbedder(CHECKPOINT, torch_dtype=torch.float32)
+# 32 frames per video (the pipeline's num_frames/max_frames setting).
+emb = Qwen3VLEmbedder(CHECKPOINT, torch_dtype=torch.float32, num_frames=32, max_frames=32)
 tok = emb.processor.tokenizer
 
 
@@ -46,7 +47,7 @@ def save(name, img, video_frame):
 
 
 IMAGE = picture(256, 192, 0.4)
-FRAMES = [picture(448, 320, i * 0.25) for i in range(64)]
+FRAMES = [picture(448, 320, i * 0.25) for i in range(32)]
 
 CASES = [
     ("text", {"text": "A red kite over a beach."}),
