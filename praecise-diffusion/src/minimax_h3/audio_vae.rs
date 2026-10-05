@@ -468,10 +468,22 @@ mod tests {
     #[test]
     #[ignore = "needs the reference fixtures"]
     fn minimax_h3_parity_audio_vae() {
+        run("checkpoint");
+    }
+
+    /// The single-file release: weight norms folded into plain weights and
+    /// the latent statistics stored beside them.
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_audio_vae_single_file() {
+        run("single");
+    }
+
+    fn run(checkpoint: &str) {
         let d = PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_AUDIO_VAE_PARITY").expect("PRAECISE_MINIMAX_H3_AUDIO_VAE_PARITY names the fixture dir"));
         let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
         let threads = std::thread::available_parallelism().map_or(8, usize::from);
-        let vae = H3AudioVae::load(&CheckpointFiles::new(d.join("checkpoint")), LoadOptions { precision: Precision::Bf16, cpu_threads: threads, device: None }).unwrap();
+        let vae = H3AudioVae::load(&CheckpointFiles::new(d.join(checkpoint)), LoadOptions { precision: Precision::Bf16, cpu_threads: threads, device: None }).unwrap();
         let (z, t) = vae.encode(&bin(&d, "enc_in")).unwrap();
         assert_eq!(t as u64, m["cases"]["enc"]["output"].as_u64().unwrap());
         assert_close("encode", &z, &bin(&d, "enc_out"), 0.999_999, 1e-4);

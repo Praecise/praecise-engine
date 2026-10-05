@@ -243,6 +243,20 @@ impl SafeTensors {
         Ok(self)
     }
 
+    /// Tensor `name` viewed under another shape of the same element count
+    /// (a file that folds dimensions together, as GGUF does past four).
+    ///
+    /// # Errors
+    /// A missing tensor, a block-quantised one, or a different element count.
+    pub fn reshaped(mut self, name: &str, shape: &[u64]) -> Result<Self> {
+        let e = self.entries.get_mut(name).ok_or_else(|| Error::MissingTensor(name.to_string()))?;
+        if matches!(e.dtype, Dtype::Quant(_)) || e.shape.iter().product::<u64>() != shape.iter().product::<u64>() {
+            return Err(Error::Weights(format!("{name}: {:?} cannot be viewed as {shape:?}", e.shape)));
+        }
+        e.shape = shape.to_vec();
+        Ok(self)
+    }
+
     /// Replace tensor `name` by tensors made of its rows (outermost
     /// dimension): each part takes the listed half-open row ranges in order.
     /// A part that is one range stays a view of the file; others are copied.
@@ -577,6 +591,17 @@ pub(crate) mod tests {
         assert_eq!(v.to_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert!(matches!(st.require("w", &[3, 2]), Err(Error::TensorShape { .. })));
         assert!(matches!(st.require("x", &[1]), Err(Error::MissingTensor(_))));
+    }
+
+    #[test]
+    fn a_tensor_is_viewed_under_another_shape_of_its_size() {
+        let dir = std::env::temp_dir().join(format!("pd-st-reshape-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.safetensors");
+        write_f32(&path, &[("w".into(), vec![6, 2], (0..12).map(|v| v as f32).collect())]);
+        let st = SafeTensors::open(&[path]).unwrap().reshaped("w", &[2, 3, 2]).unwrap();
+        assert_eq!(st.require("w", &[2, 3, 2]).unwrap().to_f32(), (0..12).map(|v| v as f32).collect::<Vec<_>>());
+        assert!(st.reshaped("w", &[5]).is_err());
     }
 
     #[test]

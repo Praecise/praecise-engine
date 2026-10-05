@@ -19,6 +19,11 @@
 //! default, as the checkpoint was released. Pixels are in the autoencoder's
 //! own space (ImageNet mean / std normalised RGB); latents are normalised
 //! with the checkpoint's per-channel `latents_mean` / `latents_std`.
+//!
+//! Checkpoints in the single-file layout (`encoder.down.N.block.M`,
+//! `decoder.x_embedder`, fused `to_qkv` with each head's query, key and value
+//! rows together, `ff.w1` with the gate half first) are renamed and regrouped
+//! to the diffusers names on load.
 
 use serde::Deserialize;
 
@@ -27,6 +32,52 @@ use crate::ggml::{Backend, Graph, HostTensor, Tn, WType, Weights};
 use crate::pipeline::{parse, CheckpointFiles, LoadOptions, Precision, RgbImage};
 use crate::safetensors::SafeTensors;
 use llama_cpp_sys_2 as sys;
+
+/// Name pieces of the single-file layout and their diffusers names, applied
+/// in order to every name.
+const SINGLE_FILE_LAYOUT: [(&str, &str); 7] = [
+    ("decoder.x_embedder.", "decoder.proj_in."),
+    (".attn.to_out.", ".attn.to_out.0."),
+    (".ff.w2.", ".ff.net.2."),
+    (".downsample.conv.", ".downsamplers.0.conv."),
+    (".nin_shortcut.", ".conv_shortcut."),
+    (".block.", ".resnets."),
+    ("encoder.down.", "encoder.down_blocks."),
+];
+
+/// The single-file layout renamed and regrouped to the diffusers names;
+/// other layouts unchanged.
+fn from_single_file_layout(st: SafeTensors, cfg: &H3VideoVaeConfig) -> Result<SafeTensors> {
+    if st.get("decoder.x_embedder.weight").is_none() {
+        return Ok(st);
+    }
+    let (heads, hd) = (cfg.decoder_num_attention_heads, cfg.decoder_attention_head_dim);
+    let mut st = st;
+    for i in 0..cfg.decoder_num_layers {
+        let p = format!("decoder.transformer_blocks.{i}");
+        for t in ["weight", "bias"] {
+            // Rows run head by head, each head's query, key and value together.
+            let qkv = ["to_q", "to_k", "to_v"]
+                .iter()
+                .enumerate()
+                .map(|(j, n)| (format!("{p}.attn.{n}.{t}"), (0..heads).map(|h| (h * 3 * hd + j as u64 * hd, h * 3 * hd + (j as u64 + 1) * hd)).collect()))
+                .collect::<Vec<_>>();
+            st = st.regroup_rows(&format!("{p}.attn.to_qkv.{t}"), &qkv)?;
+            let w1 = format!("{p}.ff.w1.{t}");
+            let ff = st.get(&w1).ok_or_else(|| Error::MissingTensor(w1.clone()))?.shape[0] / 2;
+            st = st.regroup_rows(&w1, &[(format!("{p}.ff.net.0.proj.{t}"), vec![(ff, 2 * ff), (0, ff)])])?;
+        }
+    }
+    st.renamed(|n| {
+        // The latent statistics are read from the config; the mask token is
+        // a training input.
+        if matches!(n, "latents_mean" | "latents_std" | "decoder.mask_token") {
+            return None;
+        }
+        let rename = n.starts_with("encoder.down.") || n.starts_with("decoder.");
+        Some(if rename { SINGLE_FILE_LAYOUT.iter().fold(n.to_string(), |s, (a, b)| s.replace(a, b)) } else { n.to_string() })
+    })
+}
 
 /// ImageNet channel means of the pixel space.
 pub const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -496,7 +547,7 @@ impl H3VideoVae {
         let cfg: H3VideoVaeConfig = parse(files.json("vae/config.json")?, "video autoencoder config")?;
         cfg.validate()?;
         let backend = opts.backend()?;
-        let st = SafeTensors::open(&files.weights("vae")?)?;
+        let st = from_single_file_layout(SafeTensors::open(&files.weights("vae")?)?, &cfg)?;
         let w = Weights::from_host(&backend, &cfg.host_tensors(&st, opts.precision.wtype())?)?;
         Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32, tiling: Some(Tiling::default()) })
     }
@@ -943,10 +994,14 @@ mod tests {
     }
 
     fn run(precision: Precision, min_cos: f64, max_rel: f64) {
+        run_dir("checkpoint", precision, min_cos, max_rel);
+    }
+
+    fn run_dir(checkpoint: &str, precision: Precision, min_cos: f64, max_rel: f64) {
         let d = PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_VAE_PARITY").expect("PRAECISE_MINIMAX_H3_VAE_PARITY names the fixture dir"));
         let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
         let threads = std::thread::available_parallelism().map_or(8, usize::from);
-        let mut vae = H3VideoVae::load(&CheckpointFiles::new(d.join("checkpoint")), LoadOptions { precision, cpu_threads: threads, device: None }).unwrap();
+        let mut vae = H3VideoVae::load(&CheckpointFiles::new(d.join(checkpoint)), LoadOptions { precision, cpu_threads: threads, device: None }).unwrap();
         let (tile, overlap) = (m["tile"].as_u64().unwrap() as usize, m["overlap"].as_u64().unwrap() as usize);
         let dims = |v: &Value| -> [usize; 3] { [0, 1, 2].map(|i| v[i].as_u64().unwrap() as usize) };
         for (name, case) in m["cases"].as_object().unwrap() {
@@ -975,5 +1030,14 @@ mod tests {
     #[ignore = "needs the reference fixtures"]
     fn minimax_h3_parity_video_vae_bf16() {
         run(Precision::Bf16, 0.9999, 2e-2);
+    }
+
+    /// The single-file release layout (renamed encoder, per-head fused
+    /// attention rows, gate-first feed-forward), against the same reference
+    /// outputs.
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_video_vae_single_file() {
+        run_dir("single", Precision::F32, 0.999_999, 1e-4);
     }
 }

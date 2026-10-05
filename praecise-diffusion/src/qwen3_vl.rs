@@ -26,6 +26,30 @@ const VISION_EPS: f32 = 1e-6;
 const TEXT: &str = "model.language_model";
 const VISUAL: &str = "model.visual";
 
+/// Name prefixes of the flat layout (plain decoder names and a top-level
+/// vision tower, as the GGUF releases keep them) and their nested names.
+const FLAT_LAYOUT: [(&str, &str); 4] = [
+    ("model.layers.", "model.language_model.layers."),
+    ("model.embed_tokens.", "model.language_model.embed_tokens."),
+    ("model.norm.", "model.language_model.norm."),
+    ("visual.", "model.visual."),
+];
+
+/// A checkpoint in the flat layout renamed to the nested names, with the
+/// patch embedding (folded to four dimensions in GGUF) viewed as its five;
+/// other layouts unchanged.
+fn from_flat_layout(st: SafeTensors, cfg: &Qwen3VlConfig) -> Result<SafeTensors> {
+    if st.get("visual.patch_embed.proj.weight").is_none() {
+        return Ok(st);
+    }
+    let st = st.renamed(|n| match FLAT_LAYOUT.iter().find(|(a, _)| n.starts_with(a)) {
+        Some((a, b)) => Some(format!("{b}{}", &n[a.len()..])),
+        None => Some(n.to_string()),
+    })?;
+    let v = &cfg.vision_config;
+    st.reshaped(&format!("{VISUAL}.patch_embed.proj.weight"), &[v.hidden_size, v.in_channels, v.temporal_patch_size, v.patch_size, v.patch_size])
+}
+
 /// The vision tower's layout.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Vision3Config {
@@ -262,7 +286,8 @@ fn taps(index: usize, size: usize, side: usize) -> [(usize, f32); 2] {
 }
 
 impl Qwen3VlEncoder {
-    /// Load `dir/` (its `config.json` and safetensors files) of a checkpoint.
+    /// Load `dir/` (its `config.json` and safetensors or GGUF files) of a
+    /// checkpoint, in the nested or the flat layout.
     ///
     /// # Errors
     /// An unsupported configuration, missing weights or no usable backend.
@@ -285,7 +310,7 @@ impl Qwen3VlEncoder {
             }
             t.num_hidden_layers = n;
         }
-        let st = SafeTensors::open(&files.weights(dir)?)?;
+        let st = from_flat_layout(SafeTensors::open(&files.weights(dir)?)?, &cfg)?;
         let backend = opts.backend()?;
         let exact = opts.precision == Precision::F32;
         let embed = if exact { WType::F32 } else { WType::F16 };
@@ -749,6 +774,31 @@ mod tests {
 
     fn dir() -> PathBuf {
         PathBuf::from(std::env::var("PRAECISE_QWEN3_VL_PARITY").expect("PRAECISE_QWEN3_VL_PARITY names the fixture dir"))
+    }
+
+    /// The flat-layout GGUF of the first `layer` decoder layers (no final
+    /// norm), as the released prompt encoder ships, against the same
+    /// reference outputs.
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn qwen3_vl_parity_flat_gguf() {
+        let d = dir();
+        let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+        let threads = std::thread::available_parallelism().map_or(8, usize::from);
+        let opts = LoadOptions { precision: Precision::F32, cpu_threads: threads, device: None };
+        let at = m["layer"].as_u64().unwrap() as usize;
+        let enc = Qwen3VlEncoder::load_layers(&CheckpointFiles::new(d.join("flat")), "text_encoder", opts, Some(at)).unwrap();
+        let unit = enc.cfg.vision_config.patch_size as usize;
+        let mut images = Vec::new();
+        for (i, g) in m["grids"].as_array().unwrap().iter().enumerate() {
+            let (gh, gw) = (g[0].as_u64().unwrap() as usize, g[1].as_u64().unwrap() as usize);
+            let img = enc.image(&bin(&d, &format!("pixels_{i}")), (gh * unit, gw * unit)).unwrap();
+            assert_close(&format!("image tokens {i}"), &enc.encode_image(&img).unwrap().tokens, &bin(&d, &format!("tokens_{i}")), 0.999_999, 1e-4);
+            images.push(img);
+        }
+        let ids = |k: &str| m[k].as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as u32).collect::<Vec<_>>();
+        assert_close("prompt at a layer", &enc.forward(&ids("ids"), &images).unwrap(), &bin(&d, "hidden_at"), 0.999_999, 1e-4);
+        assert_close("text prompt at a layer", &enc.forward(&ids("text_ids"), &[]).unwrap(), &bin(&d, "hidden_text_at"), 0.999_999, 1e-4);
     }
 
     fn run(precision: Precision, min_cos: f64, max_rel: f64) {
