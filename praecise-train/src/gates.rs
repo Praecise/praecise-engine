@@ -119,6 +119,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn sim(model: &str, params: &[(&str, f64)]) -> Option<SimulationOrigin> {
         Some(SimulationOrigin { model: model.into(), parameters: params.iter().map(|(k, v)| ((*k).into(), *v)).collect() })
     }

@@ -13,6 +13,15 @@
 //! - A 16-point random Hadamard transform with Philox signs spreads outliers across a block
 //!   before quantization; it is orthonormal and its inverse is exact up to f32 rounding.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    reason = "bit-level encodings of small floating-point formats"
+)]
+
 use crate::Error;
 use crate::philox::{Philox, uniform_f32};
 
@@ -45,6 +54,7 @@ pub enum Rounding<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
 enum Mode {
     Nearest,
     Up,
@@ -68,7 +78,7 @@ impl Minifloat {
     }
 
     /// Rounds a non-negative finite magnitude onto the grid, saturating at the maximum.
-    fn round(self, a: f32, mode: &Mode) -> f32 {
+    fn round(self, a: f32, mode: Mode) -> f32 {
         if a == 0.0 {
             return 0.0;
         }
@@ -107,7 +117,7 @@ impl Minifloat {
         if code >> (self.ebits + self.mbits) & 1 == 1 { -a } else { a }
     }
 
-    fn quantize(self, x: f32, mode: &Mode) -> u8 {
+    fn quantize(self, x: f32, mode: Mode) -> u8 {
         let q = self.round(x.abs(), mode);
         self.encode(if x.is_sign_negative() { -q } else { q })
     }
@@ -163,7 +173,7 @@ pub fn mxfp8_quantize(x: &[f32], rounding: Rounding<'_>) -> Result<Mxfp8, Error>
         scales.push((e + 127) as u8);
         for (i, &v) in block.iter().enumerate() {
             let y = (f64::from(v) / 2f64.powi(e)) as f32;
-            codes.push(E4M3.quantize(y, &mode(rounding, (b * MX_BLOCK + i) as u64)));
+            codes.push(E4M3.quantize(y, mode(rounding, (b * MX_BLOCK + i) as u64)));
         }
     }
     Ok(Mxfp8 { scales, codes })
@@ -226,6 +236,7 @@ fn block_of(layout: Nvfp4Layout, cols: usize, r: usize, c: usize) -> usize {
 ///
 /// # Errors
 /// [`Error::Refused`] on a non-finite value or a length that is not `rows * cols`.
+#[allow(clippy::many_single_char_names)]
 pub fn nvfp4_quantize(x: &[f32], rows: usize, cols: usize, layout: Nvfp4Layout, rounding: Rounding<'_>) -> Result<Nvfp4, Error> {
     if x.len() != rows * cols {
         return Err(Error::Refused(format!("{} values for a {rows}x{cols} tensor", x.len())));
@@ -241,14 +252,14 @@ pub fn nvfp4_quantize(x: &[f32], rows: usize, cols: usize, layout: Nvfp4Layout, 
     }
     let tensor_amax = amax.iter().fold(0f32, |m, &v| m.max(v));
     let tensor_scale = if tensor_amax == 0.0 { 1.0 } else { tensor_amax / (E2M1.max * E4M3.max) };
-    let block_scales: Vec<u8> = amax.iter().map(|&a| E4M3.encode(E4M3.round(a / E2M1.max / tensor_scale, &Mode::Up))).collect();
+    let block_scales: Vec<u8> = amax.iter().map(|&a| E4M3.encode(E4M3.round(a / E2M1.max / tensor_scale, Mode::Up))).collect();
     let mut q = Nvfp4 { rows, cols, layout, tensor_scale, block_scales, codes: Vec::with_capacity(x.len()) };
     for r in 0..rows {
         for c in 0..cols {
             let s = E4M3.decode(q.block_scales[q.block(r, c)]) * tensor_scale;
             let i = r * cols + c;
             let y = if s == 0.0 { 0.0 } else { x[i] / s };
-            q.codes.push(E2M1.quantize(y, &mode(rounding, i as u64)));
+            q.codes.push(E2M1.quantize(y, mode(rounding, i as u64)));
         }
     }
     Ok(q)
@@ -267,6 +278,7 @@ pub fn nvfp4_dequantize(q: &Nvfp4) -> Vec<f32> {
     out
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn rht_signs(rng: &Philox, stream: u32) -> [f32; NV_BLOCK] {
     std::array::from_fn(|j| if rng.word(stream, 0, j as u64) & 1 == 1 { -1.0 } else { 1.0 })
 }
@@ -294,7 +306,7 @@ fn hadamard16(v: &mut [f32]) {
 /// # Errors
 /// [`Error::Refused`] when the length is not a multiple of 16.
 pub fn rht16(x: &mut [f32], rng: &Philox, stream: u32) -> Result<(), Error> {
-    if x.len() % NV_BLOCK != 0 {
+    if !x.len().is_multiple_of(NV_BLOCK) {
         return Err(Error::Refused(format!("{} values are not whole blocks of {NV_BLOCK}", x.len())));
     }
     let s = rht_signs(rng, stream);
@@ -312,7 +324,7 @@ pub fn rht16(x: &mut [f32], rng: &Philox, stream: u32) -> Result<(), Error> {
 /// # Errors
 /// [`Error::Refused`] when the length is not a multiple of 16.
 pub fn rht16_inverse(x: &mut [f32], rng: &Philox, stream: u32) -> Result<(), Error> {
-    if x.len() % NV_BLOCK != 0 {
+    if !x.len().is_multiple_of(NV_BLOCK) {
         return Err(Error::Refused(format!("{} values are not whole blocks of {NV_BLOCK}", x.len())));
     }
     let s = rht_signs(rng, stream);
@@ -350,10 +362,10 @@ mod tests {
         for c in (1u8..16).filter(|&c| c != 0x8) {
             assert_eq!(E2M1.encode(E2M1.decode(c)), c, "e2m1 {c:#x}");
         }
-        assert_eq!(E4M3.round(1000.0, &Mode::Nearest), 448.0, "saturates");
-        assert_eq!(E2M1.round(2.5, &Mode::Nearest), 2.0, "ties to even");
-        assert_eq!(E2M1.round(5.0, &Mode::Nearest), 4.0, "ties to even");
-        assert_eq!(E2M1.round(2.1, &Mode::Up), 3.0);
+        assert_eq!(E4M3.round(1000.0, Mode::Nearest), 448.0, "saturates");
+        assert_eq!(E2M1.round(2.5, Mode::Nearest), 2.0, "ties to even");
+        assert_eq!(E2M1.round(5.0, Mode::Nearest), 4.0, "ties to even");
+        assert_eq!(E2M1.round(2.1, Mode::Up), 3.0);
     }
 
     #[test]
