@@ -1,4 +1,4 @@
-//! LoRA SFT on a real dense language model, and the exported adapter served by the runtime
+//! `LoRA` SFT on a real dense language model, and the exported adapter served by the runtime
 //! against the trainer on many prompts. Ignored by default: run with
 //! `PRAECISE_TRAIN_MODEL=<model.gguf> cargo test -p praecise-train --features engine --test real_model -- --ignored`.
 //! `PRAECISE_TRAIN_PROMPTS` sets the number of served prompts (default 1000).
@@ -83,6 +83,11 @@ fn lora_sft_on_a_real_model_and_served_logprobs_match() {
     let (t, losses) = run(30);
     let (first, last) = (losses[0], losses[losses.len() - 1]);
     println!("loss {first:.4} -> {last:.4}");
+    if let Ok(out) = std::env::var("PRAECISE_TRAIN_REFERENCE_DUMP") {
+        dump_reference_inputs(&PathBuf::from(out), &init, &batch, &losses);
+        return;
+    }
+    check_reference_band(&losses);
     assert!(first.is_finite() && first > 1.0, "the base model cannot already predict random tokens: {first}");
     assert!(last < 0.5 * first, "loss {first} -> {last}");
 
@@ -128,4 +133,71 @@ fn lora_sft_on_a_real_model_and_served_logprobs_match() {
     }
     println!("{n_prompts} prompts, max |served - trained| log-prob {max_diff:e}");
     assert!(max_diff == 0.0, "served log-probs differ from the trainer by up to {max_diff}");
+}
+
+/// Relative distance allowed between the trainer and the reference loss at every step. The
+/// reference runs the same dequantized weights in f32 through an independent graph; the trainer
+/// quantizes activations for the quantized matmuls, which the band absorbs.
+const REFERENCE_BAND: f64 = 0.05;
+
+/// The inputs the reference script needs to reproduce this run: token ids, initial adapter and
+/// recipe, beside the trainer losses.
+fn dump_reference_inputs(out: &std::path::Path, init: &std::path::Path, batch: &StepBatch, losses: &[f64]) {
+    use std::fmt::Write as _;
+    std::fs::create_dir_all(out).unwrap();
+    std::fs::copy(init, out.join("init.gguf")).unwrap();
+    let StepBatch::Sft(data) = batch else { unreachable!() };
+    let tokens: String = data
+        .iter()
+        .map(|e| e.tokens.iter().map(i32::to_string).collect::<Vec<_>>().join(" ") + "\n")
+        .collect();
+    std::fs::write(out.join("tokens.txt"), tokens).unwrap();
+    let r = recipe();
+    let OptimizerSpec::AdamW { lr, beta1, beta2, eps, weight_decay } = r.optimizer else { unreachable!() };
+    let recipe = format!("lr {lr}\nbeta1 {beta1}\nbeta2 {beta2}\neps {eps}\nweight_decay {weight_decay}\ngrad_clip {}\n", r.grad_clip);
+    std::fs::write(out.join("recipe.txt"), recipe).unwrap();
+    let mut s = String::new();
+    for (i, l) in losses.iter().enumerate() {
+        writeln!(s, "{i} {l:.6}").unwrap();
+    }
+    std::fs::write(out.join("trainer_losses.txt"), s).unwrap();
+    println!("reference inputs written to {}", out.display());
+}
+
+/// Every step's loss lies within the band of the offline reference fixture for this model,
+/// found by the model's SHA-256. A model with no fixture is refused.
+fn check_reference_band(losses: &[f64]) {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut h = sha2::Sha256::new();
+    let mut f = std::fs::File::open(model_path()).unwrap();
+    let mut buf = vec![0u8; 1 << 24];
+    loop {
+        let n = f.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sft_reference");
+    let fixture = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .find(|s| s.lines().next() == Some(&format!("model_sha256 {digest}")))
+        .unwrap_or_else(|| {
+            panic!("no reference fixture for model {digest} in {}: produce one with tests/reference/sft_reference.py", dir.display())
+        });
+    let reference: Vec<f64> = fixture
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            k.parse::<usize>().ok().map(|_| v.parse().unwrap())
+        })
+        .collect();
+    assert_eq!(reference.len(), losses.len(), "the fixture covers every step");
+    for (i, (&got, &want)) in losses.iter().zip(&reference).enumerate() {
+        let rel = (got - want).abs() / want.abs().max(1.0);
+        assert!(rel <= REFERENCE_BAND, "step {i}: trainer loss {got} vs reference {want} (relative {rel:.4})");
+    }
 }
