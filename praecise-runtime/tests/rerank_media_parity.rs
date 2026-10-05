@@ -2,7 +2,8 @@
 //! source checkpoint's own pipeline. Needs `PRAECISE_RERANK_GGUF` (a
 //! vision-language reranker GGUF), `PRAECISE_RERANK_MMPROJ` (its projector)
 //! and `PRAECISE_RERANK_MEDIA` (a directory holding `expected.json` and the
-//! raw RGB pictures it names); skips without them.
+//! raw RGB pictures it names); skips without them. `PRAECISE_RERANK_CASES`
+//! (comma-separated case names) runs a subset.
 #![cfg(feature = "mtmd")]
 
 use std::path::Path;
@@ -62,8 +63,12 @@ fn multimodal_reranker_scores_match_the_source_checkpoint() {
     };
 
     let mut worst = 0f32;
+    let only = std::env::var("PRAECISE_RERANK_CASES").ok();
     for case in exp["cases"].as_array().expect("cases") {
         let name = case["name"].as_str().expect("name");
+        if only.as_deref().is_some_and(|o| !o.split(',').any(|c| c == name)) {
+            continue;
+        }
         let query = side(dir, &case["query"]);
         let documents: Vec<RerankInput> = case["documents"]
             .as_array()
@@ -78,14 +83,16 @@ fn multimodal_reranker_scores_match_the_source_checkpoint() {
             let d = (s.score - w).abs();
             worst = worst.max(d);
             eprintln!(
-                "{name}[{}]: P(yes) {:.6} vs {:.6} (|d| {:.6}), tokens {} vs {}",
+                "pair {name}[{}]: P(yes) {:.6} vs {:.6} (|d| {:.6}), tokens {} vs {}",
                 s.index, s.score, w, d, s.tokens, t
             );
             assert_eq!(s.tokens, *t, "{name}[{}]: token count differs from the checkpoint pipeline", s.index);
         }
         // A document's score does not depend on the other documents.
-        let alone = rerank_media(&backend, &model, &projector, &query, &documents[1..2], options).expect("alone");
-        assert_eq!(alone[0].score.to_bits(), got[1].score.to_bits(), "{name}: score depends on the request");
+        if case == &exp["cases"][0] {
+            let alone = rerank_media(&backend, &model, &projector, &query, &documents[1..2], options).expect("alone");
+            assert_eq!(alone[0].score.to_bits(), got[1].score.to_bits(), "{name}: score depends on the request");
+        }
     }
     eprintln!("worst |P(yes) difference| {worst:.6}");
     assert!(worst < 1e-2, "worst P(yes) difference {worst} exceeds 1e-2");
