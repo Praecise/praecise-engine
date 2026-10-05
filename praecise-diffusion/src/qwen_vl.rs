@@ -202,6 +202,13 @@ impl QwenVlConfig {
         s.push(WeightSpec::new("visual.merger.mlp.0.bias", &[merged], f));
         s.push(WeightSpec::new("visual.merger.mlp.2.weight", &[v.out_hidden_size, merged], linear));
         s.push(WeightSpec::new("visual.merger.mlp.2.bias", &[v.out_hidden_size], f));
+        // 8-bit blocks hold 32 columns; narrower rows (the vision feed-forward
+        // width 3420 of the released tower) stay float32.
+        for w in &mut s {
+            if w.ty == WType::Q8_0 && !w.shape.last().copied().unwrap_or(0).is_multiple_of(32) {
+                w.ty = f;
+            }
+        }
         s
     }
 
@@ -657,6 +664,26 @@ mod tests {
         let c: VisionConfig = serde_json::from_value(v).map_err(|e| Error::Config(e.to_string()))?;
         c.validate()?;
         Ok(c)
+    }
+
+    #[test]
+    fn eight_bit_weights_keep_narrow_rows_in_float32() {
+        let c = serde_json::json!({
+            "hidden_size": 64, "intermediate_size": 128, "num_attention_heads": 4, "num_hidden_layers": 1,
+            "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "rope_theta": 1e6, "rope_scaling": {"mrope_section": [2, 3, 3]},
+            "vocab_size": 256, "image_token_id": 7,
+            "vision_config": {
+                "depth": 1, "hidden_size": 64, "intermediate_size": 3420, "num_heads": 4, "out_hidden_size": 64,
+                "patch_size": 14, "spatial_merge_size": 2, "temporal_patch_size": 2, "window_size": 112,
+                "fullatt_block_indexes": [0]
+            }
+        });
+        let cfg = QwenVlConfig::from_json(c).unwrap();
+        let specs = cfg.weight_specs(WType::F16, WType::Q8_0);
+        let ty = |n: &str| specs.iter().find(|w| w.name == n).unwrap().ty;
+        assert_eq!(ty("visual.blocks.0.mlp.down_proj.weight"), WType::F32);
+        assert_eq!(ty("visual.blocks.0.mlp.up_proj.weight"), WType::Q8_0);
+        assert_eq!(ty("model.layers.0.mlp.down_proj.weight"), WType::Q8_0);
     }
 
     #[test]
