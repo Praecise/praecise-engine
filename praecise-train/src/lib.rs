@@ -15,6 +15,10 @@
 //!   resolution that refuses a missing accelerator.
 //! - [`recipe`]: the canonical recipe and its hash.
 //! - [`reward`]: rewards for policy optimization and their digest.
+//! - [`gates`]: host policy, validated-band and evaluation-disjointness gates on
+//!   training records.
+//! - [`lowp`]: MXFP8 and NVFP4 block-scaled formats, stochastic rounding and the
+//!   random Hadamard transform.
 //! - [`update`]: parameter-delta and optimizer-state primitives.
 //! - [`objective`]: token objectives (SFT, DPO, GRPO, distillation) as per-token
 //!   weights, and the Muon orthogonalization.
@@ -27,8 +31,10 @@ pub mod canonical;
 pub mod checkpoint;
 #[cfg(feature = "engine")]
 pub mod engine;
+pub mod gates;
 pub mod hash;
 pub mod kernel_class;
+pub mod lowp;
 pub mod merkle;
 pub mod objective;
 pub mod philox;
