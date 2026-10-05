@@ -544,6 +544,35 @@ impl LlamaModelParams {
         self.params.load_mtp
     }
 
+    /// Load only blocks `begin..end` of the model, as one stage of a layer pipeline.
+    ///
+    /// A stage that does not start at block 0 takes hidden states as input
+    /// ([`crate::llama_batch::LlamaBatch::new_hidden`]) and does not load the token
+    /// embedding. A stage that does not end at the last block does not load the output
+    /// head; its context must enable embeddings with
+    /// [`crate::context::params::LlamaPoolingType::None`], and it returns the hidden state
+    /// after its last block for each output position through
+    /// [`crate::context::LlamaContext::embeddings_ith`]. Loading fails for an
+    /// architecture that cannot be split or a range outside the model.
+    #[must_use]
+    pub fn with_layer_stage(mut self, begin: u32, end: u32) -> Self {
+        self.params.stage_layer_begin = i32::try_from(begin).expect("layer index fits i32");
+        self.params.stage_layer_end = i32::try_from(end).expect("layer index fits i32");
+        self
+    }
+
+    /// The layer stage set by [`Self::with_layer_stage`]; `None` loads the whole model.
+    #[must_use]
+    pub fn layer_stage(&self) -> Option<(u32, u32)> {
+        if self.params.stage_layer_begin == 0 && self.params.stage_layer_end == 0 {
+            return None;
+        }
+        Some((
+            u32::try_from(self.params.stage_layer_begin).unwrap_or(0),
+            u32::try_from(self.params.stage_layer_end).unwrap_or(0),
+        ))
+    }
+
     /// sets the main GPU
     ///
     /// To enable this option, you must set `split_mode` to `LlamaSplitMode::None` to enable single GPU mode.

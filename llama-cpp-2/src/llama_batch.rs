@@ -14,6 +14,8 @@ pub struct LlamaBatch<'a> {
     #[allow(clippy::doc_markdown)]
     /// The llama_cpp batch. always initialize by `llama_cpp_sys_2::llama_batch_init(allocated, <unknown>, <unknown>)`
     pub(crate) llama_batch: llama_batch,
+    /// Floats per position of a hidden-state batch; 0 for a token batch.
+    hidden_width: usize,
     phantom: PhantomData<&'a [LlamaToken]>,
 }
 
@@ -26,6 +28,14 @@ pub enum BatchAddError {
     /// Empty buffer is provided for [`LlamaBatch::get_one`]
     #[error("Empty buffer")]
     EmptyBuffer,
+    /// A hidden state of the wrong width was added to a hidden-state batch.
+    #[error("hidden state has {got} floats, the batch takes {expected}")]
+    HiddenWidth {
+        /// Floats per position the batch was made with.
+        expected: usize,
+        /// Floats given.
+        got: usize,
+    },
 }
 
 impl<'a> LlamaBatch<'a> {
@@ -152,8 +162,89 @@ impl<'a> LlamaBatch<'a> {
             allocated: n_tokens,
             initialized_logits: vec![],
             llama_batch: batch,
+            hidden_width: 0,
             phantom: PhantomData,
         }
+    }
+
+    /// A batch of hidden states instead of tokens, `n_embd` floats per position: the
+    /// input of a layer-pipeline stage after the first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_tokens` or `n_embd` is greater than `i32::MAX`.
+    #[must_use]
+    pub fn new_hidden(n_tokens: usize, n_embd: usize, n_seq_max: i32) -> Self {
+        let n_tokens_i32 = i32::try_from(n_tokens).expect("cannot fit n_tokens into a i32");
+        let n_embd_i32 = i32::try_from(n_embd).expect("cannot fit n_embd into a i32");
+        assert!(n_embd > 0, "a hidden-state batch needs n_embd > 0");
+        let batch = unsafe { llama_batch_init(n_tokens_i32, n_embd_i32, n_seq_max) };
+
+        LlamaBatch {
+            allocated: n_tokens,
+            initialized_logits: vec![],
+            llama_batch: batch,
+            hidden_width: n_embd,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Add one position's hidden state to a batch made by [`Self::new_hidden`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch is full or `hidden` is not `n_embd` floats.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a token batch.
+    pub fn add_hidden(
+        &mut self,
+        hidden: &[f32],
+        pos: llama_pos,
+        seq_ids: &[i32],
+        logits: bool,
+    ) -> Result<(), BatchAddError> {
+        assert!(self.hidden_width > 0, "add_hidden on a token batch");
+        if hidden.len() != self.hidden_width {
+            return Err(BatchAddError::HiddenWidth { expected: self.hidden_width, got: hidden.len() });
+        }
+        if self.allocated
+            < usize::try_from(self.n_tokens() + 1).expect("cannot fit n_tokens into a usize")
+        {
+            return Err(BatchAddError::InsufficientSpace(self.allocated));
+        }
+        let offset = self.llama_batch.n_tokens;
+        let offset_usize = usize::try_from(offset).expect("cannot fit n_tokens into a usize");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                hidden.as_ptr(),
+                self.llama_batch.embd.add(offset_usize * self.hidden_width),
+                self.hidden_width,
+            );
+            self.llama_batch.pos.add(offset_usize).write(pos);
+            self.llama_batch.n_seq_id.add(offset_usize).write(
+                llama_seq_id::try_from(seq_ids.len())
+                    .expect("cannot fit seq_ids.len() into a llama_seq_id"),
+            );
+            for (i, seq_id) in seq_ids.iter().enumerate() {
+                let tmp = *self.llama_batch.seq_id.add(offset_usize);
+                tmp.add(i).write(*seq_id);
+            }
+            self.llama_batch
+                .logits
+                .add(offset_usize)
+                .write(i8::from(logits));
+        }
+
+        if logits {
+            self.initialized_logits.push(offset);
+        } else {
+            self.initialized_logits.retain(|l| l != &offset);
+        }
+        self.llama_batch.n_tokens += 1;
+
+        Ok(())
     }
 
     /// ``llama_batch_get_one``
@@ -186,6 +277,7 @@ impl<'a> LlamaBatch<'a> {
                 .try_into()
                 .expect("number of tokens exceeds i32::MAX + 1")],
             llama_batch: batch,
+            hidden_width: 0,
             phantom: PhantomData,
         };
         Ok(batch)

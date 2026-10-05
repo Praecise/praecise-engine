@@ -53,6 +53,8 @@ pub mod prax;
 /// Prefix reuse across requests: what each kind of model memory can rewind,
 /// where checkpoints go, and whose cache a request may match. Backend-agnostic.
 pub mod prefix_cache;
+/// Layer-pipeline serving: one model's blocks split across machines on a LAN.
+pub mod pipeline;
 pub mod prompt;
 /// Speculation policy: which drafting method and how long a block, given the
 /// model, the hardware and the current load. Backend-agnostic — it is a
