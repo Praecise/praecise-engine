@@ -34,6 +34,8 @@ fn check_frames(decoded: &[u8], w: usize, h: usize, n: usize, min_psnr: f64) {
     let size = w * h * 3;
     assert_eq!(decoded.len(), n * size, "frame count");
     let source: Vec<Vec<u8>> = (0..n).map(|i| pattern(w, h, i)).collect();
+    let report: Vec<String> = decoded.chunks_exact(size).enumerate().map(|(i, f)| format!("{:.1}", psnr(f, &source[i]))).collect();
+    eprintln!("PSNR per frame: {}", report.join(" "));
     for (i, f) in decoded.chunks_exact(size).enumerate() {
         let nearest = (0..n).min_by(|&a, &b| mse(f, &source[a]).total_cmp(&mse(f, &source[b]))).unwrap();
         assert_eq!(nearest, i, "frame {i} decodes closest to source frame {nearest}");
