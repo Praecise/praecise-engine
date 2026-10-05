@@ -20,7 +20,7 @@ use llama_cpp_2::token::LlamaToken;
 use praecise_runtime::pipeline::driver::{DriverOptions, Pipeline};
 use praecise_runtime::pipeline::stage::{self, StageOptions};
 use praecise_runtime::pipeline::{split_layers, LayerRange, PipelineError, PipelinePlan, StageAuthenticator, StageSpec};
-use praecise_runtime::ModelFingerprint;
+use praecise_runtime::{BatchPrompt, GenerationConfig, ModelFingerprint};
 use sha2::{Digest, Sha256};
 
 const STAGE_ENV: &str = "PRAECISE_PIPELINE_TEST_STAGE";
@@ -266,6 +266,27 @@ fn three_processes_match_one_process() {
             assert!(rows.is_empty());
         }
     }
+
+    // a whole greedy generation through the pipeline equals one in a single process
+    let config = GenerationConfig { temperature: 0.0, repeat_penalty: 1.0, max_tokens: 12, ..Default::default() };
+    let result = pipe
+        .generate(&BatchPrompt::Raw(TEXT_B.to_string()), &config, false, None, None, None)
+        .expect("generate");
+    reference.ctx.clear_kv_cache_seq(Some(0), None, None).unwrap();
+    let mut logits = reference.run(0, 0, &b);
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut want_text = String::new();
+    for i in 0..config.max_tokens as usize {
+        let t = LlamaToken(argmax(&logits) as i32);
+        if full.is_eog_token(t) {
+            break;
+        }
+        want_text.push_str(&full.token_to_piece(t, &mut decoder, false, None).unwrap());
+        logits = reference.run(0, b.len() + i, &[t]);
+    }
+    eprintln!("generated: {:?}", result.text);
+    assert!(result.output_tokens > 0);
+    assert_eq!(result.text, want_text);
 
     // the last stage dies: the next request fails naming it, and so does every later one
     let mut last = children.0.remove(0);

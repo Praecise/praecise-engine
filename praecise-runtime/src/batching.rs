@@ -2326,23 +2326,34 @@ const MEDIA_PLACEHOLDER: LlamaToken = LlamaToken(-1);
 
 /// Render the request's prompt with its thinking mode and effort level.
 fn render_request(model: &LlamaModel, req: &BatchRequest, enable_thinking: bool) -> Result<String> {
+    render_with_config(model, &req.prompt, &req.config, enable_thinking)
+}
+
+/// Render `prompt` with the thinking mode and effort level `config` asks for,
+/// `enable_thinking` being the engine's default.
+pub(crate) fn render_with_config(
+    model: &LlamaModel,
+    prompt: &BatchPrompt,
+    config: &GenerationConfig,
+    enable_thinking: bool,
+) -> Result<String> {
     // The engine's thinking mode is the default; a request may override it.
     // This is what lets one served model answer plainly to API callers and
     // show its reasoning to a client that asked to see it.
-    let enable_thinking = req.config.enable_thinking.unwrap_or(enable_thinking);
+    let enable_thinking = config.enable_thinking.unwrap_or(enable_thinking);
     // The effort level is a thinking-mode knob; with thinking off the template
     // never reads it, and some templates reject it outright.
     let reasoning = if enable_thinking {
-        req.config.reasoning_effort.as_deref().map(|value| {
+        config.reasoning_effort.as_deref().map(|value| {
             (
-                req.config.reasoning_kwarg.as_deref().unwrap_or("reasoning_effort"),
+                config.reasoning_kwarg.as_deref().unwrap_or("reasoning_effort"),
                 value,
             )
         })
     } else {
         None
     };
-    render_prompt(model, &req.prompt, enable_thinking, reasoning)
+    render_prompt(model, prompt, enable_thinking, reasoning)
 }
 
 /// Tokenize a text prompt.

@@ -44,7 +44,9 @@ enum Upstream {
 
 /// A connected pipeline, driven from the machine that holds the first blocks.
 pub struct Pipeline<'m> {
+    model: &'m LlamaModel,
     ctx: LlamaContext<'m>,
+    n_ctx: u32,
     n_embd: usize,
     n_stages: usize,
     max_rows: usize,
@@ -141,7 +143,9 @@ impl<'m> Pipeline<'m> {
         }));
 
         Ok(Self {
+            model,
             ctx,
+            n_ctx: opts.stage.n_ctx,
             n_embd: plan.n_embd as usize,
             n_stages: plan.stages.len(),
             max_rows: opts.stage.max_rows as usize,
@@ -339,6 +343,106 @@ impl<'m> Pipeline<'m> {
     pub fn step(&mut self, seq: i32, pos: i32, token: LlamaToken) -> Result<Vec<f32>, PipelineError> {
         let t = self.submit(seq, pos, &[token], &[true])?;
         self.wait(t)?.pop().ok_or_else(|| PipelineError::Protocol("last stage returned no logits".into()))
+    }
+
+    /// Generate a reply to `prompt` on sequence 0, which is cleared first: the prompt
+    /// is rendered with the model's chat template, prefilled in micro-batches across
+    /// the pipeline, and then sampled one token at a time. Text goes to `token_tx` as
+    /// it becomes final and reasoning to `reasoning_tx`; generation stops at an
+    /// end-of-generation token, a stop sequence, `max_tokens`, a dropped receiver or
+    /// `cancel`. `enable_thinking` is the default thinking mode a request may override.
+    ///
+    /// # Errors
+    ///
+    /// A prompt that does not fit the context, a local engine error, or the failure
+    /// of any stage.
+    pub fn generate(
+        &mut self,
+        prompt: &crate::batching::BatchPrompt,
+        config: &crate::config::GenerationConfig,
+        enable_thinking: bool,
+        token_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+        reasoning_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::result::InferenceResult, PipelineError> {
+        use llama_cpp_2::model::AddBos;
+        use llama_cpp_2::token::data::LlamaTokenData;
+        use llama_cpp_2::token::data_array::LlamaTokenDataArray;
+
+        const SEQ: i32 = 0;
+        let started = Instant::now();
+        let rendered = crate::batching::render_with_config(self.model, prompt, config, enable_thinking)
+            .map_err(|e| PipelineError::Engine(format!("prompt: {e}")))?;
+        let tokens = self
+            .model
+            .str_to_token(&rendered, AddBos::Always)
+            .map_err(|e| PipelineError::Engine(format!("tokenize: {e}")))?;
+        let budget = config.max_tokens.max(1) as usize;
+        if tokens.is_empty() || tokens.len() + budget > self.n_ctx as usize {
+            return Err(PipelineError::Engine(format!(
+                "prompt of {} tokens plus {budget} to generate does not fit a context of {}",
+                tokens.len(),
+                self.n_ctx
+            )));
+        }
+        self.truncate(SEQ, -1)?;
+        let mut logits = self.prefill(SEQ, 0, &tokens, self.max_rows)?;
+
+        let n_vocab = self.model.n_vocab();
+        let mut sampler = crate::sampling::build_sampler_chain(config, n_vocab);
+        let mut stream = crate::stream::StopStream::new(config.stop.clone())
+            .framed(crate::stream::ReasoningFrame::for_prompt(&rendered))
+            .with_reasoning(reasoning_tx);
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut output_tokens = 0u32;
+        let mut eos = false;
+        let decode_started = Instant::now();
+        loop {
+            let mut candidates = LlamaTokenDataArray::from_iter(
+                logits.iter().enumerate().map(|(i, l)| LlamaTokenData::new(LlamaToken(i as i32), *l, 0.0)),
+                false,
+            );
+            candidates.apply_sampler(&sampler);
+            let token = candidates
+                .selected_token()
+                .ok_or_else(|| PipelineError::Engine("the sampler selected no token".into()))?;
+            sampler.accept(token);
+            if self.model.is_eog_token(token) {
+                eos = true;
+                break;
+            }
+            output_tokens += 1;
+            let piece = self
+                .model
+                .token_to_piece(token, &mut decoder, false, None)
+                .map_err(|e| PipelineError::Engine(format!("detokenize: {e}")))?;
+            if !stream.push(&piece, token_tx) || stream.hit_stop() || output_tokens as usize >= budget {
+                break;
+            }
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                break;
+            }
+            let pos = (tokens.len() + output_tokens as usize - 1) as i32;
+            logits = self.step(SEQ, pos, token)?;
+        }
+        let (text, thinking) = stream.close(token_tx);
+        let stop_reason = if eos {
+            crate::result::StopReason::Eos
+        } else {
+            crate::result::StopReason::from_loop(stream.hit_stop(), output_tokens, budget as u32)
+        };
+        let decode_secs = decode_started.elapsed().as_secs_f64();
+        Ok(crate::result::InferenceResult {
+            text,
+            thinking,
+            input_tokens: tokens.len() as u32,
+            output_tokens,
+            generation_time_ms: started.elapsed().as_millis() as u64,
+            tokens_per_second: if decode_secs > 0.0 { f64::from(output_tokens) / decode_secs } else { 0.0 },
+            stop_reason,
+            commitment: None,
+            cached_tokens: 0,
+        })
     }
 
     /// Drop positions `from_pos..` of `seq` (all of it for a negative `from_pos`) from
