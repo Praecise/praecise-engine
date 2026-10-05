@@ -1,6 +1,6 @@
 //! Flow-matching noise schedule and seeded initial noise.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 /// Resolution- and step-dependent shift for the FLUX.2 schedule, fitted by
