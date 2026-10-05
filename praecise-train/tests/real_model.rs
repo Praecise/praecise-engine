@@ -77,21 +77,23 @@ fn lora_sft_on_a_real_model_and_served_logprobs_match() {
 
     let run = |n_steps: usize| {
         let mut t = LoraTrainer::new(&backend, &model, &init, recipe(), config).unwrap();
-        let losses: Vec<f64> = (0..n_steps).map(|_| t.step(&batch).unwrap().loss).collect();
-        (t, losses)
+        let outcomes: Vec<_> = (0..n_steps).map(|_| t.step(&batch).unwrap()).collect();
+        let losses: Vec<f64> = outcomes.iter().map(|o| o.loss).collect();
+        let norms: Vec<f64> = outcomes.iter().map(|o| o.grad_norm).collect();
+        (t, losses, norms)
     };
-    let (t, losses) = run(30);
+    let (t, losses, norms) = run(30);
     let (first, last) = (losses[0], losses[losses.len() - 1]);
     println!("loss {first:.4} -> {last:.4}");
     if let Ok(out) = std::env::var("PRAECISE_TRAIN_REFERENCE_DUMP") {
-        dump_reference_inputs(&PathBuf::from(out), &init, &batch, &losses);
+        dump_reference_inputs(&PathBuf::from(out), &init, &batch, &losses, &norms);
         return;
     }
     check_reference_band(&losses);
     assert!(first.is_finite() && first > 1.0, "the base model cannot already predict random tokens: {first}");
     assert!(last < 0.5 * first, "loss {first} -> {last}");
 
-    let (_, again) = run(5);
+    let (_, again, _) = run(5);
     assert_eq!(&losses[..5], &again[..], "repeated runs differ");
 
     let exported = dir.join("adapter.gguf");
@@ -141,8 +143,8 @@ fn lora_sft_on_a_real_model_and_served_logprobs_match() {
 const REFERENCE_BAND: f64 = 0.05;
 
 /// The inputs the reference script needs to reproduce this run: token ids, initial adapter and
-/// recipe, beside the trainer losses.
-fn dump_reference_inputs(out: &std::path::Path, init: &std::path::Path, batch: &StepBatch, losses: &[f64]) {
+/// recipe, beside the trainer losses and gradient norms.
+fn dump_reference_inputs(out: &std::path::Path, init: &std::path::Path, batch: &StepBatch, losses: &[f64], norms: &[f64]) {
     use std::fmt::Write as _;
     std::fs::create_dir_all(out).unwrap();
     std::fs::copy(init, out.join("init.gguf")).unwrap();
@@ -157,8 +159,8 @@ fn dump_reference_inputs(out: &std::path::Path, init: &std::path::Path, batch: &
     let recipe = format!("lr {lr}\nbeta1 {beta1}\nbeta2 {beta2}\neps {eps}\nweight_decay {weight_decay}\ngrad_clip {}\n", r.grad_clip);
     std::fs::write(out.join("recipe.txt"), recipe).unwrap();
     let mut s = String::new();
-    for (i, l) in losses.iter().enumerate() {
-        writeln!(s, "{i} {l:.6}").unwrap();
+    for (i, (l, n)) in losses.iter().zip(norms).enumerate() {
+        writeln!(s, "{i} {l:.6} {n:.6}").unwrap();
     }
     std::fs::write(out.join("trainer_losses.txt"), s).unwrap();
     println!("reference inputs written to {}", out.display());
