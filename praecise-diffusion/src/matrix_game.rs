@@ -249,6 +249,13 @@ pub fn weight_specs(cfg: &WanDitConfig, wd: &WorldDit, linear: WType) -> Vec<Wei
             WeightSpec::new(format!("{m}.proj_keyboard.weight"), &[d, kd], linear),
         ]);
     }
+    // 8-bit blocks hold 32 columns; narrower rows (the released mouse input
+    // width) stay float32.
+    for w in &mut v {
+        if w.ty == WType::Q8_0 && !w.shape.last().copied().unwrap_or(0).is_multiple_of(32) {
+            w.ty = f;
+        }
+    }
     v
 }
 
