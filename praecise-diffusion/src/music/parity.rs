@@ -51,9 +51,9 @@ fn request(m: &Value, guidance: f32) -> MusicRequest {
         guidance_scale: Some(guidance),
         shift: Some(m["shift"].as_f64().unwrap() as f32),
         seed: 0,
-        bpm: Some(m["bpm"].as_u64().unwrap() as u32),
-        keyscale: Some(s("keyscale")),
-        timesignature: Some(s("timesignature")),
+        bpm: m["bpm"].as_u64().map(|b| b as u32),
+        keyscale: m["keyscale"].as_str().map(str::to_string),
+        timesignature: m["timesignature"].as_str().map(str::to_string),
     }
 }
 
@@ -146,6 +146,43 @@ fn acestep_parity_whole_pipeline() {
         let audio = p.generate_from(&req, &bin("noise")).unwrap();
         assert_eq!(audio.channels, 2);
         assert_close(&format!("{name} audio"), &audio.samples, &bin(name), 0.9999, 5e-3);
+    }
+}
+
+/// RMS of each second of `[2][samples]` audio, both channels averaged.
+fn loudness_per_second(audio: &[f32], rate: usize) -> Vec<f64> {
+    let n = audio.len() / 2;
+    let (l, r) = audio.split_at(n);
+    (0..n / rate)
+        .map(|s| {
+            let sum: f64 = (s * rate..(s + 1) * rate).map(|i| (f64::from(l[i] + r[i]) / 2.0).powi(2)).sum();
+            (sum / rate as f64).sqrt()
+        })
+        .collect()
+}
+
+/// The clip is audible for as long as the reference's from the same noise,
+/// second by second, and goes quiet where the reference does: the requested
+/// duration is rendered, not cut short.
+#[test]
+#[ignore = "needs the reference fixtures"]
+fn acestep_parity_the_clip_sounds_as_long_as_the_reference() {
+    let m = meta();
+    let mut p = load();
+    for run in m["runs"].as_array().unwrap() {
+        let name = run[0].as_str().unwrap();
+        let req = request(&m, run[1].as_f64().unwrap() as f32);
+        let audio = p.generate_from(&req, &bin("noise")).unwrap();
+        let rate = audio.sample_rate as usize;
+        let ours = loudness_per_second(&audio.samples, rate);
+        let reference = loudness_per_second(&bin(name), rate);
+        eprintln!("{name} loudness per second, ours:      {ours:.3?}");
+        eprintln!("{name} loudness per second, reference: {reference:.3?}");
+        assert_eq!(ours.len(), req.duration_secs as usize, "{name}: the requested duration");
+        assert_eq!(ours.len(), reference.len());
+        for (s, (a, b)) in ours.iter().zip(&reference).enumerate() {
+            assert!((a - b).abs() <= 0.15 * a.max(*b) + 0.003, "{name}: second {s} is {a:.4} against {b:.4}");
+        }
     }
 }
 
