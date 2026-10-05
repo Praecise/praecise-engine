@@ -11,7 +11,7 @@
 
 use std::num::NonZeroU32;
 
-use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -119,6 +119,10 @@ fn context(n_ctx: u32, n_ubatch: u32, n_threads: i32) -> LlamaContextParams {
         .with_n_threads_batch(n_threads)
         .with_embeddings(true)
         .with_pooling_type(LlamaPoolingType::Last)
+        // Keys and values in float32: a long input (a video is thousands of
+        // positions) then pools as the source checkpoint does.
+        .with_type_k(KvCacheType::F32)
+        .with_type_v(KvCacheType::F32)
 }
 
 /// The pooled vector of the input just decoded, cut and normalised.
