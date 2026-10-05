@@ -3,8 +3,9 @@
 //! One input (text, or text carrying pictures and video frames) becomes one
 //! vector: the input is written into the checkpoint's chat template with an
 //! instruction as the system turn, the input as the user turn and the
-//! assistant turn opened; the hidden state of the last position is read
-//! (LAST pooling) and L2-normalised. Every input is decoded on its own, in a
+//! assistant turn opened, and the end-of-text token after it when the
+//! checkpoint's tokenizer appends one; the hidden state of the last position
+//! is read (LAST pooling) and L2-normalised. Every input is decoded on its own, in a
 //! fresh sequence, so its vector does not depend on the other inputs in the
 //! request.
 
@@ -100,6 +101,13 @@ pub fn prompt(model: &LlamaModel, instruction_text: &str, content: &str) -> Resu
     model.apply_chat_template(&template, &chat, true).map_err(inference)
 }
 
+/// The end-of-text token, when the checkpoint's tokenizer appends one to
+/// every input (the pooled position is then that token).
+fn end_token(model: &LlamaModel) -> Option<llama_cpp_2::token::LlamaToken> {
+    let eos = model.token_eos();
+    (model.vocab_adds_eos() && eos.0 >= 0).then_some(eos)
+}
+
 /// Context parameters for embedding one input at a time in sequence 0.
 fn context(n_ctx: u32, n_ubatch: u32, n_threads: i32) -> LlamaContextParams {
     LlamaContextParams::default()
@@ -154,7 +162,9 @@ pub fn embed(backend: &LlamaBackend, model: &LlamaModel, instruction_text: &str,
     let mut tokenized = Vec::with_capacity(inputs.len());
     for text in inputs {
         let p = prompt(model, instruction_text, text)?;
-        tokenized.push(model.str_to_token(&p, AddBos::Never).map_err(inference)?);
+        let mut tokens = model.str_to_token(&p, AddBos::Never).map_err(inference)?;
+        tokens.extend(end_token(model));
+        tokenized.push(tokens);
     }
     let longest = tokenized.iter().map(Vec::len).max().unwrap_or(0);
     let n_ctx = fit(longest, 256, &options, model)?;
@@ -204,8 +214,12 @@ pub fn embed_media(
     for input in inputs {
         input.check("an input")?;
     }
+    let end = match end_token(model) {
+        Some(t) => String::from_utf8(model.token_to_piece_bytes(t, 64, true, None).map_err(inference)?).map_err(inference)?,
+        None => String::new(),
+    };
     let tokenize = |input: &crate::media::MediaInput| -> Result<llama_cpp_2::mtmd::MtmdInputChunks> {
-        let text = prompt(model, instruction_text, &input.text)?;
+        let text = prompt(model, instruction_text, &input.text)? + &end;
         let bitmaps = input.bitmaps()?;
         let refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
         projector

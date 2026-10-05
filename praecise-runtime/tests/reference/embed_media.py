@@ -59,7 +59,7 @@ CASES = [
 ]
 
 BLOCK = re.compile(r"<\|vision_start\|>(<\|image_pad\|>|<\|video_pad\|>)+<\|vision_end\|>")
-TURN = re.compile(r"<\|im_start\|>user\n(.*)<\|im_end\|>\n<\|im_start\|>assistant\n$", re.S)
+TURN = re.compile(r"<\|im_start\|>user\n(.*)<\|im_end\|>\n<\|im_start\|>assistant\n(<\|endoftext\|>)?$", re.S)
 
 expected = {"cases": []}
 for name, inp in CASES:
