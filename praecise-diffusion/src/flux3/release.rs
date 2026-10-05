@@ -6,6 +6,7 @@
 //! quantile statistics) and the shared base holding the video autoencoder
 //! and the text encoder, at the paths the policy config names.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -292,37 +293,205 @@ impl ReleasedPolicy {
     /// # Errors
     /// On a malformed observation or a backend failure.
     pub fn act(&self, obs: &RawObservation<'_>, seed: u64) -> Result<Vec<f32>> {
-        let cfg = &self.release.config;
-        let d = cfg.action_dim;
-        let frames = self.release.observation_frames();
-        if obs.cameras.len() != self.release.camera_keys.len() {
+        let noise = Noise::from_seed(&self.release.config, seed);
+        act_with(&self.release, &|o| self.policy.predict(o, &noise), obs)
+    }
+
+    /// A closed-loop rollout: every chunk is drawn from the noise of `seed`
+    /// and conditioned on the history the previous chunks left behind.
+    #[must_use]
+    pub fn rollout(&self, instruction: &str, seed: u64) -> Rollout<'_> {
+        let noise = Noise::from_seed(&self.release.config, seed);
+        Rollout::new(&self.release, Box::new(move |o| self.policy.predict(o, &noise)), instruction)
+    }
+}
+
+/// A predictor of normalised chunks from a normalised observation.
+type Predict<'p> = Box<dyn Fn(&Observation<'_>) -> Result<Vec<f32>> + 'p>;
+
+/// Map a raw observation to one chunk of absolute commands through
+/// `predict`, which works in the policy's normalised units.
+fn act_with(release: &PolicyRelease, predict: &dyn Fn(&Observation<'_>) -> Result<Vec<f32>>, obs: &RawObservation<'_>) -> Result<Vec<f32>> {
+    let cfg = &release.config;
+    let d = cfg.action_dim;
+    let frames = release.observation_frames();
+    if obs.cameras.len() != release.camera_keys.len() {
+        return Err(Error::Request(format!("the policy reads {} cameras", release.camera_keys.len())));
+    }
+    if obs.cameras.iter().any(|c| c.len() != frames) {
+        return Err(Error::Request(format!("the policy reads {frames} frames per camera")));
+    }
+    if obs.states.len() != frames * d {
+        return Err(Error::Request(format!("the policy reads {frames} state rows of {d} values")));
+    }
+    let wants_commands = cfg.conditioning == Conditioning::History && cfg.condition_on_past_actions;
+    let commands = match obs.commands {
+        Some(c) if c.len() != frames * d => {
+            return Err(Error::Request(format!("the policy reads {frames} past command rows of {d} values")));
+        }
+        None if wants_commands => {
+            return Err(Error::Request(format!("the policy reads {frames} past command rows of {d} values")));
+        }
+        c => c,
+    };
+    let (states, past) = match &release.normalization {
+        Some(n) => (n.states(obs.states), commands.filter(|_| wants_commands).map(|c| n.past_actions(c))),
+        None => (obs.states.to_vec(), None),
+    };
+    let o = Observation { cameras: obs.cameras, states: &states, past_actions: past.as_deref(), instruction: obs.instruction };
+    let chunk = predict(&o)?;
+    Ok(match &release.normalization {
+        Some(n) => {
+            // Commands integrate from the last command sent, or from the
+            // measured state when no command history is given.
+            let anchor = commands.unwrap_or(obs.states);
+            n.commands(&chunk, &anchor[anchor.len() - d..])
+        }
+        None => chunk,
+    })
+}
+
+/// A policy run in closed loop, one control tick at a time.
+///
+/// The rollout keeps the last observation frames of every camera, the
+/// measured states and the commands in effect at each of them. A new chunk
+/// is predicted when the previous one has run its execution steps
+/// (`n_action_steps`); every chunk uses the same noise. The first
+/// observation fills the whole history, with the measured state standing in
+/// for the command in effect.
+pub struct Rollout<'p> {
+    release: &'p PolicyRelease,
+    predict: Predict<'p>,
+    instruction: String,
+    cameras: Vec<VecDeque<Frame>>,
+    states: VecDeque<Vec<f32>>,
+    commands: VecDeque<Vec<f32>>,
+    last_command: Option<Vec<f32>>,
+    queue: VecDeque<Vec<f32>>,
+}
+
+impl std::fmt::Debug for Rollout<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rollout").field("history", &self.states.len()).field("queued", &self.queue.len()).finish_non_exhaustive()
+    }
+}
+
+impl<'p> Rollout<'p> {
+    fn new(release: &'p PolicyRelease, predict: Predict<'p>, instruction: &str) -> Self {
+        Self {
+            release,
+            predict,
+            instruction: instruction.to_owned(),
+            cameras: vec![VecDeque::new(); release.camera_keys.len()],
+            states: VecDeque::new(),
+            commands: VecDeque::new(),
+            last_command: None,
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn execute_steps(&self) -> usize {
+        self.release.config.n_action_steps.clamp(1, self.release.config.chunk_size)
+    }
+
+    fn push(&mut self, cameras: &[Frame], state: &[f32], command: &[f32]) {
+        let n = self.release.observation_frames();
+        for (q, f) in self.cameras.iter_mut().zip(cameras) {
+            q.push_back(f.clone());
+            if q.len() > n {
+                q.pop_front();
+            }
+        }
+        for (q, row) in [(&mut self.states, state), (&mut self.commands, command)] {
+            q.push_back(row.to_vec());
+            if q.len() > n {
+                q.pop_front();
+            }
+        }
+    }
+
+    /// The next chunk of absolute commands from the current history.
+    fn predict_chunk(&self) -> Result<Vec<f32>> {
+        let cameras: Vec<Vec<Frame>> = self.cameras.iter().map(|q| q.iter().cloned().collect()).collect();
+        let states: Vec<f32> = self.states.iter().flatten().copied().collect();
+        let commands: Vec<f32> = self.commands.iter().flatten().copied().collect();
+        let obs = RawObservation { cameras: &cameras, states: &states, commands: Some(&commands), instruction: &self.instruction };
+        act_with(self.release, &*self.predict, &obs)
+    }
+
+    /// One control tick: record the observation (`cameras` one frame per
+    /// camera, `state` the measured state) and return the command to send.
+    ///
+    /// # Errors
+    /// On a malformed observation or a backend failure.
+    pub fn tick(&mut self, cameras: &[Frame], state: &[f32]) -> Result<Vec<f32>> {
+        let d = self.release.config.action_dim;
+        if cameras.len() != self.release.camera_keys.len() {
             return Err(Error::Request(format!("the policy reads {} cameras", self.release.camera_keys.len())));
         }
-        if obs.cameras.iter().any(|c| c.len() != frames) {
-            return Err(Error::Request(format!("the policy reads {frames} frames per camera")));
+        if state.len() != d {
+            return Err(Error::Request(format!("the policy reads a state of {d} values")));
         }
-        if obs.states.len() != frames * d {
-            return Err(Error::Request(format!("the policy reads {frames} state rows of {d} values")));
+        let command = self.last_command.clone().unwrap_or_else(|| state.to_vec());
+        let repeats = if self.states.is_empty() { self.release.observation_frames() } else { 1 };
+        for _ in 0..repeats {
+            self.push(cameras, state, &command);
         }
-        let wants_commands = cfg.conditioning == Conditioning::History && cfg.condition_on_past_actions;
-        let commands = match (wants_commands, obs.commands) {
-            (true, Some(c)) if c.len() == frames * d => Some(c),
-            (true, _) => return Err(Error::Request(format!("the policy reads {frames} past command rows of {d} values"))),
-            (false, _) => None,
-        };
-        let (states, past) = match &self.release.normalization {
-            Some(n) => (n.states(obs.states), commands.map(|c| n.past_actions(c))),
-            None => (obs.states.to_vec(), None),
-        };
-        let o = Observation { cameras: obs.cameras, states: &states, past_actions: past.as_deref(), instruction: obs.instruction };
-        let chunk = self.policy.predict(&o, &Noise::from_seed(cfg, seed))?;
-        Ok(match &self.release.normalization {
-            Some(n) => {
-                let anchor = commands.unwrap_or(obs.states);
-                n.commands(&chunk, &anchor[anchor.len() - d..])
-            }
-            None => chunk,
-        })
+        if self.queue.is_empty() {
+            let chunk = self.predict_chunk()?;
+            self.queue.extend(chunk.chunks(d).take(self.execute_steps()).map(<[f32]>::to_vec));
+        }
+        let next = self.queue.pop_front().expect("a chunk has at least one execution step");
+        self.last_command = Some(next.clone());
+        Ok(next)
+    }
+
+    /// Start from a recorded history: `obs` carries every frame the policy
+    /// reads, the measured states and, when known, the commands in effect at
+    /// each of them (the states stand in otherwise).
+    ///
+    /// # Errors
+    /// On a malformed observation.
+    pub fn prime(&mut self, obs: &RawObservation<'_>) -> Result<()> {
+        let d = self.release.config.action_dim;
+        let n = self.release.observation_frames();
+        if obs.cameras.len() != self.release.camera_keys.len() || obs.cameras.iter().any(|c| c.len() != n) {
+            return Err(Error::Request(format!("the policy reads {n} frames from each of {} cameras", self.release.camera_keys.len())));
+        }
+        if obs.states.len() != n * d || obs.commands.is_some_and(|c| c.len() != n * d) {
+            return Err(Error::Request(format!("the policy reads {n} state and command rows of {d} values")));
+        }
+        let commands = obs.commands.unwrap_or(obs.states);
+        for t in 0..n {
+            let frames: Vec<Frame> = obs.cameras.iter().map(|c| c[t].clone()).collect();
+            self.push(&frames, &obs.states[t * d..(t + 1) * d], &commands[t * d..(t + 1) * d]);
+        }
+        self.last_command = Some(commands[(n - 1) * d..].to_vec());
+        self.queue.clear();
+        self.instruction = obs.instruction.to_owned();
+        Ok(())
+    }
+
+    /// The next whole chunk `[chunk][action_dim]` of absolute commands, after
+    /// which the rollout stands where its execution steps leave the robot:
+    /// each executed command reached (it becomes the measured state and the
+    /// command in effect) and the cameras holding their last frame.
+    ///
+    /// # Errors
+    /// Before [`Rollout::prime`] or on a backend failure.
+    pub fn chunk(&mut self) -> Result<Vec<f32>> {
+        let d = self.release.config.action_dim;
+        if self.states.len() != self.release.observation_frames() {
+            return Err(Error::Request("the rollout has no observation history".into()));
+        }
+        let chunk = self.predict_chunk()?;
+        let held: Vec<Frame> = self.cameras.iter().map(|q| q.back().cloned().expect("a primed camera")).collect();
+        for row in chunk.chunks(d).take(self.execute_steps()) {
+            self.push(&held, row, row);
+        }
+        self.last_command = Some(chunk[(self.execute_steps() - 1) * d..self.execute_steps() * d].to_vec());
+        self.queue.clear();
+        Ok(chunk)
     }
 }
 

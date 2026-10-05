@@ -501,6 +501,11 @@ impl Weights {
             let data = if matches!(view.dtype, Dtype::Quant(_)) { view.bytes.to_vec() } else { convert(&view, s)? };
             unsafe { sys::ggml_backend_tensor_set(t, data.as_ptr().cast(), 0, data.len()) };
             out.bytes += data.len();
+            if s.parts.is_empty() {
+                files.release(&s.name);
+            } else {
+                s.parts.iter().for_each(|p| files.release(p));
+            }
         }
         Ok(out)
     }

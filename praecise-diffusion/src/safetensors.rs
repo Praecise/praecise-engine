@@ -363,6 +363,30 @@ impl SafeTensors {
         })
     }
 
+    /// Drop the resident pages of a mapped tensor once its bytes have been
+    /// copied out, so a load holds one copy of the weights at a time rather
+    /// than the whole file next to the engine's buffers. The bytes stay
+    /// readable: a later read faults them in from the file again.
+    pub fn release(&self, name: &str) {
+        #[cfg(unix)]
+        if let Some(e) = self.entries.get(name) {
+            if let Some(Store::Map(map)) = self.maps.get(e.file) {
+                // A multiple of every page size in use (4, 16 and 64 KiB).
+                const PAGE: usize = 1 << 16;
+                let start = e.start.div_ceil(PAGE) * PAGE;
+                let end = e.end / PAGE * PAGE;
+                if end > start {
+                    // SAFETY: the mapping is private, read-only and backed by
+                    // a file nobody writes while it is mapped, so dropping its
+                    // pages only means the next read reloads the same bytes.
+                    let _ = unsafe { map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, end - start) };
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = name;
+    }
+
     /// Look up a tensor that must exist with the given shape.
     ///
     /// # Errors

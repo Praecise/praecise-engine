@@ -129,6 +129,146 @@ fn splits_an_observation_grid() {
     assert!(frames_from_grid(7, 2, &vec![0; 42], 3, 2).is_err());
 }
 
+/// A release of `case` (history conditioning, the fixture's statistics) in
+/// a scratch directory.
+fn rollout_release(case: &serde_json::Value, d: &Path) -> PolicyRelease {
+    let n = |k: &str| case[k].as_u64().unwrap();
+    let dim = n("d");
+    let keys: Vec<String> = (0..n("cams")).map(|c| format!("observation.images.cam{c}")).collect();
+    let mut cfg: serde_json::Value = serde_json::from_str(HISTORY_CONFIG).unwrap();
+    cfg["n_obs_steps"] = n("n_obs").into();
+    cfg["chunk_size"] = n("chunk").into();
+    cfg["n_action_steps"] = n("execute").into();
+    cfg["condition_on_past_actions"] = case["past"].clone();
+    cfg["camera_keys"] = serde_json::json!(keys);
+    cfg["output_features"]["action"]["shape"] = serde_json::json!([dim]);
+    write(&d.join("policy/config.json"), &cfg.to_string());
+    let pre = serde_json::json!({"steps": [{"registry_name": "flux3_observation_history_normalizer",
+        "config": {"action_dim": dim, "action_representation": case["repr"], "absolute_dims": case["absolute"], "normalization_clip": 6.0},
+        "state_file": "stats.safetensors"}]});
+    write(&d.join("policy/policy_preprocessor.json"), &pre.to_string());
+    let q = &case["quantiles"];
+    let v = |k: &str| q[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect::<Vec<_>>();
+    write_f32s(
+        &d.join("policy/stats.safetensors"),
+        &[("action.q01", v("action.q01")), ("action.q99", v("action.q99")), ("state.q01", v("state.q01")), ("state.q99", v("state.q99"))],
+    );
+    PolicyRelease::open(&d.join("policy"), &d.join("base")).unwrap()
+}
+
+/// The fixture's stand-in for the chunk sampler: `tanh(W x + b)` over the
+/// normalised states, the past actions and the mean of every frame.
+fn rollout_stub(case: &serde_json::Value) -> impl Fn(&Observation<'_>) -> Result<Vec<f32>> + 'static {
+    let w: Vec<Vec<f64>> = case["w"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect()).collect();
+    let b: Vec<f64> = case["b"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    move |o: &Observation<'_>| {
+        let mut x: Vec<f64> = o.states.iter().map(|&v| f64::from(v)).collect();
+        x.extend(o.past_actions.unwrap_or(&[]).iter().map(|&v| f64::from(v)));
+        for cam in o.cameras {
+            x.extend(cam.iter().map(|f| f64::from(f.data.iter().sum::<f32>() / f.data.len() as f32)));
+        }
+        assert_eq!(x.len(), w[0].len(), "stand-in inputs");
+        Ok(w.iter().zip(&b).map(|(row, bias)| (row.iter().zip(&x).map(|(a, v)| a * v).sum::<f64>() + bias).tanh() as f32).collect())
+    }
+}
+
+fn tick_frames(case: &serde_json::Value, tick: &serde_json::Value) -> Vec<Frame> {
+    let hw = case["hw"].as_array().unwrap();
+    let (h, w) = (hw[0].as_u64().unwrap() as usize, hw[1].as_u64().unwrap() as usize);
+    tick["pixels"].as_array().unwrap().iter().map(|px| {
+        let px: Vec<u8> = px.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect();
+        Frame::from_u8(h, w, &px).unwrap()
+    }).collect()
+}
+
+fn floats(v: &serde_json::Value) -> Vec<f32> {
+    v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+}
+
+/// The closed-loop rollout against the reference control loop, tick by tick
+/// and chunk by chunk. Fixtures: `make_flux3_rollout_fixtures.py`, at
+/// `PRAECISE_FLUX3_ROLLOUT=<dir>`.
+#[test]
+#[ignore = "needs reference fixtures"]
+fn flux3_rollout_parity() {
+    let dir = PathBuf::from(std::env::var("PRAECISE_FLUX3_ROLLOUT").expect("PRAECISE_FLUX3_ROLLOUT=<fixture dir>"));
+    let fx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("rollout.json")).unwrap()).unwrap();
+    for case in fx["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let d = scratch(&format!("rollout-{name}"));
+        let release = rollout_release(case, &d);
+        let dim = release.config.action_dim;
+        let mut worst = 0.0f32;
+
+        // Tick by tick, with the scripted observations.
+        let mut r = Rollout::new(&release, Box::new(rollout_stub(case)), "");
+        for (t, tick) in case["scripted"].as_array().unwrap().iter().enumerate() {
+            let got = r.tick(&tick_frames(case, tick), &floats(&tick["state"])).unwrap();
+            for (a, b) in got.iter().zip(floats(&tick["command"])) {
+                worst = worst.max((a - b).abs());
+                assert!((a - b).abs() < 1e-4, "{name} tick {t}: {got:?} vs {:?}", tick["command"]);
+            }
+        }
+
+        // Chunk by chunk from a primed history, every command reached.
+        let reached = case["reached"].as_array().unwrap();
+        let first = &reached[0];
+        let n = release.observation_frames();
+        let frames = tick_frames(case, first);
+        let cameras: Vec<Vec<Frame>> = frames.iter().map(|f| vec![f.clone(); n]).collect();
+        let states: Vec<f32> = floats(&first["state"]).repeat(n);
+        let mut r = Rollout::new(&release, Box::new(rollout_stub(case)), "");
+        r.prime(&RawObservation { cameras: &cameras, states: &states, commands: None, instruction: "" }).unwrap();
+        let exec = release.config.n_action_steps;
+        for k in 0..reached.len() / exec {
+            let chunk = r.chunk().unwrap();
+            assert_eq!(chunk.len(), release.config.chunk_size * dim);
+            for (j, tick) in reached[k * exec..(k + 1) * exec].iter().enumerate() {
+                for (a, b) in chunk[j * dim..(j + 1) * dim].iter().zip(floats(&tick["command"])) {
+                    worst = worst.max((a - b).abs());
+                    assert!((a - b).abs() < 1e-4, "{name} chunk {k} step {j}: {a} vs {b}");
+                }
+            }
+        }
+        eprintln!("{name}: worst |command difference| {worst:.2e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+/// The first tick fills the history; a chunk is drawn every execution
+/// window, and each draw sees the commands the previous one produced.
+#[test]
+fn a_rollout_draws_a_chunk_per_execution_window() {
+    let case = serde_json::json!({"d": 2, "n_obs": 2, "chunk": 3, "execute": 2, "cams": 1, "past": true,
+        "repr": "absolute", "absolute": [],
+        "quantiles": {"state.q01": [-1.0, -1.0], "state.q99": [1.0, 1.0], "action.q01": [-1.0, -1.0], "action.q99": [1.0, 1.0]}});
+    let d = scratch("rollout-unit");
+    let release = rollout_release(&case, &d);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Vec<f32>>::new()));
+    let log = seen.clone();
+    let predict = move |o: &Observation<'_>| {
+        log.borrow_mut().push(o.past_actions.unwrap().to_vec());
+        let k = log.borrow().len() as f32;
+        Ok(vec![0.1 * k, -0.1 * k, 0.2 * k, -0.2 * k, 0.3 * k, -0.3 * k])
+    };
+    let mut r = Rollout::new(&release, Box::new(predict), "");
+    let cam = [frame(2, 2, 0)];
+    let mut sent = Vec::new();
+    for _ in 0..5 {
+        sent.push(r.tick(&cam, &[0.0, 0.0]).unwrap());
+    }
+    assert_eq!(seen.borrow().len(), 3, "ticks 0, 2 and 4 draw");
+    let near = |a: &[f32], b: [f32; 2]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+    // Ticks 0 and 1 run the first window, tick 2 starts the second draw.
+    assert!(near(&sent[0], [0.1, -0.1]) && near(&sent[1], [0.2, -0.2]) && near(&sent[2], [0.2, -0.2]), "{sent:?}");
+    // The first draw sees the state standing in for every command; the
+    // second sees the command in effect at tick 2, sent at tick 1.
+    assert!(seen.borrow()[0].iter().all(|v| v.abs() < 1e-6));
+    let second = seen.borrow()[1].clone();
+    assert!(near(&second[..2], [0.0, 0.0]) && near(&second[2..], [0.2, -0.2]), "{second:?}");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
 /// A smooth synthetic camera frame.
 fn frame(h: usize, w: usize, phase: usize) -> Frame {
     let mut px = Vec::with_capacity(h * w * 3);
