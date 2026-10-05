@@ -325,8 +325,30 @@ fn flux3_release_real() {
     eprintln!("conditions: {} video values, {:.1}s", cond.video.len(), t1.elapsed().as_secs_f32());
     let t2 = std::time::Instant::now();
     let dit = r.load_transformer(opts).unwrap();
-    let chunk = predict_chunk(&dit, &cfg, &cond, &ctx, uncond.as_deref(), &Noise::from_seed(&cfg, 42)).unwrap();
+    let noise = Noise::from_seed(&cfg, 42);
+    let chunk = predict_chunk(&dit, &cfg, &cond, &ctx, uncond.as_deref(), &noise).unwrap();
     eprintln!("chunk: {:.1}s", t2.elapsed().as_secs_f32());
+    // The inputs, the noise and the chunk, for a reference run
+    // (`compare_flux3_release.py`): `PRAECISE_FLUX3_DUMP=<dir>`.
+    if let Ok(dir) = std::env::var("PRAECISE_FLUX3_DUMP") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let put = |name: &str, v: &[f32]| std::fs::write(dir.join(name), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        put("cameras.f32", &cameras.iter().flatten().flat_map(|f| f.data.iter().copied()).collect::<Vec<f32>>());
+        put("states.f32", obs.states);
+        if let Some(p) = obs.past_actions {
+            put("past.f32", p);
+        }
+        put("noise_video.f32", &noise.video);
+        put("noise_action.f32", &noise.action);
+        put("chunk.f32", &chunk);
+        let meta = serde_json::json!({
+            "camera_keys": r.camera_keys, "frames": frames, "action_dim": d, "chunk_size": cfg.chunk_size,
+            "frame_hw": [feats[0].0, feats[0].1], "instruction": obs.instruction,
+            "noise_video_len": noise.video.len(), "noise_action_len": noise.action.len(),
+        });
+        write(&dir.join("meta.json"), &meta.to_string());
+    }
 
     assert_eq!(chunk.len(), cfg.chunk_size * d);
     assert!(chunk.iter().all(|x| x.is_finite()), "non-finite actions");
