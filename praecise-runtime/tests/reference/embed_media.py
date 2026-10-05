@@ -71,16 +71,17 @@ for name, inp in CASES:
     # same pixels.
     if "image_grid_thw" in proc:
         _, gh, gw = proc["image_grid_thw"][0].tolist()
-        assert (gh * 16, gw * 16) == (IMAGE.height, IMAGE.width), (name, gh, gw)
+        assert (gh * 16, gw * 16) == (inp["image"].height, inp["image"].width), (name, gh, gw)
     pictures = []
     slices = 0
     if "video_grid_thw" in proc:
         gt, gh, gw = proc["video_grid_thw"][0].tolist()
-        assert (gt * 2, gh * 16, gw * 16) == (len(FRAMES), FRAMES[0].height, FRAMES[0].width), (name, gt, gh, gw)
+        video = inp["video"]
+        assert (gt * 2, gh * 16, gw * 16) == (len(video), video[0].height, video[0].width), (name, gt, gh, gw)
         slices = gt
-        pictures += [save(f"frame{i}", f, True) for i, f in enumerate(FRAMES)]
+        pictures += [save(f"{name}-frame{i}", f, True) for i, f in enumerate(video)]
     if inp.get("image") is not None:
-        pictures.append(save("image", IMAGE, False))
+        pictures.append(save(f"{name}-image", inp["image"], False))
 
     # Video blocks hold one slice of two frames: two markers each.
     def marker(m):
