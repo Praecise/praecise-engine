@@ -1,14 +1,39 @@
 # TODO: image and video input for reranking and embedding
 
-Status: reranking done, embedding open. `rerank::rerank_media` scores pairs
-whose sides carry pictures and video frames through the projector (items 1,
-2, 4 and 7 below for rerankers); the caller sizes pictures and samples
-frames by the checkpoint's own rule (items 5 and 6) and writes each side with
-media markers. Against the Qwen3-VL Reranker 2B pipeline, with the text model
-in F16 and the projector from the same converter commit, every pair is
-within 0.0065 of the checkpoint's P(yes) (`tests/rerank_media_parity.rs`);
-in Q8_0 the text model alone moves scores by up to 0.055. Pooled embedding
-(item 3) is still text-only in the engine.
+Status: reranking and pooled embedding done; one gap open (long visual
+inputs, below). `rerank::rerank_media` scores pairs whose sides carry
+pictures and video frames through the projector (items 1, 2, 4 and 7 below
+for rerankers); the caller sizes pictures and samples frames by the
+checkpoint's own rule (items 5 and 6) and writes each side with media
+markers. Against the Qwen3-VL Reranker 2B pipeline, with the text model in
+F16 and the projector from the same converter commit, every pair is within
+0.0065 of the checkpoint's P(yes) (`tests/rerank_media_parity.rs`); in Q8_0
+the text model alone moves scores by up to 0.055.
+
+`embed::embed_media` (item 3) pools one vector for an input carrying text,
+pictures and video frames together: the checkpoint's chat template with the
+instruction as the system turn, the end-of-text token the tokenizer appends,
+LAST pooling, L2 normalisation; `embed::embed` is the same for text alone.
+Against the Qwen3-VL Embedding 2B pipeline (transformers 5.18, float32;
+`tests/reference/embed_media.py`), F16 text model and projector, the token
+counts are identical and the cosines are: text 0.9999996, text with an
+instruction 0.9999991, empty input 0.9999997, picture 0.9999864, picture
+and text 0.9999965, 32-frame video 0.9995916, video plus picture plus text
+0.9996755 (`tests/embed_media_parity.rs`).
+
+Open: the gap to the reference grows with the number of visual tokens. A
+1280x960 picture (1222 tokens) gives 0.99983 and a 64-frame video (4780
+tokens) 0.99853, below the 0.999 bar; 4, 16 and 32 frames give 0.999986,
+0.99989 and 0.99959. It is not precision: F32 weights for both files, F32
+keys and values, and the projector without flash attention all leave it
+unchanged, and the reference's vision features are the same whether the
+frames are encoded together or one slice at a time. Two differences in the
+projector were found and are worth carrying with the fix: the patch mergers
+use the exact (erf) GELU in the reference but the tanh form here, and image
+tokens leave the fourth rotary position at 0 where interleaved M-RoPE reads
+it for its last sectors (text tokens carry the sequence position there);
+neither moves the 64-frame cosine by more than 1e-5, so the main cause is
+still to be found in the projector or the image-chunk decode path.
 
 ## Where things stand
 
