@@ -46,7 +46,7 @@ def save(name, img, video_frame):
 
 
 IMAGE = picture(256, 192, 0.4)
-FRAMES = [picture(416, 320, i * 0.25) for i in range(64)]
+FRAMES = [picture(448, 320, i * 0.25) for i in range(64)]
 
 CASES = [
     ("text", {"text": "A red kite over a beach."}),
