@@ -1479,6 +1479,10 @@ fn main() {
             println!("cargo:rustc-link-search=native={}", lib_dir.display());
         }
 
+        // The CUDA driver library (libcuda.so / nvcuda.dll) is not linked: ggml-cuda resolves
+        // the driver entry points it needs at runtime, so a CUDA build still starts on a host
+        // without the driver and can report that no GPU is available.
+
         // Platform-specific linking
         if cfg!(target_os = "windows") {
             // ✅ On Windows, use dynamic linking.
@@ -1488,11 +1492,6 @@ fn main() {
             println!("cargo:rustc-link-lib=cudart"); // Links to cudart64_*.dll
             println!("cargo:rustc-link-lib=cublas"); // Links to cublas64_*.dll
             println!("cargo:rustc-link-lib=cublasLt"); // Links to cublasLt64_*.dll
-
-            // Link to CUDA driver API (nvcuda.dll via cuda.lib)
-            if !cfg!(feature = "cuda-no-vmm") {
-                println!("cargo:rustc-link-lib=cuda");
-            }
         } else {
             // ✅ On non-Windows platforms (e.g., Linux), static linking is preferred and supported.
             // Static libraries like cudart_static and cublas_static depend on culibos.
@@ -1500,11 +1499,6 @@ fn main() {
             println!("cargo:rustc-link-lib=static=cudart_static");
             println!("cargo:rustc-link-lib=static=cublas_static");
             println!("cargo:rustc-link-lib=static=cublasLt_static");
-
-            // Link to CUDA driver API (libcuda.so)
-            if !cfg!(feature = "cuda-no-vmm") {
-                println!("cargo:rustc-link-lib=cuda");
-            }
 
             // culibos is required when statically linking cudart_static
             println!("cargo:rustc-link-lib=static=culibos");

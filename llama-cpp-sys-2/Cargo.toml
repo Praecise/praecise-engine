@@ -91,7 +91,7 @@ default = ["common"]
 # Enabled by default to preserve backwards compatibility.
 common = []
 cuda = []
-# Disables the need to dynamically link against libcuda.so / cuda.dll
+# CUDA without the virtual memory pool
 cuda-no-vmm = ["cuda"]
 metal = []
 dynamic-link = []
