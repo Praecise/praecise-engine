@@ -72,7 +72,7 @@ pub(crate) fn encode(s: Sound<'_>) -> Result<Encoded> {
     let planes: Vec<Vec<f32>> = (0..ch).map(|c| resample(&s.samples[c * per..(c + 1) * per], s.sample_rate, RATE)).collect();
     let len = planes[0].len();
     let mut enc = opus::Encoder::new(RATE, layout, Application::Audio).map_err(codec)?;
-    enc.set_bitrate(Bitrate::Bits(96_000 * s.channels as i32)).map_err(codec)?;
+    enc.set_bitrate(Bitrate::Bits(64_000 * s.channels as i32)).map_err(codec)?;
     let pre_skip = u32::try_from(enc.get_lookahead().map_err(codec)?).map_err(codec)?;
     // Priming plus sound, padded with silence to whole packets.
     let total = (len + pre_skip as usize).div_ceil(FRAME) * FRAME;
