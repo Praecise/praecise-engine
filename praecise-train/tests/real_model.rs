@@ -140,7 +140,7 @@ fn lora_sft_on_a_real_model_and_served_logprobs_match() {
 /// Relative distance allowed between the trainer and the reference loss at every step. The
 /// reference runs the same dequantized weights in f32 through an independent graph; the trainer
 /// quantizes activations for the quantized matmuls, which the band absorbs. Measured: at most 0.12
-/// (Qwen3-0.6B, step 12) and 0.20 (Qwen3-8B Q4_K_M, step 17), both during the steep descent where
+/// (Qwen3-0.6B, step 12) and 0.20 (Qwen3-8B `Q4_K_M`, step 17), both during the steep descent where
 /// every step is clipped; the curves meet again by the end of the run.
 const REFERENCE_BAND: f64 = 0.25;
 
