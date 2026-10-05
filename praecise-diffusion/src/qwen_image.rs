@@ -26,6 +26,12 @@ use llama_cpp_sys_2 as sys;
 
 const EPS: f32 = 1e-6;
 const ROPE_THETA: f32 = 10000.0;
+/// Factor values are multiplied by before their half-precision cast for the
+/// fused attention, and divided by after it. The released 20B checkpoint's
+/// values leave the half-precision range late in sampling; attention is linear
+/// in the values, so the round trip is exact apart from half-precision
+/// resolution (an absolute 2^-16 at this factor).
+const VALUE_PRESCALE: f32 = 1.0 / 256.0;
 
 /// `transformer/config.json` of a Qwen-Image checkpoint.
 #[derive(Debug, Clone, Deserialize)]
@@ -287,6 +293,7 @@ fn block(g: &mut Graph, w: &Weights, p: &str, c: Ctx, (img, txt): (Tn, Tn), (tem
     let q = g.concat(qt, qi, 2);
     let k = g.concat(kt, ki, 2);
     let v = g.concat(vt, vi, 2);
+    let v = if c.exact { v } else { g.scale_bias(v, VALUE_PRESCALE, 0.0) };
     let q = g.rotate_half_rope(q, cos, sin);
     let k = g.rotate_half_rope(k, cos, sin);
     let q = g.permute(q, [0, 2, 1, 3]);
@@ -300,7 +307,8 @@ fn block(g: &mut Graph, w: &Weights, p: &str, c: Ctx, (img, txt): (Tn, Tn), (tem
     } else {
         let k = g.cast(k, sys::GGML_TYPE_F16);
         let v = g.cast(v, sys::GGML_TYPE_F16);
-        g.attention(q, k, v, None, scale, true)
+        let o = g.attention(q, k, v, None, scale, true);
+        g.scale_bias(o, 1.0 / VALUE_PRESCALE, 0.0)
     };
     let o = g.reshape(o, &[c.d, n_txt + n_img]);
     let ot = g.view_cols(o, 0, n_txt);
