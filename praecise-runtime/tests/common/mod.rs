@@ -13,13 +13,10 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::token::LlamaToken;
 
-/// Path of a small dense GGUF model, or `None` to skip.
-pub fn model_path() -> Option<String> {
-    let p = std::env::var("PRAECISE_TEST_KV_MODEL").ok();
-    if p.is_none() {
-        eprintln!("PRAECISE_TEST_KV_MODEL not set; skipping model-backed test");
-    }
-    p
+/// Path of a small dense GGUF model; the model-backed tests are ignored by
+/// default and fail when run without it.
+pub fn model_path() -> String {
+    std::env::var("PRAECISE_TEST_KV_MODEL").expect("PRAECISE_TEST_KV_MODEL names a small dense GGUF")
 }
 
 pub fn backend() -> &'static LlamaBackend {

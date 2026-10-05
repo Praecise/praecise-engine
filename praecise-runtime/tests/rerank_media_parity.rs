@@ -1,9 +1,13 @@
 //! Multimodal cross-encoder scores against reference probabilities from the
-//! source checkpoint's own pipeline. Needs `PRAECISE_RERANK_GGUF` (a
-//! vision-language reranker GGUF), `PRAECISE_RERANK_MMPROJ` (its projector)
-//! and `PRAECISE_RERANK_MEDIA` (a directory holding `expected.json` and the
-//! raw RGB pictures it names); skips without them. `PRAECISE_RERANK_CASES`
-//! (comma-separated case names) runs a subset.
+//! source checkpoint's own pipeline. The reference scores and the raw RGB
+//! pictures they were computed from are committed under
+//! `tests/parity/rerank_media` (written by
+//! `tests/parity/make_rerank_media_fixtures.py`). The weights are not: the
+//! test is ignored by default and, run with `--ignored`, needs
+//! `PRAECISE_RERANK_GGUF` (the vision-language reranker GGUF converted from
+//! the checkpoint revision recorded in `expected.json`) and
+//! `PRAECISE_RERANK_MMPROJ` (its projector), and fails without them.
+//! `PRAECISE_RERANK_CASES` (comma-separated case names) runs a subset.
 #![cfg(feature = "mtmd")]
 
 use std::path::Path;
@@ -33,18 +37,16 @@ fn side(dir: &Path, v: &serde_json::Value) -> RerankInput {
 }
 
 #[test]
+#[ignore = "needs the reranker weights: PRAECISE_RERANK_GGUF and PRAECISE_RERANK_MMPROJ"]
 fn multimodal_reranker_scores_match_the_source_checkpoint() {
-    let (Ok(gguf), Ok(mmproj), Ok(dir)) = (
-        std::env::var("PRAECISE_RERANK_GGUF"),
-        std::env::var("PRAECISE_RERANK_MMPROJ"),
-        std::env::var("PRAECISE_RERANK_MEDIA"),
-    ) else {
-        eprintln!("PRAECISE_RERANK_GGUF / PRAECISE_RERANK_MMPROJ / PRAECISE_RERANK_MEDIA not set; skipping");
-        return;
-    };
-    let dir = Path::new(&dir);
-    let exp: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("expected.json")).expect("expected")).expect("json");
+    let gguf = std::env::var("PRAECISE_RERANK_GGUF").expect("PRAECISE_RERANK_GGUF names the reranker GGUF");
+    let mmproj = std::env::var("PRAECISE_RERANK_MMPROJ").expect("PRAECISE_RERANK_MMPROJ names its projector");
+    let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/parity/rerank_media"));
+    let expected = dir.join("expected.json");
+    let exp: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&expected).unwrap_or_else(|e| panic!("{}: {e}", expected.display())),
+    )
+    .expect("json");
 
     let mut backend = LlamaBackend::init().expect("backend");
     backend.void_logs();
@@ -63,8 +65,11 @@ fn multimodal_reranker_scores_match_the_source_checkpoint() {
     };
 
     let mut worst = 0f32;
+    let mut pairs = 0usize;
     let only = std::env::var("PRAECISE_RERANK_CASES").ok();
-    for case in exp["cases"].as_array().expect("cases") {
+    let cases = exp["cases"].as_array().expect("cases");
+    assert!(!cases.is_empty(), "{} holds no cases", expected.display());
+    for case in cases {
         let name = case["name"].as_str().expect("name");
         if only.as_deref().is_some_and(|o| !o.split(',').any(|c| c == name)) {
             continue;
@@ -79,6 +84,9 @@ fn multimodal_reranker_scores_match_the_source_checkpoint() {
         let want: Vec<f32> = serde_json::from_value(case["p_yes"].clone()).expect("p_yes");
         let tokens: Vec<usize> = serde_json::from_value(case["n_tokens"].clone()).expect("n_tokens");
         let got = rerank_media(&backend, &model, &projector, &query, &documents, options).expect("rerank");
+        assert_eq!(got.len(), want.len(), "{name}: {} scores for {} reference scores", got.len(), want.len());
+        assert_eq!(tokens.len(), want.len(), "{name}: token counts and scores disagree");
+        pairs += got.len();
         for (s, (w, t)) in got.iter().zip(want.iter().zip(&tokens)) {
             let d = (s.score - w).abs();
             worst = worst.max(d);
@@ -94,6 +102,7 @@ fn multimodal_reranker_scores_match_the_source_checkpoint() {
             assert_eq!(alone[0].score.to_bits(), got[1].score.to_bits(), "{name}: score depends on the request");
         }
     }
-    eprintln!("worst |P(yes) difference| {worst:.6}");
+    assert!(pairs > 0, "no pair was scored (PRAECISE_RERANK_CASES={only:?})");
+    eprintln!("{pairs} pairs, worst |P(yes) difference| {worst:.6}");
     assert!(worst < 1e-2, "worst P(yes) difference {worst} exceeds 1e-2");
 }

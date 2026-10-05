@@ -1,5 +1,6 @@
 //! Staged-weights activation against a cold load, on a real model.
-//! Needs `PRAECISE_TEST_KV_MODEL`; skips without it. Runs in its own process so
+//! Ignored by default; run with `--ignored`, it needs `PRAECISE_TEST_KV_MODEL`
+//! and fails without it. Runs in its own process so
 //! no other test holds the file mapped while it is evicted.
 #![cfg(all(feature = "bundled-llama", target_os = "linux"))]
 
@@ -19,8 +20,9 @@ fn serve_first_token(model: &llama_cpp_2::model::LlamaModel) -> usize {
 }
 
 #[test]
+#[ignore = "needs a small dense GGUF: PRAECISE_TEST_KV_MODEL"]
 fn staged_activation_is_faster_than_a_cold_load() {
-    let Some(path) = common::model_path() else { return };
+    let path = common::model_path();
     common::backend();
 
     // Cold: the file is evicted from the page cache first.

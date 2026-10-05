@@ -1,5 +1,6 @@
 //! KV-cache export and import between two engine instances of one model.
-//! Needs `PRAECISE_TEST_KV_MODEL` (a small dense GGUF); skips without it.
+//! Ignored by default; run with `--ignored`, it needs `PRAECISE_TEST_KV_MODEL`
+//! (a small dense GGUF) and fails without it.
 #![cfg(feature = "bundled-llama")]
 
 mod common;
@@ -21,8 +22,9 @@ fn fingerprint(path: &str) -> ModelFingerprint {
 }
 
 #[test]
+#[ignore = "needs a small dense GGUF: PRAECISE_TEST_KV_MODEL"]
 fn export_import_resumes_with_identical_logits_and_deltas_carry_only_new_positions() {
-    let Some(path) = common::model_path() else { return };
+    let path = common::model_path();
     let fp = fingerprint(&path);
 
     // Source engine: prefill a prefix, export it, append more, export the delta.
@@ -100,8 +102,9 @@ fn export_import_resumes_with_identical_logits_and_deltas_carry_only_new_positio
 }
 
 #[test]
+#[ignore = "needs a small dense GGUF: PRAECISE_TEST_KV_MODEL"]
 fn a_blob_from_other_weights_is_refused() {
-    let Some(path) = common::model_path() else { return };
+    let path = common::model_path();
     let fp = fingerprint(&path);
     let model = common::load(&path);
     let tokens = model.str_to_token(TEXT, AddBos::Always).expect("tokenize");
@@ -119,8 +122,9 @@ fn a_blob_from_other_weights_is_refused() {
 }
 
 #[test]
+#[ignore = "needs a small dense GGUF: PRAECISE_TEST_KV_MODEL"]
 fn a_context_without_a_unified_buffer_is_refused() {
-    let Some(path) = common::model_path() else { return };
+    let path = common::model_path();
     let fp = fingerprint(&path);
     let model = common::load(&path);
     let tokens = model.str_to_token(TEXT, AddBos::Always).expect("tokenize");
@@ -170,15 +174,16 @@ fn decode_rows(ctx: &mut llama_cpp_2::context::LlamaContext<'_>, rows: &[(i32, u
 }
 
 #[test]
+#[ignore = "needs a GGUF: PRAECISE_TEST_KV_MODEL, PRAECISE_TEST_HYBRID_MODEL or PRAECISE_TEST_RECURRENT_MODEL"]
 fn a_batch_slot_moves_to_another_slot_of_another_context_with_identical_logits() {
     const SRC_SLOT: i32 = 1;
     const DST_SLOT: i32 = 0;
     const SCRATCH3: i32 = 2;
     let models = slot_models();
-    if models.is_empty() {
-        eprintln!("no model given; skipping");
-        return;
-    }
+    assert!(
+        !models.is_empty(),
+        "set PRAECISE_TEST_KV_MODEL, PRAECISE_TEST_HYBRID_MODEL or PRAECISE_TEST_RECURRENT_MODEL"
+    );
     for (var, path) in models {
         let fp = ModelFingerprint::of_file(&path).expect("fingerprint");
         let model = common::load(&path);

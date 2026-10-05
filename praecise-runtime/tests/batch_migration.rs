@@ -1,7 +1,7 @@
 //! Moving a running sequence between two batch engines of one model.
 //! Needs `PRAECISE_TEST_KV_MODEL` (a small dense GGUF) and, optionally,
-//! `PRAECISE_TEST_HYBRID_MODEL` (attention plus recurrent layers); skips
-//! without them.
+//! `PRAECISE_TEST_HYBRID_MODEL` (attention plus recurrent layers); ignored
+//! by default and fails without them when run with `--ignored`.
 #![cfg(feature = "bundled-llama")]
 
 use std::sync::Arc;
@@ -249,6 +249,7 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
 }
 
 #[test]
+#[ignore = "needs a GGUF: PRAECISE_TEST_KV_MODEL or PRAECISE_TEST_HYBRID_MODEL"]
 fn a_running_sequence_moves_to_another_engine_and_continues_where_it_stopped() {
     // Few slots keep the test's contexts small; set before any engine reads it.
     // SAFETY: set before this test binary starts any other thread.
@@ -257,10 +258,7 @@ fn a_running_sequence_moves_to_another_engine_and_continues_where_it_stopped() {
         .into_iter()
         .filter_map(|var| std::env::var(var).ok().map(|p| (var, p)))
         .collect();
-    if models.is_empty() {
-        eprintln!("no model given; skipping");
-        return;
-    }
+    assert!(!models.is_empty(), "set PRAECISE_TEST_KV_MODEL or PRAECISE_TEST_HYBRID_MODEL");
     let mut backend = LlamaBackend::init().expect("backend");
     backend.void_logs();
     let backend = Arc::new(backend);

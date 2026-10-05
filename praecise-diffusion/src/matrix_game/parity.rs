@@ -113,6 +113,7 @@ fn world_dit_parity() {
 }
 
 #[test]
+#[ignore = "needs PRAECISE_MG3_PARITY fixtures"]
 fn camera_rays_match_reference() {
     use super::camera::{clip_rays, extrinsic, memory_rays, poses, select_by_view};
     let dir = root().join("../mg3cam");

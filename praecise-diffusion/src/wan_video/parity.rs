@@ -170,8 +170,10 @@ fn wan_session_matches_generation() {
 #[ignore = "needs a released checkpoint and its reference stage outputs"]
 fn wan_checkpoint_stages() {
     let d = PathBuf::from(std::env::var("PRAECISE_WAN_STAGES").unwrap());
-    let rd = |name: &str| -> Option<Vec<f32>> {
-        std::fs::read(d.join(format!("{name}.bin"))).ok().map(|b| b.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+    let rd = |name: &str| -> Vec<f32> {
+        let path = d.join(format!("{name}.bin"));
+        let b = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        b.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
     };
     let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
     let exact = std::env::var("PRAECISE_WAN_STAGES_EXACT").is_ok();
@@ -181,10 +183,10 @@ fn wan_checkpoint_stages() {
     let ids: Vec<i32> = m["prompt_ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
     assert_eq!(wan.tokens(m["prompt"].as_str().unwrap()).unwrap(), ids);
     let ctx = wan.context(&ids).unwrap();
-    let c = cos(&ctx, &rd("prompt_states").unwrap());
+    let c = cos(&ctx, &rd("prompt_states"));
     println!("prompt states cosine {c:.6}");
     assert!(c > 0.999, "prompt states {c}");
-    let ctx = rd("prompt_states").unwrap();
+    let ctx = rd("prompt_states");
     let (w, h) = (m["width"].as_u64().unwrap() as usize, m["height"].as_u64().unwrap() as usize);
     let (lt, lh, lw) = (1, h / 16, w / 16);
     let (rows, cols) = (lh / 2, lw / 2);
@@ -192,9 +194,9 @@ fn wan_checkpoint_stages() {
     let (cs, sn) = wan.cfg.rotary_tables(lt, rows, cols);
     let (_, steps) = flow_sigmas_schedule(30, wan.sched.flow_shift, wan.sched.num_train_timesteps);
     println!("first timestep {}", steps[0]);
-    let noise = rd("noise").unwrap();
+    let noise = rd("noise");
     for k in [1u64, 2, 4, 8, 15, 30] {
-        let Some(want) = rd(&format!("velocity_k{k}")) else { continue };
+        let want = rd(&format!("velocity_k{k}"));
         let mut cfg = wan.cfg.clone();
         cfg.num_layers = k;
         let mut g = Graph::new(&wan.backend).unwrap();
@@ -211,7 +213,8 @@ fn wan_checkpoint_stages() {
         println!("velocity after {k} blocks: cosine {c:.6}");
         assert!(c > 0.999, "velocity after {k} blocks {c}");
     }
-    if let (Some(lat), Some(dec)) = (rd("vae_latents"), rd("vae_decoded")) {
+    {
+        let (lat, dec) = (rd("vae_latents"), rd("vae_decoded"));
         let img = RgbImage { width: w as u32, height: h as u32, rgb: std::fs::read(d.join("image.rgb")).unwrap() };
         let z = wan::encode_frames(&wan.backend, &wan.vae_cfg, &wan.vae, std::slice::from_ref(&img)).unwrap();
         let c = cos(&z, &lat);
