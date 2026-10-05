@@ -1,9 +1,10 @@
 //! Pooled embeddings of text, pictures and video against reference vectors
 //! from the source checkpoint's own pipeline (`reference/embed_media.py`).
-//! Needs `PRAECISE_EMBED_GGUF` (a vision-language embedder GGUF),
-//! `PRAECISE_EMBED_MMPROJ` (its projector) and `PRAECISE_EMBED_MEDIA` (the
-//! reference output directory); skips without them. `PRAECISE_EMBED_CASES`
-//! (comma-separated case names) runs a subset.
+//! Ignored by default; run with `--ignored`, it needs `PRAECISE_EMBED_GGUF`
+//! (a vision-language embedder GGUF), `PRAECISE_EMBED_MMPROJ` (its projector)
+//! and `PRAECISE_EMBED_MEDIA` (the reference output directory), and fails
+//! without them. `PRAECISE_EMBED_CASES` (comma-separated case names) runs a
+//! subset.
 #![cfg(feature = "mtmd")]
 
 use std::path::Path;
@@ -40,14 +41,14 @@ fn cosine(a: &[f32], b: &[f64]) -> f64 {
 }
 
 #[test]
+#[ignore = "needs the embedder weights and reference: PRAECISE_EMBED_GGUF, PRAECISE_EMBED_MMPROJ and PRAECISE_EMBED_MEDIA"]
 fn pooled_embeddings_match_the_source_checkpoint() {
     let (Ok(gguf), Ok(mmproj), Ok(dir)) = (
         std::env::var("PRAECISE_EMBED_GGUF"),
         std::env::var("PRAECISE_EMBED_MMPROJ"),
         std::env::var("PRAECISE_EMBED_MEDIA"),
     ) else {
-        eprintln!("PRAECISE_EMBED_GGUF / PRAECISE_EMBED_MMPROJ / PRAECISE_EMBED_MEDIA not set; skipping");
-        return;
+        panic!("PRAECISE_EMBED_GGUF, PRAECISE_EMBED_MMPROJ and PRAECISE_EMBED_MEDIA must name the embedder, its projector and the reference");
     };
     let only: Option<Vec<String>> = std::env::var("PRAECISE_EMBED_CASES").ok().map(|s| s.split(',').map(str::to_owned).collect());
     let dir = Path::new(&dir);
@@ -62,6 +63,7 @@ fn pooled_embeddings_match_the_source_checkpoint() {
     let options = EmbedOptions { n_ctx: 8192, ..EmbedOptions::default() };
 
     let mut worst = 1.0f64;
+    let mut compared = 0usize;
     for case in exp["cases"].as_array().expect("cases") {
         let name = case["name"].as_str().expect("name");
         if only.as_ref().is_some_and(|o| !o.iter().any(|n| n == name)) {
@@ -76,6 +78,7 @@ fn pooled_embeddings_match_the_source_checkpoint() {
         assert_eq!(got.tokens as u64, case["tokens"].as_u64().expect("tokens"), "{name}: token count");
         assert!(c > 0.999, "{name}: cosine {c}");
         worst = worst.min(c);
+        compared += 1;
         if inp.pictures.is_empty() {
             // Text goes the same way without the projector.
             let t = embed(&backend, &model, instruction, &[inp.text.as_str()], options).expect("embed").remove(0);
@@ -84,5 +87,6 @@ fn pooled_embeddings_match_the_source_checkpoint() {
             assert!(ct > 0.999, "{name}: text-only cosine {ct}");
         }
     }
+    assert!(compared > 0, "no case was compared");
     println!("worst cosine {worst:.7}");
 }
