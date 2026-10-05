@@ -212,6 +212,74 @@ mod backend_tests {
         eprintln!("attention {d}x{h} heads over {n} tokens on {}: {ms:.2} ms ({tflops:.1} TFLOPS)", backend.name());
     }
 
+    /// A bf16 weight times f32 activations: the activations are rounded to
+    /// bf16 and every product is exact in f32, so the result matches a
+    /// direct sum over the rounded values. Token counts below four take the
+    /// row-dot path, the rest the blocked matrix path; widths off the block
+    /// size take the tail code.
+    #[test]
+    fn bf16_linear_matches_a_direct_computation() {
+        let backend = Backend::select_device(Device::Cpu, 4).unwrap();
+        let value = |i: usize, salt: usize| (((i * 2_654_435_761 + salt) % 1009) as f32 / 1009.0 - 0.5) * 2.0;
+        let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+        for (k, m, n) in [(264usize, 37usize, 1usize), (264, 37, 3), (264, 37, 4), (3072, 64, 39), (262, 19, 21)] {
+            let mut g = Graph::new(&backend).unwrap();
+            let w = g.input(sys::GGML_TYPE_BF16, &[k as i64, m as i64]);
+            let x = g.input(sys::GGML_TYPE_F32, &[k as i64, n as i64]);
+            let y = g.linear(w, x);
+            g.finish(&[y]).unwrap();
+            let wd: Vec<f32> = (0..k * m).map(|i| bf(value(i, 5))).collect();
+            let xd: Vec<f32> = (0..k * n).map(|i| value(i, 9) * 3.0).collect();
+            let wb: Vec<half::bf16> = wd.iter().map(|v| half::bf16::from_f32(*v)).collect();
+            unsafe { sys::ggml_backend_tensor_set(w.0, wb.as_ptr().cast(), 0, wb.len() * 2) };
+            g.set_f32(x, &xd);
+            g.compute().unwrap();
+            let got = g.read_f32(y);
+            let mut worst = 0f64;
+            for j in 0..n {
+                for i in 0..m {
+                    let (mut want, mut mag) = (0f64, 0f64);
+                    for c in 0..k {
+                        let p = f64::from(wd[i * k + c]) * f64::from(bf(xd[j * k + c]));
+                        want += p;
+                        mag += p.abs();
+                    }
+                    worst = worst.max((f64::from(got[j * m + i]) - want).abs() / mag.max(1e-12));
+                }
+            }
+            assert!(worst < 1e-5, "k {k}, m {m}, n {n}: relative error {worst}");
+        }
+    }
+
+    /// Time a bf16, f16 and f32 linear at a video transformer's widths.
+    /// Run explicitly on the machine being measured.
+    #[test]
+    #[ignore = "a timing, run on the hardware being measured"]
+    fn bench_linear() {
+        let threads = std::env::var("PRAECISE_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+        let n: i64 = std::env::var("PRAECISE_BENCH_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(390);
+        let backend = Backend::select(threads).unwrap();
+        for (k, m) in [(3072i64, 3072i64), (3072, 14336), (14336, 3072)] {
+            for (name, ty) in [("bf16", sys::GGML_TYPE_BF16), ("f16", sys::GGML_TYPE_F16), ("f32", sys::GGML_TYPE_F32)] {
+                let mut g = Graph::new(&backend).unwrap();
+                let w = g.input(ty, &[k, m]);
+                let x = g.input(sys::GGML_TYPE_F32, &[k, n]);
+                let y = g.linear(w, x);
+                g.finish(&[y]).unwrap();
+                g.set_f32(x, &vec![0.01; (k * n) as usize]);
+                g.compute().unwrap();
+                let runs = 3;
+                let t = std::time::Instant::now();
+                for _ in 0..runs {
+                    g.compute().unwrap();
+                }
+                let ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+                let gflops = 2.0 * (k * m * n) as f64 / (ms / 1000.0) / 1e9;
+                eprintln!("linear {name} {k}->{m} over {n} tokens on {} x{threads}: {ms:.1} ms ({gflops:.1} GFLOPS)", backend.name());
+            }
+        }
+    }
+
     /// Flash attention against a direct computation, at key lengths that are
     /// not a multiple of any tile and query counts wide enough for the
     /// pipelined kernels, with and without a mask.

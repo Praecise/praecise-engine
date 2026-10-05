@@ -500,3 +500,83 @@ pub fn build(g: &mut Graph, cfg: &WanDitConfig, w: &Weights, pe: &Weights, frame
 
 #[cfg(test)]
 mod parity;
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::ggml::Backend;
+
+    /// One transformer evaluation at the released 5B model's widths with
+    /// random weights: 390 tokens is one 832x480 frame. Layers default to
+    /// 2 (`PRAECISE_BENCH_LAYERS`); the per-step figure scales to 30 layers
+    /// and two evaluations (guidance). Run on the machine being measured.
+    #[test]
+    #[ignore = "a timing, run on the hardware being measured"]
+    fn bench_wan_dit_step() {
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let threads = env("PRAECISE_BENCH_THREADS", 6);
+        let layers = env("PRAECISE_BENCH_LAYERS", 2) as u64;
+        let (rows, cols) = (env("PRAECISE_BENCH_ROWS", 15), env("PRAECISE_BENCH_COLS", 26));
+        let cfg: WanDitConfig = serde_json::from_value(serde_json::json!({
+            "patch_size": [1, 2, 2], "num_attention_heads": 24, "attention_head_dim": 128,
+            "in_channels": 48, "out_channels": 48, "text_dim": 4096, "ffn_dim": 14336,
+            "num_layers": layers, "qk_norm": "rms_norm_across_heads"
+        }))
+        .unwrap();
+        cfg.validate().unwrap();
+        let backend = Backend::select(threads).unwrap();
+        let mut seed = 0x9e37_79b9_u32;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed as f32 / u32::MAX as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        let host: Vec<HostTensor> = cfg
+            .weight_specs(WType::Bf16)
+            .into_iter()
+            .map(|s| {
+                let n = s.shape.iter().product::<u64>() as usize;
+                let scale = 2.0 / (*s.shape.last().unwrap() as f32).sqrt();
+                HostTensor { name: s.name, shape: s.shape, ty: s.ty, data: rnd(n, scale) }
+            })
+            .collect();
+        let w = Weights::from_host(&backend, &host).unwrap();
+        drop(host);
+        let pe = Weights::from_host(
+            &backend,
+            &[HostTensor { name: "patch_embedding.weight".into(), shape: vec![cfg.dim(), cfg.patch_in()], ty: WType::F32, data: rnd((cfg.dim() * cfg.patch_in()) as usize, 0.1) }],
+        )
+        .unwrap();
+        let (frames, text) = (1usize, 512usize);
+        let n = frames * rows * cols;
+        let mut g = Graph::new(&backend).unwrap();
+        let io = build(&mut g, &cfg, &w, &pe, frames as i64, n as i64, text as i64, 1, false);
+        g.finish(&[io.out]).unwrap();
+        let (cos, sin) = cfg.rotary_tables(frames, rows, cols);
+        g.set_f32(io.patches, &rnd(cfg.patch_in() as usize * n, 2.0));
+        g.set_f32(io.time, &time_features(500.0));
+        g.set_f32(io.context, &rnd(cfg.text_dim as usize * text, 0.2));
+        g.set_f32(io.cos, &cos);
+        g.set_f32(io.sin, &sin);
+        g.compute().unwrap();
+        let runs = 2;
+        let t = std::time::Instant::now();
+        for _ in 0..runs {
+            g.compute().unwrap();
+        }
+        let s = t.elapsed().as_secs_f64() / f64::from(runs);
+        let per_layer = s / layers as f64;
+        let out = g.read_f32(io.out);
+        assert!(out.iter().all(|v| v.is_finite()));
+        eprintln!(
+            "wan dit {layers} layers, {n} tokens, {} x{threads}: {s:.2} s per evaluation, {per_layer:.3} s per layer, ~{:.1} s per guided 30-layer step",
+            backend.name(),
+            2.0 * 30.0 * per_layer
+        );
+    }
+}
