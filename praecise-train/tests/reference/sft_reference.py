@@ -8,7 +8,8 @@ batch is the test's token ids, and the optimizer, clipping and loss reduction fo
 the test (AdamW with bias correction, global-norm clip, mean over all target tokens).
 
 Inputs come from a run of the test with `PRAECISE_TRAIN_REFERENCE_DUMP=<dir>` (tokens.txt,
-init.gguf, recipe.txt). Output is the fixture the test reads (`model_sha256`, then one loss per step).
+init.gguf, recipe.txt). Output is the fixture the test reads (`model_sha256`, then one line per
+step: step, loss and gradient norm before clipping).
 
 usage: sft_reference.py <model.gguf> <dump dir> <out fixture> [--steps N]
 Needs torch, transformers and gguf-py (llama.cpp/gguf-py on PYTHONPATH). CPU only.
@@ -170,6 +171,7 @@ def main():
     v = [torch.zeros_like(p) for p in params]
 
     losses = []
+    norms = []
     for step in range(1, args.steps + 1):
         logits = model(input_ids=tokens).logits
         logp = torch.log_softmax(logits[:, :-1].double(), dim=-1)
@@ -189,6 +191,7 @@ def main():
                 vi.mul_(beta2).add_((1 - beta2) * g * g)
                 p.mul_(1 - lr * wd).sub_(lr * (mi * bc1) / ((vi * bc2).sqrt() + eps))
         losses.append(float(loss.detach()))
+        norms.append(norm)
         print(f"step {step} loss {losses[-1]:.6f} grad_norm {norm:.6f}", flush=True)
 
     h = hashlib.sha256()
@@ -198,8 +201,8 @@ def main():
     with open(args.out, "w") as f:
         f.write(f"model_sha256 {h.hexdigest()}\n")
         f.write(f"model {os.path.basename(args.model)}\n")
-        for i, x in enumerate(losses):
-            f.write(f"{i} {x:.6f}\n")
+        for i, (x, n) in enumerate(zip(losses, norms)):
+            f.write(f"{i} {x:.6f} {n:.6f}\n")
 
 
 if __name__ == "__main__":
