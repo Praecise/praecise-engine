@@ -1,7 +1,8 @@
 //! Layer-pipeline serving across local processes: one model split into three stages
 //! (this process plus two children) gives the logits of the whole model in one process.
 //! Needs `PRAECISE_TEST_KV_MODEL` (a small GGUF of a splittable architecture, e.g. a
-//! Qwen3 or Llama dense model); skips without it.
+//! Qwen3 or Llama dense model); ignored by default and fails without it when run
+//! with `--ignored`.
 #![cfg(feature = "bundled-llama")]
 
 mod common;
@@ -94,9 +95,10 @@ fn load_stage(path: &str, r: LayerRange) -> LlamaModel {
 #[test]
 #[ignore = "spawned by three_processes_match_one_process"]
 fn stage_process() {
-    let (Ok(index), Ok(plan), Some(path)) = (std::env::var(STAGE_ENV), std::env::var(PLAN_ENV), common::model_path()) else {
-        return;
-    };
+    // Run directly rather than spawned as a stage, there is nothing to serve.
+    let Ok(index) = std::env::var(STAGE_ENV) else { return };
+    let plan = std::env::var(PLAN_ENV).expect("a stage is spawned with its plan");
+    let path = common::model_path();
     let index: usize = index.parse().unwrap();
     let plan = decode_plan(&plan);
     let model = load_stage(&path, plan.stages[index].layers);
@@ -187,8 +189,9 @@ fn assert_close(what: &str, got: &[f32], want: &[f32]) {
 }
 
 #[test]
+#[ignore = "needs a small dense GGUF: PRAECISE_TEST_KV_MODEL"]
 fn three_processes_match_one_process() {
-    let Some(path) = common::model_path() else { return };
+    let path = common::model_path();
     let full = common::load(&path);
     let n_layer = full.n_layer();
     let ranges = split_layers(n_layer, &[1, 1, 1]).unwrap();
