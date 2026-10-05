@@ -4,7 +4,8 @@
 //! (a vision-language embedder GGUF), `PRAECISE_EMBED_MMPROJ` (its projector)
 //! and `PRAECISE_EMBED_MEDIA` (the reference output directory), and fails
 //! without them. `PRAECISE_EMBED_CASES` (comma-separated case names) runs a
-//! subset.
+//! subset. Every case, a 1280x960 picture (1222 tokens) and a 64-frame video
+//! (4780 tokens) among them, must reach a cosine of [`BAR`].
 #![cfg(feature = "mtmd")]
 
 use std::path::Path;
@@ -15,6 +16,9 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{MtmdContext, MtmdContextParams};
 use praecise_runtime::embed::{embed, embed_media, EmbedOptions};
 use praecise_runtime::media::{MediaInput, Picture};
+
+/// Least cosine to the reference vector, for every case.
+const BAR: f64 = 0.9999;
 
 fn input(dir: &Path, case: &serde_json::Value) -> MediaInput {
     let pictures = case["pictures"]
@@ -76,7 +80,7 @@ fn pooled_embeddings_match_the_source_checkpoint() {
         let c = cosine(&got.vector, &want);
         println!("{name}: tokens {} (reference {}), cosine {c:.7}", got.tokens, case["tokens"]);
         assert_eq!(got.tokens as u64, case["tokens"].as_u64().expect("tokens"), "{name}: token count");
-        assert!(c > 0.999, "{name}: cosine {c}");
+        assert!(c >= BAR, "{name}: cosine {c}");
         worst = worst.min(c);
         compared += 1;
         if inp.pictures.is_empty() {
@@ -84,7 +88,7 @@ fn pooled_embeddings_match_the_source_checkpoint() {
             let t = embed(&backend, &model, instruction, &[inp.text.as_str()], options).expect("embed").remove(0);
             let ct = cosine(&t.vector, &want);
             assert_eq!(t.tokens, got.tokens, "{name}: text-only token count");
-            assert!(ct > 0.999, "{name}: text-only cosine {ct}");
+            assert!(ct >= BAR, "{name}: text-only cosine {ct}");
         }
     }
     assert!(compared > 0, "no case was compared");

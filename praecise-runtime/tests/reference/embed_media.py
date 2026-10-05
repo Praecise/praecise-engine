@@ -47,7 +47,9 @@ def save(name, img, video_frame):
 
 
 IMAGE = picture(256, 192, 0.4)
+LARGE = picture(1280, 960, 0.4)
 FRAMES = [picture(448, 320, i * 0.25) for i in range(32)]
+LONG = [picture(448, 320, i * 0.25) for i in range(64)]
 
 CASES = [
     ("text", {"text": "A red kite over a beach."}),
@@ -57,6 +59,8 @@ CASES = [
     ("image_text", {"image": IMAGE, "text": "A colourful pattern."}),
     ("video", {"video": FRAMES}),
     ("video_image_text", {"video": FRAMES, "image": IMAGE, "text": "Moving colour bands, then a still."}),
+    ("image_large", {"image": LARGE}),
+    ("video_long", {"video": LONG}),
 ]
 
 BLOCK = re.compile(r"<\|vision_start\|>(<\|image_pad\|>|<\|video_pad\|>)+<\|vision_end\|>")
@@ -64,6 +68,8 @@ TURN = re.compile(r"<\|im_start\|>user\n(.*)<\|im_end\|>\n<\|im_start\|>assistan
 
 expected = {"cases": []}
 for name, inp in CASES:
+    # every frame given is kept: the pipeline samples to its frame count
+    emb.num_frames = emb.max_frames = len(inp.get("video") or FRAMES)
     conv = emb.format_model_input(text=inp.get("text"), image=inp.get("image"), video=inp.get("video"), instruction=inp.get("instruction"))
     proc = emb._preprocess_inputs([conv])
     ids = proc["input_ids"][0][proc["attention_mask"][0].bool()]
