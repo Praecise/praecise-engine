@@ -8,9 +8,10 @@ description = "Praecise Engine video codecs: in-process H.264, H.265 and AV1 dec
 [dependencies]
 thiserror = "2"
 libc = "0.2"
-# H.264 encode and decode, built from the bundled source (BSD-2-Clause).
+# H.264 encode, built from the bundled source (BSD-2-Clause).
 openh264 = { version = "0.9.8", default-features = false, features = ["source"] }
-# H.265 decode, pure Rust (MIT OR Apache-2.0).
+# H.264 and H.265 decode, pure Rust (MIT OR Apache-2.0).
+rust_h264 = "0.4.0"
 rust_h265 = "0.1.0"
 # AV1 encode, pure Rust (BSD-2-Clause); no assembly, so no assembler is needed.
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }

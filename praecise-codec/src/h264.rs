@@ -1,9 +1,11 @@
-//! H.264 through OpenH264.
+//! H.264: encoding through OpenH264, decoding through a pure-Rust decoder
+//! (Baseline, Main and High profiles, 8-bit 4:2:0).
 
 use openh264::OpenH264API;
-use openh264::decoder::{DecodeOptions, Decoder, Flush};
 use openh264::encoder::{BitRate, EncoderConfig, FrameRate, IntraFramePeriod, QpRange, RateControlMode, VuiConfig};
-use openh264::formats::{YUVSlices, YUVSource};
+use openh264::formats::YUVSlices;
+use rust_h264::decoder::OrderedDecoder;
+use rust_h264::nal::parse_annex_b;
 
 use crate::color::{Matrix, Planes, Yuv420};
 use crate::nal::{build_avcc, h264_type, parse_avcc, push_annex_b, push_prefixed, split_annex_b, split_prefixed};
@@ -92,36 +94,45 @@ fn keep_once(slot: &mut Option<Vec<u8>>, nal: &[u8], what: &str) -> Result<()> {
     Ok(())
 }
 
-fn emit(sink: &mut Sink<'_>, p: &impl YUVSource, m: Matrix) -> Result<()> {
-    let (w, h) = p.dimensions();
-    let (sy, su, _) = p.strides();
-    sink.picture(Planes { y: p.y(), u: p.u(), v: p.v(), strides: (sy, su) }, w, h, m)
+fn emit(sink: &mut Sink<'_>, f: &rust_h264::decoder::Frame, m: Matrix) -> Result<()> {
+    let (w, h) = (f.width as usize, f.height as usize);
+    sink.picture(Planes { y: &f.y, u: &f.u, v: &f.v, strides: (w, w.div_ceil(2)) }, w, h, m)
 }
 
+fn decode_error(e: impl std::fmt::Debug) -> Error {
+    Error::Codec(format!("H.264: {e:?}"))
+}
+
+/// Decode with the pure-Rust decoder, which emits pictures in display order.
 pub(crate) fn decode(d: &Demuxed, sink: &mut Sink<'_>) -> Result<()> {
     let cfg = parse_avcc(&d.config)?;
     let m = d.matrix.unwrap_or(Matrix::BT709);
-    let mut dec = Decoder::new().map_err(codec)?;
-    let mut packet = Vec::new();
+    let mut dec = OrderedDecoder::new();
+    let mut stream = Vec::new();
     for (i, s) in d.samples.iter().enumerate() {
-        packet.clear();
+        stream.clear();
         if i == 0 {
             for set in &cfg.sets {
-                push_annex_b(&mut packet, set);
+                push_annex_b(&mut stream, set);
             }
         }
         for unit in split_prefixed(s, cfg.len_size)? {
-            push_annex_b(&mut packet, unit);
+            push_annex_b(&mut stream, unit);
         }
-        if let Some(p) = dec.decode_with_options(&packet, DecodeOptions::new().flush_after_decode(Flush::NoFlush)).map_err(codec)? {
-            emit(sink, &p, m)?;
-        }
-        if sink.stopped() {
-            return Ok(());
+        for unit in parse_annex_b(&stream) {
+            for f in dec.decode_nal(&unit).map_err(decode_error)? {
+                emit(sink, &f, m)?;
+                if sink.stopped() {
+                    return Ok(());
+                }
+            }
         }
     }
-    for p in dec.flush_remaining().map_err(codec)? {
-        emit(sink, &p, m)?;
+    for f in dec.flush() {
+        emit(sink, &f, m)?;
+        if sink.stopped() {
+            break;
+        }
     }
     Ok(())
 }
