@@ -93,6 +93,92 @@ pub struct RgbImage {
     pub rgb: Vec<u8>,
 }
 
+impl RgbImage {
+    /// Resampled to `width x height` with a Lanczos-3 filter, computed as
+    /// PIL's 8-bit resampler does it (fixed-point weights with 22 fraction
+    /// bits, horizontal pass first, rounding and clipping after each pass),
+    /// so the result matches `Image.resize(.., LANCZOS)` byte for byte. The
+    /// same size returns a copy.
+    ///
+    /// # Panics
+    /// A zero-sized target, or a pixel buffer that disagrees with its size.
+    #[must_use]
+    pub fn lanczos(&self, width: u32, height: u32) -> Self {
+        assert!(width > 0 && height > 0 && self.rgb.len() == 3 * self.width as usize * self.height as usize);
+        let (sw, sh, dw, dh) = (self.width as usize, self.height as usize, width as usize, height as usize);
+        let mut img = self.rgb.clone();
+        let mut w = sw;
+        if dw != sw {
+            let taps = lanczos_taps(sw, dw);
+            let mut out = vec![0u8; 3 * dw * sh];
+            for y in 0..sh {
+                for (x, (x0, k)) in taps.iter().enumerate() {
+                    for c in 0..3 {
+                        let acc = k.iter().enumerate().fold(1i64 << (LANCZOS_BITS - 1), |a, (i, &kk)| a + i64::from(img[(y * sw + x0 + i) * 3 + c]) * i64::from(kk));
+                        out[(y * dw + x) * 3 + c] = clip8(acc);
+                    }
+                }
+            }
+            img = out;
+            w = dw;
+        }
+        if dh != sh {
+            let taps = lanczos_taps(sh, dh);
+            let mut out = vec![0u8; 3 * w * dh];
+            for (y, (y0, k)) in taps.iter().enumerate() {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let acc = k.iter().enumerate().fold(1i64 << (LANCZOS_BITS - 1), |a, (i, &kk)| a + i64::from(img[((y0 + i) * w + x) * 3 + c]) * i64::from(kk));
+                        out[(y * w + x) * 3 + c] = clip8(acc);
+                    }
+                }
+            }
+            img = out;
+        }
+        Self { width, height, rgb: img }
+    }
+}
+
+const LANCZOS_BITS: u32 = 22;
+
+fn clip8(acc: i64) -> u8 {
+    (acc >> LANCZOS_BITS).clamp(0, 255) as u8
+}
+
+/// Per output index: the first source index and the fixed-point weights.
+fn lanczos_taps(input: usize, output: usize) -> Vec<(usize, Vec<i32>)> {
+    let sinc = |x: f64| {
+        if x == 0.0 {
+            1.0
+        } else {
+            let x = x * std::f64::consts::PI;
+            x.sin() / x
+        }
+    };
+    let filter = |x: f64| if (-3.0..3.0).contains(&x) { sinc(x) * sinc(x / 3.0) } else { 0.0 };
+    let scale = input as f64 / output as f64;
+    let fscale = scale.max(1.0);
+    let support = 3.0 * fscale;
+    (0..output)
+        .map(|o| {
+            let centre = (o as f64 + 0.5) * scale;
+            // C casts truncate toward zero.
+            let lo = ((centre - support + 0.5) as i64).max(0) as usize;
+            let hi = ((centre + support + 0.5) as i64).min(input as i64) as usize;
+            let k: Vec<f64> = (lo..hi).map(|i| filter((i as f64 - centre + 0.5) / fscale)).collect();
+            let sum: f64 = k.iter().sum();
+            let k = k
+                .iter()
+                .map(|&v| {
+                    let v = if sum == 0.0 { v } else { v / sum } * f64::from(1u32 << LANCZOS_BITS);
+                    if v < 0.0 { (v - 0.5) as i32 } else { (v + 0.5) as i32 }
+                })
+                .collect();
+            (lo, k)
+        })
+        .collect()
+}
+
 /// Largest reference image, in pixels; larger ones must be resized first.
 pub const MAX_REFERENCE_PIXELS: u32 = 1024 * 1024;
 

@@ -55,9 +55,6 @@ impl MiniMaxH3Config {
     /// [`Error::Config`] naming the problem.
     pub fn validate(&self) -> Result<()> {
         let bad = |m: &str| Err(Error::Config(format!("MiniMax-H3 transformer: {m}")));
-        if self.num_attention_heads * self.attention_head_dim != self.hidden_size {
-            return bad("heads do not fill the width");
-        }
         if 6 * self.rope_freq_dim > self.attention_head_dim {
             return bad("rotary part wider than a head");
         }
@@ -81,7 +78,10 @@ impl MiniMaxH3Config {
     #[must_use]
     pub fn weight_specs(&self, linear: WType) -> Vec<WeightSpec> {
         let (d, hd, ff, te) = (self.hidden_size, self.attention_head_dim, self.ffn_dim, self.time_embed_dim);
+        let inner = self.num_attention_heads * hd;
         let f = WType::F32;
+        // 8-bit blocks hold 32 columns; narrower rows stay float32.
+        let q = |cols: u64| if linear == WType::Q8_0 && cols % 32 != 0 { f } else { linear };
         let mut v = Vec::new();
         let mut lin = |name: &str, out: u64, inp: u64, ty: WType, bias: bool| {
             v.push(WeightSpec::new(format!("{name}.weight"), &[out, inp], ty));
@@ -91,7 +91,7 @@ impl MiniMaxH3Config {
         };
         lin("proj_in", d, self.patch_dim(), f, true);
         lin("audio_proj_in", d, self.audio_in_channels, f, true);
-        lin("context_embedder", d, self.text_dim, linear, true);
+        lin("context_embedder", d, self.text_dim, q(self.text_dim), true);
         lin("time_embedder.linear_1", self.time_embed_hidden_dim, self.freq_dim, f, true);
         lin("time_embedder.linear_2", te, self.time_embed_hidden_dim, f, true);
         lin("norm_out.linear", 2 * d, te, f, true);
@@ -102,14 +102,14 @@ impl MiniMaxH3Config {
                 v.push(WeightSpec::new(format!("{p}.{n}.weight"), &[d], f));
             }
             for n in ["to_q", "to_k", "to_v"] {
-                v.push(WeightSpec::new(format!("{p}.attn.{n}.weight"), &[d, d], linear));
+                v.push(WeightSpec::new(format!("{p}.attn.{n}.weight"), &[inner, d], q(d)));
             }
-            v.push(WeightSpec::new(format!("{p}.attn.to_out.0.weight"), &[d, d], linear));
+            v.push(WeightSpec::new(format!("{p}.attn.to_out.0.weight"), &[d, inner], q(inner)));
             for n in ["norm_q", "norm_k"] {
                 v.push(WeightSpec::new(format!("{p}.attn.{n}.weight"), &[hd], f));
             }
-            v.push(WeightSpec::new(format!("{p}.ff.net.0.proj.weight"), &[2 * ff, d], linear));
-            v.push(WeightSpec::new(format!("{p}.ff.net.2.weight"), &[d, ff], linear));
+            v.push(WeightSpec::new(format!("{p}.ff.net.0.proj.weight"), &[2 * ff, d], q(d)));
+            v.push(WeightSpec::new(format!("{p}.ff.net.2.weight"), &[d, ff], q(ff)));
         };
         for i in 0..self.num_refiner_layers {
             block(&mut v, &format!("token_refiner.refiner_blocks.{i}"));
@@ -118,7 +118,7 @@ impl MiniMaxH3Config {
         for i in 0..self.num_layers {
             let p = format!("transformer_blocks.{i}");
             block(&mut v, &p);
-            v.push(WeightSpec::new(format!("{p}.adaln_proj.linear.weight"), &[6 * d * MODALITIES as u64, te], linear));
+            v.push(WeightSpec::new(format!("{p}.adaln_proj.linear.weight"), &[6 * d * MODALITIES as u64, te], q(te)));
             v.push(WeightSpec::new(format!("{p}.adaln_proj.linear.bias"), &[6 * d * MODALITIES as u64], f));
         }
         v.push(WeightSpec::new("norm_out.norm.weight", &[d], f));
@@ -245,7 +245,7 @@ fn attention(g: &mut Graph, w: &Weights, p: &str, c: Ctx, x: Tn, rot: Option<(Tn
         let v = g.cast(v, sys::GGML_TYPE_F16);
         g.attention(q, k, v, None, scale, true)
     };
-    let o = g.reshape(o, &[c.d, n]);
+    let o = g.reshape(o, &[c.hd * c.heads, n]);
     lin(g, w, &format!("{p}.attn.to_out.0"), o)
 }
 
@@ -280,11 +280,20 @@ impl MiniMaxH3Transformer {
     /// # Errors
     /// A missing or malformed config or weight, or no usable backend.
     pub fn load(files: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
-        let cfg: MiniMaxH3Config = parse(files.json("transformer/config.json")?, "transformer config")?;
+        Self::load_dir(files, "transformer", opts)
+    }
+
+    /// Load the transformer in directory `dir` of a checkpoint (the
+    /// reference-conditioned weights live in `transformer_ref/`).
+    ///
+    /// # Errors
+    /// A missing or malformed config or weight, or no usable backend.
+    pub fn load_dir(files: &CheckpointFiles, dir: &str, opts: LoadOptions) -> Result<Self> {
+        let cfg: MiniMaxH3Config = parse(files.json(&format!("{dir}/config.json"))?, "transformer config")?;
         cfg.validate()?;
         let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "video transformer backend selected");
-        let st = SafeTensors::open(&files.weights("transformer")?)?;
+        let st = SafeTensors::open(&files.weights(dir)?)?;
         let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;
         Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })
     }

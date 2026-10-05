@@ -153,6 +153,8 @@ impl Qwen3VlConfig {
         let (d, hd, ff) = (t.hidden_size, t.head_dim, t.intermediate_size);
         let (q, kv) = (t.num_attention_heads * hd, t.num_key_value_heads * hd);
         let f = WType::F32;
+        // 8-bit blocks hold 32 columns; narrower rows stay float32.
+        let q8 = |cols: u64| if linear == WType::Q8_0 && cols % 32 != 0 { f } else { linear };
         let mut s = vec![WeightSpec::new(format!("{TEXT}.embed_tokens.weight"), &[t.vocab_size, d], embed)];
         for i in 0..t.num_hidden_layers {
             let p = format!("{TEXT}.layers.{i}");
@@ -161,18 +163,18 @@ impl Qwen3VlConfig {
             s.push(WeightSpec::new(format!("{p}.self_attn.q_norm.weight"), &[hd], f));
             s.push(WeightSpec::new(format!("{p}.self_attn.k_norm.weight"), &[hd], f));
             for (n, rows) in [("q", q), ("k", kv), ("v", kv)] {
-                s.push(WeightSpec::new(format!("{p}.self_attn.{n}_proj.weight"), &[rows, d], linear));
+                s.push(WeightSpec::new(format!("{p}.self_attn.{n}_proj.weight"), &[rows, d], q8(d)));
             }
-            s.push(WeightSpec::new(format!("{p}.self_attn.o_proj.weight"), &[d, q], linear));
-            s.push(WeightSpec::new(format!("{p}.mlp.gate_proj.weight"), &[ff, d], linear));
-            s.push(WeightSpec::new(format!("{p}.mlp.up_proj.weight"), &[ff, d], linear));
-            s.push(WeightSpec::new(format!("{p}.mlp.down_proj.weight"), &[d, ff], linear));
+            s.push(WeightSpec::new(format!("{p}.self_attn.o_proj.weight"), &[d, q], q8(q)));
+            s.push(WeightSpec::new(format!("{p}.mlp.gate_proj.weight"), &[ff, d], q8(d)));
+            s.push(WeightSpec::new(format!("{p}.mlp.up_proj.weight"), &[ff, d], q8(d)));
+            s.push(WeightSpec::new(format!("{p}.mlp.down_proj.weight"), &[d, ff], q8(ff)));
         }
         let v = &self.vision_config;
         let (vd, vf) = (v.hidden_size, v.intermediate_size);
         let merged = vd * v.spatial_merge_size * v.spatial_merge_size;
         let lin = |s: &mut Vec<WeightSpec>, p: String, out: u64, inp: u64| {
-            s.push(WeightSpec::new(format!("{p}.weight"), &[out, inp], linear));
+            s.push(WeightSpec::new(format!("{p}.weight"), &[out, inp], q8(inp)));
             s.push(WeightSpec::new(format!("{p}.bias"), &[out], f));
         };
         let ln = |s: &mut Vec<WeightSpec>, p: String, c: u64| {

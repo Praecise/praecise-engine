@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from make_qwen_image21_fixtures import randomise, save  # noqa: E402
 
 TINY = dict(
-    num_attention_heads=2, attention_head_dim=24, hidden_size=48, num_layers=2, num_refiner_layers=1, ffn_dim=64,
+    num_attention_heads=3, attention_head_dim=32, hidden_size=64, num_layers=2, num_refiner_layers=1, ffn_dim=64,
     in_channels=4, audio_in_channels=6, patch_size=(1, 2, 2), text_dim=20, freq_dim=256, time_embed_hidden_dim=40,
     time_embed_dim=24, rope_freq_dim=2, rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5,
 )

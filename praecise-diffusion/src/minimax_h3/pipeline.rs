@@ -12,6 +12,18 @@
 //! predicts every row's velocity, video and audio each step down their own
 //! shifted schedule (`s b / (1 + (s - 1) b)` over a linear ramp, shift 12
 //! for video and 3 for audio), and prompt rows ride the video timestep.
+//!
+//! Two conditioned tasks share that machinery. First-and-last-frame
+//! (`fl2va`) puts each keyframe's latent, noised to `t = 0.999`, in front of
+//! the generated video rows at the time of the first or the last latent
+//! frame; reference-to-video (`ref2va`, its own transformer weights) puts
+//! reference images there, each on its own grid one time step after the
+//! previous, and starts the generated audio and video after them. In both,
+//! the prompt presentation gives each image a `"<Picture i>: "` label and a
+//! vision block (tagged video), conditioning rows stay fixed through the
+//! loop at `max(t, 0.999)`, and only the generated rows are stepped and
+//! decoded. Conditioning latents are posterior samples under their own seed,
+//! rounded to float16.
 
 use std::time::Instant;
 
@@ -20,7 +32,7 @@ use super::vae::{to_unit_rgb, H3VideoVae};
 use super::{H3Input, H3Source, H3Token, MiniMaxH3Transformer};
 use crate::error::{Error, Result};
 use crate::music::Audio;
-use crate::pipeline::{CheckpointFiles, LoadOptions, Timings};
+use crate::pipeline::{CheckpointFiles, LoadOptions, Precision, RgbImage, Timings};
 use crate::qwen3_vl::Qwen3VlEncoder;
 use crate::schedule::gaussian;
 use crate::video::Video;
@@ -44,6 +56,14 @@ pub const MAX_SECONDS: f32 = 15.0;
 pub const CANVAS_SHORT_EDGE: f64 = 768.0;
 pub const CANVAS_MAX_PIXELS: f64 = 768.0 * 1344.0;
 
+/// Seed every conditioning posterior is sampled under, whatever the request.
+pub const KEYFRAME_ENCODE_SEED: u64 = 42;
+/// The `t` conditioning rows are noised to and held at.
+pub const KEYFRAME_NOISE_AUG: f32 = 0.999;
+/// Short edge a reference image is resampled to.
+pub const REFERENCE_SHORT_EDGE: f64 = 2048.0;
+/// Most reference images one request may carry.
+pub const MAX_REFERENCE_IMAGES: usize = 9;
 const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
 const ROPE_SPATIAL_SCALE: f64 = 32.0;
@@ -61,12 +81,64 @@ pub struct H3Request {
     /// many noise levels, so one fewer transformer evaluation).
     pub steps: usize,
     pub seed: u64,
+    /// What the clip is conditioned on besides the prompt.
+    pub condition: H3Condition,
 }
 
 impl Default for H3Request {
     fn default() -> Self {
-        Self { prompt: String::new(), num_frames: 240, width: None, height: None, steps: 50, seed: 0 }
+        Self { prompt: String::new(), num_frames: 240, width: None, height: None, steps: 50, seed: 0, condition: H3Condition::Text }
     }
+}
+
+/// The images a request is conditioned on.
+#[derive(Debug, Clone, Default)]
+pub enum H3Condition {
+    /// The prompt alone (`t2va`).
+    #[default]
+    Text,
+    /// Keyframes the clip starts and/or ends on (`fl2va`). Without a canvas
+    /// size the first given keyframe's aspect ratio sets it; that keyframe is
+    /// stretched onto the canvas and a second one cover-cropped.
+    Keyframes { first: Option<RgbImage>, last: Option<RgbImage> },
+    /// Reference images (`ref2va`), each resampled to a 2048 short edge.
+    References(Vec<RgbImage>),
+}
+
+/// Which transformer weights a pipeline loads: `transformer/` serves the
+/// prompt-only and keyframe tasks, `transformer_ref/` the reference task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H3Partition {
+    #[default]
+    Keyframe,
+    Reference,
+}
+
+impl H3Partition {
+    /// The checkpoint directory of these weights.
+    #[must_use]
+    pub fn dir(self) -> &'static str {
+        match self {
+            Self::Keyframe => "transformer",
+            Self::Reference => "transformer_ref",
+        }
+    }
+}
+
+/// Where one conditioning image sits in the packed sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Anchor {
+    First,
+    Last,
+    Reference,
+}
+
+/// Conditioning images on their final sizes, in packed order, and the canvas.
+#[derive(Debug, Clone)]
+pub(crate) struct Prepared {
+    pub(crate) height: usize,
+    pub(crate) width: usize,
+    pub(crate) images: Vec<(Anchor, RgbImage)>,
 }
 
 /// A generated clip with its stereo soundtrack.
@@ -153,26 +225,39 @@ fn spatial_grid(dim: usize, patch: usize, sqrt_area: f64) -> Vec<f64> {
     (0..n).map(|k| (k as f64 * step + left) * ROPE_SPATIAL_SCALE).collect()
 }
 
-/// Rotary positions and tags of `[prompt | audio | video]`, in that order.
-pub(crate) fn layout(text: usize, s: &H3Shape, patch: [usize; 3]) -> (Vec<[f32; 3]>, Vec<usize>) {
+/// Rotary positions and tags of `[prompt | conditions | audio | video]`.
+/// `conds` gives each conditioning block's time and latent `(h, w)`;
+/// generated audio and video start at time `origin`.
+pub(crate) fn layout(text_tags: &[usize], s: &H3Shape, patch: [usize; 3], conds: &[(f64, usize, usize)], origin: f64) -> (Vec<[f32; 3]>, Vec<usize>) {
     let [pt, ph, pw] = patch;
-    let sqrt_area = ((s.latent_height * s.latent_width) as f64).sqrt();
-    let hg = spatial_grid(s.latent_height, ph, sqrt_area);
-    let wg = spatial_grid(s.latent_width, pw, sqrt_area);
+    let grid = |h: usize, w: usize| {
+        let a = ((h * w) as f64).sqrt();
+        (spatial_grid(h, ph, a), spatial_grid(w, pw, a))
+    };
+    let (hg, wg) = grid(s.latent_height, s.latent_width);
     let mut pos: Vec<[f32; 3]> = Vec::new();
     let mut tags = Vec::new();
-    for i in 0..text {
+    for (i, &tag) in text_tags.iter().enumerate() {
         pos.push([i as f32, 0.0, 0.0]);
-        tags.push(TEXT_TAG);
+        tags.push(tag);
+    }
+    for &(t, h, w) in conds {
+        let (ch, cw) = grid(h, w);
+        for y in &ch {
+            for x in &cw {
+                pos.push([t as f32, *y as f32, *x as f32]);
+                tags.push(VIDEO_TAG);
+            }
+        }
     }
     for ch in 0..AUDIO_CHANNELS {
         let col = if ch == 0 { wg[0] } else { wg[wg.len() - 1] };
         for j in 0..s.audio_latents {
-            pos.push([(text as f64 + j as f64) as f32, 0.0, col as f32]);
+            pos.push([(origin + j as f64) as f32, 0.0, col as f32]);
             tags.push(AUDIO_TAG);
         }
     }
-    let mut t = text as f64;
+    let mut t = origin;
     for f in 0..s.latent_frames / pt {
         for h in &hg {
             for w in &wg {
@@ -183,6 +268,38 @@ pub(crate) fn layout(text: usize, s: &H3Shape, patch: [usize; 3]) -> (Vec<[f32; 
         t += ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[f % ROPE_FRAMES_PER_LATENT.len()];
     }
     (pos, tags)
+}
+
+/// Rotary time of a keyframe anchored at the last latent frame.
+fn last_anchor_time(text: usize, latent_frames: usize) -> f64 {
+    let spans: f64 = (0..latent_frames).map(|f| ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[f % ROPE_FRAMES_PER_LATENT.len()]).sum();
+    text as f64 + spans - ROPE_FRAME_RESCALE
+}
+
+/// Token ids and per-token modality tags of a prompt presentation: per image
+/// a `"<Picture i>: "` label (text) and a vision block of `image_tokens[i]`
+/// pads between start and end markers (video), then the prompt verbatim.
+///
+/// # Errors
+/// A tokenizer without the vision markers.
+pub(crate) fn presentation(tok: &tokenizers::Tokenizer, prompt: &str, image_tokens: &[usize]) -> Result<(Vec<u32>, Vec<usize>)> {
+    let encode = |text: &str| -> Result<Vec<u32>> { Ok(tok.encode(text, false).map_err(|e| Error::Tokenizer(e.to_string()))?.get_ids().to_vec()) };
+    let id = |t: &str| tok.token_to_id(t).ok_or_else(|| Error::Tokenizer(format!("no {t} token")));
+    let (start, pad, end) = (id("<|vision_start|>")?, id("<|image_pad|>")?, id("<|vision_end|>")?);
+    let (mut ids, mut tags) = (Vec::new(), Vec::new());
+    for (i, &n) in image_tokens.iter().enumerate() {
+        let label = encode(&format!("<Picture {}>: ", i + 1))?;
+        tags.extend(std::iter::repeat_n(TEXT_TAG, label.len()));
+        ids.extend(label);
+        ids.push(start);
+        ids.extend(std::iter::repeat_n(pad, n));
+        ids.push(end);
+        tags.extend(std::iter::repeat_n(VIDEO_TAG, n + 2));
+    }
+    let p = encode(prompt)?;
+    tags.extend(std::iter::repeat_n(TEXT_TAG, p.len()));
+    ids.extend(p);
+    Ok((ids, tags))
 }
 
 /// Video latents `[C][T][H][W]` to patch rows `[(T', H', W')][(C, pt, ph, pw)]`.
@@ -243,16 +360,19 @@ fn step(x: &mut [f32], v: &[f32], t: f32, sigma: f32, sigma_next: f32) {
 /// A loaded MiniMax-H3 pipeline.
 pub struct MiniMaxH3Pipeline {
     transformer: MiniMaxH3Transformer,
+    partition: H3Partition,
     vae: H3VideoVae,
     audio_vae: H3AudioVae,
     text: Option<(Qwen3VlEncoder, tokenizers::Tokenizer)>,
+    /// Pixel counts the prompt encoder's image processor keeps unchanged.
+    vision_pixels: (usize, usize),
     video_shift: f32,
     audio_shift: f32,
 }
 
 impl std::fmt::Debug for MiniMaxH3Pipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MiniMaxH3Pipeline").field("device", &self.transformer.device()).finish_non_exhaustive()
+        f.debug_struct("MiniMaxH3Pipeline").field("device", &self.transformer.device()).field("partition", &self.partition).finish_non_exhaustive()
     }
 }
 
@@ -265,41 +385,81 @@ fn shift(files: &CheckpointFiles, dir: &str) -> Result<f32> {
     Ok(s as f32)
 }
 
+/// The image processor's pixel bounds (`processor/preprocessor_config.json`,
+/// else the released ones).
+fn vision_pixels(files: &CheckpointFiles) -> Result<(usize, usize)> {
+    if !files.root.join("processor/preprocessor_config.json").exists() {
+        return Ok((65_536, 16_777_216));
+    }
+    let v = files.json("processor/preprocessor_config.json")?;
+    let get = |k: &str| v["size"][k].as_u64().map(|x| x as usize).ok_or_else(|| Error::Config(format!("processor: no size.{k}")));
+    Ok((get("shortest_edge")?, get("longest_edge")?))
+}
+
+/// Python's `round` (half to even) of a non-negative value.
+fn round_even(v: f64) -> usize {
+    v.round_ties_even() as usize
+}
+
 impl MiniMaxH3Pipeline {
-    /// Load a diffusers-layout checkpoint: `transformer/`, `vae/`,
-    /// `audio_vae/`, `text_encoder/` (only its first 50 layers),
-    /// `tokenizer/tokenizer.json`, `scheduler/` and `audio_scheduler/`.
+    /// Load a diffusers-layout checkpoint: the partition's transformer
+    /// (`transformer/` or `transformer_ref/`), `vae/`, `audio_vae/`,
+    /// `text_encoder/` (only its first 50 layers), `tokenizer/tokenizer.json`,
+    /// `scheduler/`, `audio_scheduler/` and, when present,
+    /// `processor/preprocessor_config.json`.
     ///
     /// # Errors
     /// A missing or malformed part, or no usable backend.
-    pub fn load(files: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
-        let mut p = Self::load_denoiser(files, opts)?;
+    pub fn load(files: &CheckpointFiles, opts: LoadOptions, partition: H3Partition) -> Result<Self> {
+        let mut p = Self::load_denoiser(files, opts, partition)?;
         let enc = Qwen3VlEncoder::load_layers(files, "text_encoder", opts, Some(TEXT_ENCODER_LAYER))?;
         let tok_path = files.root.join("tokenizer/tokenizer.json");
         let tok = tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| Error::Tokenizer(format!("{}: {e}", tok_path.display())))?;
         if enc.config().text_config.hidden_size != p.transformer.config().text_dim {
             return Err(Error::Config("prompt encoder width differs from the transformer's text width".into()));
         }
+        if tok.token_to_id("<|image_pad|>") != Some(enc.config().image_token_id) {
+            return Err(Error::Config("tokenizer and prompt encoder disagree on the image token".into()));
+        }
+        p.vision_pixels = vision_pixels(files)?;
         p.text = Some((enc, tok));
         Ok(p)
     }
 
     /// Everything but the prompt encoder.
-    pub(crate) fn load_denoiser(files: &CheckpointFiles, opts: LoadOptions) -> Result<Self> {
-        let transformer = MiniMaxH3Transformer::load(files, opts)?;
-        let vae = H3VideoVae::load(files, opts)?;
-        let audio_vae = H3AudioVae::load(files, opts)?;
+    pub(crate) fn load_denoiser(files: &CheckpointFiles, opts: LoadOptions, partition: H3Partition) -> Result<Self> {
+        let transformer = MiniMaxH3Transformer::load_dir(files, partition.dir(), opts)?;
+        // 8-bit weights are for the transformer and the prompt encoder; the
+        // autoencoders keep bfloat16.
+        let ae = if opts.precision == Precision::Q8_0 { LoadOptions { precision: Precision::Bf16, ..opts } } else { opts };
+        let vae = H3VideoVae::load(files, ae)?;
+        let audio_vae = H3AudioVae::load(files, ae)?;
         let tc = transformer.config();
         if vae.config().latent_channels != tc.in_channels || audio_vae.config().latent_channels != tc.audio_in_channels {
             return Err(Error::Config("autoencoder latent widths differ from the transformer's".into()));
         }
-        Ok(Self { transformer, vae, audio_vae, text: None, video_shift: shift(files, "scheduler")?, audio_shift: shift(files, "audio_scheduler")? })
+        Ok(Self {
+            transformer,
+            partition,
+            vae,
+            audio_vae,
+            text: None,
+            vision_pixels: (65_536, 16_777_216),
+            video_shift: shift(files, "scheduler")?,
+            audio_shift: shift(files, "audio_scheduler")?,
+        })
     }
 
     /// The device the transformer runs on.
     #[must_use]
     pub fn device(&self) -> &str {
         self.transformer.device()
+    }
+
+    /// The transformer weights this pipeline serves.
+    #[must_use]
+    pub fn partition(&self) -> H3Partition {
+        self.partition
     }
 
     /// Bytes of weights held on the device.
@@ -309,20 +469,40 @@ impl MiniMaxH3Pipeline {
         self.transformer.resident_bytes() + self.vae.resident_bytes() + self.audio_vae.resident_bytes() + text
     }
 
+    /// Canvas sides are multiples of this.
+    fn canvas_multiple(&self) -> usize {
+        self.vae.config().spatial_ratio() * self.transformer.config().patch_size[2] as usize
+    }
+
     /// Resolve a request's geometry as the reference does.
     ///
     /// # Errors
     /// A canvas off the patch grid, or a clip outside 5 to 15 seconds.
     pub fn shape(&self, req: &H3Request) -> Result<H3Shape> {
+        let (h, w) = self.canvas(req)?;
+        self.shape_at(req, h, w)
+    }
+
+    /// The canvas `(height, width)`: the request's, else the first keyframe's
+    /// aspect ratio, else 16:9.
+    fn canvas(&self, req: &H3Request) -> Result<(usize, usize)> {
+        let multiple = self.canvas_multiple();
+        match (req.height, req.width, &req.condition) {
+            (Some(h), Some(w), _) => Ok((h, w)),
+            (None, None, H3Condition::Keyframes { first, last }) => {
+                let k = first.as_ref().or(last.as_ref()).ok_or_else(|| Error::Request("keyframe conditioning needs a keyframe".into()))?;
+                canvas(f64::from(k.width), f64::from(k.height), multiple, CANVAS_SHORT_EDGE, CANVAS_MAX_PIXELS)
+            }
+            (None, None, _) => canvas(16.0, 9.0, multiple, CANVAS_SHORT_EDGE, CANVAS_MAX_PIXELS),
+            _ => Err(Error::Request("height and width go together".into())),
+        }
+    }
+
+    fn shape_at(&self, req: &H3Request, height: usize, width: usize) -> Result<H3Shape> {
         let v = self.vae.config();
         let patch = self.transformer.config().patch_size.map(|p| p as usize);
         let ratio = v.spatial_ratio();
-        let multiple = ratio * patch[2];
-        let (height, width) = match (req.height, req.width) {
-            (Some(h), Some(w)) => (h, w),
-            (None, None) => canvas(16.0, 9.0, multiple, CANVAS_SHORT_EDGE, CANVAS_MAX_PIXELS)?,
-            _ => return Err(Error::Request("height and width go together".into())),
-        };
+        let multiple = self.canvas_multiple();
         if !height.is_multiple_of(multiple) || !width.is_multiple_of(multiple) || height == 0 || width == 0 {
             return Err(Error::Request(format!("height and width must be multiples of {multiple}, got {height}x{width}")));
         }
@@ -350,14 +530,96 @@ impl MiniMaxH3Pipeline {
         Ok(shape)
     }
 
-    fn encode_prompt(&self, prompt: &str) -> Result<Vec<f32>> {
+    /// The canvas and the conditioning images on their final sizes, after
+    /// checking the request against the loaded partition.
+    pub(crate) fn prepare(&self, req: &H3Request) -> Result<Prepared> {
+        let (height, width) = self.canvas(req)?;
+        let (w32, h32) = (width as u32, height as u32);
+        let images = match (&req.condition, self.partition) {
+            (H3Condition::Text, H3Partition::Keyframe) => Vec::new(),
+            (H3Condition::Keyframes { first, last }, H3Partition::Keyframe) => {
+                let given: Vec<(Anchor, &RgbImage)> = [(Anchor::First, first), (Anchor::Last, last)].into_iter().filter_map(|(a, k)| k.as_ref().map(|k| (a, k))).collect();
+                if given.is_empty() {
+                    return Err(Error::Request("keyframe conditioning needs a keyframe".into()));
+                }
+                given
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (a, k))| {
+                        let k = if (k.width, k.height) == (w32, h32) {
+                            k.clone()
+                        } else if i == 0 {
+                            k.lanczos(w32, h32)
+                        } else {
+                            // Cover the canvas, then crop the centre.
+                            let s = (width as f64 / f64::from(k.width)).max(height as f64 / f64::from(k.height));
+                            let rw = width.max(round_even(f64::from(k.width) * s));
+                            let rh = height.max(round_even(f64::from(k.height) * s));
+                            let r = k.lanczos(rw as u32, rh as u32);
+                            let (left, top) = ((rw - width) / 2, (rh - height) / 2);
+                            let mut rgb = Vec::with_capacity(3 * width * height);
+                            for y in top..top + height {
+                                rgb.extend_from_slice(&r.rgb[(y * rw + left) * 3..(y * rw + left + width) * 3]);
+                            }
+                            RgbImage { width: w32, height: h32, rgb }
+                        };
+                        (a, k)
+                    })
+                    .collect()
+            }
+            (H3Condition::References(refs), H3Partition::Reference) => {
+                if refs.is_empty() || refs.len() > MAX_REFERENCE_IMAGES {
+                    return Err(Error::Request(format!("reference conditioning takes 1 to {MAX_REFERENCE_IMAGES} images, got {}", refs.len())));
+                }
+                let m = self.canvas_multiple();
+                refs.iter()
+                    .map(|r| {
+                        let (w, h) = (f64::from(r.width), f64::from(r.height));
+                        if r.width == 0 || r.height == 0 || w > 4.0 * h || h > 4.0 * w {
+                            return Err(Error::Request(format!("a reference image must be within 1:4 and 4:1, got {}x{}", r.width, r.height)));
+                        }
+                        let s = REFERENCE_SHORT_EDGE / w.min(h);
+                        let th = m.max(round_even(h * s / m as f64) * m) as u32;
+                        let tw = m.max(round_even(w * s / m as f64) * m) as u32;
+                        let r = if (r.width, r.height) == (tw, th) { r.clone() } else { r.lanczos(tw, th) };
+                        Ok((Anchor::Reference, r))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            (H3Condition::References(_), H3Partition::Keyframe) => return Err(Error::Request("reference images need the reference-conditioned weights".into())),
+            (_, H3Partition::Reference) => return Err(Error::Request("the reference-conditioned weights need at least one reference image".into())),
+        };
+        Ok(Prepared { height, width, images })
+    }
+
+    /// Prompt states `[tokens][width]` and their modality tags for a prompt
+    /// presented after its conditioning images.
+    fn encode_prompt(&self, prompt: &str, images: &[(Anchor, RgbImage)]) -> Result<(Vec<f32>, Vec<usize>)> {
         let (enc, tok) = self.text.as_ref().ok_or_else(|| Error::Config("no prompt encoder loaded".into()))?;
-        let ids = tok.encode(prompt, false).map_err(|e| Error::Tokenizer(e.to_string()))?;
-        let ids: Vec<u32> = ids.get_ids().to_vec();
-        if ids.is_empty() {
+        let unit = enc.config().image_unit();
+        let mut vl = Vec::with_capacity(images.len());
+        let mut counts = Vec::with_capacity(images.len());
+        for (_, im) in images {
+            let (h, w) = (im.height as usize, im.width as usize);
+            let (lo, hi) = self.vision_pixels;
+            if !(lo..=hi).contains(&(h * w)) {
+                return Err(Error::Request(format!("a {w}x{h} image is outside the prompt encoder's {lo} to {hi} pixels")));
+            }
+            let plane = h * w;
+            let mut px = vec![0f32; 3 * plane];
+            for (i, rgb) in im.rgb.chunks_exact(3).enumerate() {
+                for c in 0..3 {
+                    px[c * plane + i] = f32::from(rgb[c]) / 255.0;
+                }
+            }
+            vl.push(enc.image(&px, (h, w))?);
+            counts.push((h / unit) * (w / unit));
+        }
+        if prompt.trim().is_empty() {
             return Err(Error::Request("empty prompt".into()));
         }
-        enc.forward(&ids, &[])
+        let (ids, tags) = presentation(tok, prompt, &counts)?;
+        Ok((enc.forward(&ids, &vl)?, tags))
     }
 
     /// Generate a clip and its stereo soundtrack.
@@ -366,15 +628,29 @@ impl MiniMaxH3Pipeline {
     /// A request the model cannot serve, or a backend failure.
     pub fn generate(&self, req: &H3Request) -> Result<H3Output> {
         let t0 = Instant::now();
-        let text = self.encode_prompt(&req.prompt)?;
+        let prep = self.prepare(req)?;
+        let (text, tags) = self.encode_prompt(&req.prompt, &prep.images)?;
         let encode_ms = t0.elapsed().as_millis() as u64;
-        let shape = self.shape(req)?;
+        let shape = self.shape_at(req, prep.height, prep.width)?;
         let c = self.vae.config().latent_channels as usize;
         let ac = self.audio_vae.config().latent_channels as usize;
+        let ratio = self.vae.config().spatial_ratio();
+        let sizes: Vec<usize> = prep.images.iter().map(|(_, im)| c * (im.height as usize / ratio) * (im.width as usize / ratio)).collect();
+        let nc: usize = sizes.iter().sum();
         let nv = c * shape.latent_frames * shape.latent_height * shape.latent_width;
         let na = AUDIO_CHANNELS * ac * shape.audio_latents;
-        let noise = gaussian(req.seed, nv + na);
-        let mut d = self.generate_from(&text, req, &noise[..nv], &noise[nv..])?;
+        // Conditioning noise first, then video, then audio.
+        let noise = gaussian(req.seed, nc + nv + na);
+        let mut at = 0;
+        let cond_noise: Vec<Vec<f32>> = sizes
+            .iter()
+            .map(|&n| {
+                at += n;
+                noise[at - n..at].to_vec()
+            })
+            .collect();
+        let eps: Vec<Vec<f32>> = sizes.iter().map(|&n| gaussian(KEYFRAME_ENCODE_SEED, n)).collect();
+        let mut d = self.generate_from(&text, &tags, &prep, &eps, &cond_noise, req, &noise[nc..nc + nv], &noise[nc + nv..])?;
         d.timings.encode_ms = encode_ms;
         let s = d.shape;
         let mut rgb = Vec::with_capacity(d.frames.len());
@@ -408,19 +684,64 @@ impl MiniMaxH3Pipeline {
         Ok(H3Output { video, audio })
     }
 
-    /// The loop and both decoders from prompt states `[tokens][width]`,
-    /// video noise `[C][T][H][W]` and audio noise `[channels][C][T]`.
-    pub(crate) fn generate_from(&self, text: &[f32], req: &H3Request, video_noise: &[f32], audio_noise: &[f32]) -> Result<Decoded> {
-        let s = self.shape(req)?;
+    /// The loop and both decoders from prompt states `[tokens][width]` and
+    /// their tags, the prepared conditioning images with their posterior
+    /// noise (`eps`) and noise-augmentation noise (`cond_noise`), video noise
+    /// `[C][T][H][W]` and audio noise `[channels][C][T]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_from(
+        &self,
+        text: &[f32],
+        text_tags: &[usize],
+        prep: &Prepared,
+        eps: &[Vec<f32>],
+        cond_noise: &[Vec<f32>],
+        req: &H3Request,
+        video_noise: &[f32],
+        audio_noise: &[f32],
+    ) -> Result<Decoded> {
+        let s = self.shape_at(req, prep.height, prep.width)?;
         let tc = self.transformer.config();
         let patch = tc.patch_size.map(|p| p as usize);
         let (c, ac) = (tc.in_channels as usize, tc.audio_in_channels as usize);
+        let pd = tc.patch_dim() as usize;
         let nt = text.len() / tc.text_dim as usize;
         let lat = [s.latent_frames, s.latent_height, s.latent_width];
-        if nt == 0 || nt * tc.text_dim as usize != text.len() || video_noise.len() != c * lat.iter().product::<usize>() || audio_noise.len() != AUDIO_CHANNELS * ac * s.audio_latents {
-            return Err(Error::Request("prompt states or starting noise disagree with the request".into()));
+        if nt == 0
+            || nt * tc.text_dim as usize != text.len()
+            || text_tags.len() != nt
+            || eps.len() != prep.images.len()
+            || cond_noise.len() != prep.images.len()
+            || video_noise.len() != c * lat.iter().product::<usize>()
+            || audio_noise.len() != AUDIO_CHANNELS * ac * s.audio_latents
+        {
+            return Err(Error::Request("prompt states, conditioning or starting noise disagree with the request".into()));
         }
-        let mut video = patchify(video_noise, c, lat, patch);
+        // Conditioning rows: encoded, noised to the augmentation level, packed.
+        let t_aug = KEYFRAME_NOISE_AUG;
+        let mut video = Vec::new();
+        let mut conds = Vec::with_capacity(prep.images.len());
+        let n_refs = prep.images.iter().filter(|(a, _)| *a == Anchor::Reference).count();
+        let mut ref_index = 0;
+        for (((anchor, im), e), n) in prep.images.iter().zip(eps).zip(cond_noise) {
+            let (z, dims) = self.vae.encode_condition(im, e)?;
+            if n.len() != z.len() {
+                return Err(Error::Request("conditioning noise disagrees with its latent".into()));
+            }
+            let z: Vec<f32> = z.iter().zip(n).map(|(x, n)| t_aug * x + (1.0 - t_aug) * n).collect();
+            video.extend(patchify(&z, c, dims, patch));
+            let t = match anchor {
+                Anchor::First => nt as f64,
+                Anchor::Last => last_anchor_time(nt, s.latent_frames),
+                Anchor::Reference => {
+                    ref_index += 1;
+                    (nt + ref_index - 1) as f64
+                }
+            };
+            conds.push((t, dims[1], dims[2]));
+        }
+        let n_cond_rows = video.len() / pd;
+        video.extend(patchify(video_noise, c, lat, patch));
         let n_audio_rows = AUDIO_CHANNELS * s.audio_latents;
         let mut audio = vec![0f32; n_audio_rows * ac];
         for ch in 0..AUDIO_CHANNELS {
@@ -430,8 +751,8 @@ impl MiniMaxH3Pipeline {
                 }
             }
         }
-        let n_video_rows = video.len() / tc.patch_dim() as usize;
-        let (pos, tags) = layout(nt, &s, patch);
+        let n_video_rows = video.len() / pd;
+        let (pos, tags) = layout(text_tags, &s, patch, &conds, (nt + n_refs) as f64);
         let sv = sigmas(req.steps, self.video_shift);
         let sa = sigmas(req.steps, self.audio_shift);
         if sv.len() != sa.len() {
@@ -440,11 +761,16 @@ impl MiniMaxH3Pipeline {
         let t_loop = Instant::now();
         for i in 0..sv.len() - 1 {
             let (tv, ta) = (1.0 - sv[i], 1.0 - sa[i]);
+            let tcond = tv.max(t_aug);
             let mut ts = vec![tv, ta];
+            if n_cond_rows > 0 {
+                ts.push(tcond);
+            }
             ts.sort_by(f32::total_cmp);
             ts.dedup();
             let idx = |t: f32| ts.iter().position(|x| x.total_cmp(&t).is_eq()).expect("present");
             let (iv, ia) = (idx(tv), idx(ta));
+            let ic = if n_cond_rows > 0 { idx(tcond) } else { iv };
             let tokens: Vec<H3Token> = pos
                 .iter()
                 .zip(&tags)
@@ -452,8 +778,10 @@ impl MiniMaxH3Pipeline {
                 .map(|(r, (&p, &tag))| {
                     let (source, timestep) = if r < nt {
                         (H3Source::Text(r), iv)
-                    } else if r < nt + n_audio_rows {
-                        (H3Source::Audio(r - nt), ia)
+                    } else if r < nt + n_cond_rows {
+                        (H3Source::Video(r - nt), ic)
+                    } else if r < nt + n_cond_rows + n_audio_rows {
+                        (H3Source::Audio(r - nt - n_cond_rows), ia)
                     } else {
                         (H3Source::Video(r - nt - n_audio_rows), iv)
                     };
@@ -462,12 +790,13 @@ impl MiniMaxH3Pipeline {
                 .collect();
             debug_assert_eq!(tokens.len(), nt + n_audio_rows + n_video_rows);
             let (vv, va) = self.transformer.forward(&H3Input { video: &video, audio: &audio, text, timesteps: &ts, tokens: &tokens })?;
-            step(&mut video, &vv, tv, sv[i], sv[i + 1]);
+            let k = n_cond_rows * pd;
+            step(&mut video[k..], &vv[k..], tv, sv[i], sv[i + 1]);
             step(&mut audio, &va, ta, sa[i], sa[i + 1]);
         }
         let denoise_ms = t_loop.elapsed().as_millis() as u64;
         let t_dec = Instant::now();
-        let z = unpatchify(&video, c, lat, patch);
+        let z = unpatchify(&video[n_cond_rows * pd..], c, lat, patch);
         let (mut frames, _) = self.vae.decode(&z, s.latent_frames, s.latent_height, s.latent_width)?;
         to_unit_rgb(&mut frames);
         let mut wave = Vec::new();
@@ -492,7 +821,6 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::pipeline::Precision;
     use crate::qwen_image::parity::{assert_close, bin};
 
     #[test]
@@ -505,16 +833,13 @@ mod tests {
         assert_eq!(unpatchify(&patchify(&z, 2, [2, 4, 6], [1, 2, 2]), 2, [2, 4, 6], [1, 2, 2]), z);
     }
 
-    fn run(precision: Precision, min_cos: f64, max_rel: f64) {
-        let d = PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_PIPELINE").expect("PRAECISE_MINIMAX_H3_PIPELINE names the fixture dir"));
-        let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+    fn opts(precision: Precision) -> LoadOptions {
         let threads = std::thread::available_parallelism().map_or(8, usize::from);
-        let p = MiniMaxH3Pipeline::load_denoiser(&CheckpointFiles::new(d.join("checkpoint")), LoadOptions { precision, cpu_threads: threads, device: None }).unwrap();
-        let u = |k: &str| m[k].as_u64().unwrap() as usize;
-        let req = H3Request { num_frames: u("frames"), height: Some(u("height")), width: Some(u("width")), steps: u("steps"), ..H3Request::default() };
-        let out = p.generate_from(&bin(&d, "text"), &req, &bin(&d, "video_noise"), &bin(&d, "audio_noise")).unwrap();
-        assert_eq!((out.shape.latent_frames, out.shape.audio_latents), (u("latent_frames"), u("audio_latents")));
-        // Reference frames are [T][3][H][W].
+        LoadOptions { precision, cpu_threads: threads, device: None }
+    }
+
+    /// Reference frames are `[T][3][H][W]`; ours `[3][T][H][W]`.
+    fn check_outputs(out: &Decoded, d: &std::path::Path, min_cos: f64, max_rel: f64) {
         let (h, w) = (out.shape.height, out.shape.width);
         let nf = out.frames.len() / (3 * h * w);
         let mut ours = vec![0f32; out.frames.len()];
@@ -523,8 +848,133 @@ mod tests {
                 ours[(f * 3 + c) * h * w..(f * 3 + c + 1) * h * w].copy_from_slice(&out.frames[(c * nf + f) * h * w..(c * nf + f + 1) * h * w]);
             }
         }
-        assert_close("frames", &ours, &bin(&d, "frames"), min_cos, max_rel);
-        assert_close("waveform", &out.wave, &bin(&d, "waveform"), min_cos, max_rel);
+        assert_close("frames", &ours, &bin(d, "frames"), min_cos, max_rel);
+        assert_close("waveform", &out.wave, &bin(d, "waveform"), min_cos, max_rel);
+    }
+
+    fn run(precision: Precision, min_cos: f64, max_rel: f64) {
+        let d = PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_PIPELINE").expect("PRAECISE_MINIMAX_H3_PIPELINE names the fixture dir"));
+        let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+        let p = MiniMaxH3Pipeline::load_denoiser(&CheckpointFiles::new(d.join("checkpoint")), opts(precision), H3Partition::Keyframe).unwrap();
+        let u = |k: &str| m[k].as_u64().unwrap() as usize;
+        let req = H3Request { num_frames: u("frames"), height: Some(u("height")), width: Some(u("width")), steps: u("steps"), ..H3Request::default() };
+        let text = bin(&d, "text");
+        let tags = vec![TEXT_TAG; text.len() / p.transformer.config().text_dim as usize];
+        let prep = Prepared { height: u("height"), width: u("width"), images: Vec::new() };
+        let out = p.generate_from(&text, &tags, &prep, &[], &[], &req, &bin(&d, "video_noise"), &bin(&d, "audio_noise")).unwrap();
+        assert_eq!((out.shape.latent_frames, out.shape.audio_latents), (u("latent_frames"), u("audio_latents")));
+        check_outputs(&out, &d, min_cos, max_rel);
+    }
+
+    fn condition_dir() -> PathBuf {
+        PathBuf::from(std::env::var("PRAECISE_MINIMAX_H3_CONDITION").expect("PRAECISE_MINIMAX_H3_CONDITION names the fixture dir"))
+    }
+
+    fn rgb(d: &std::path::Path, name: &str, size: &Value) -> RgbImage {
+        let (w, h) = (size[0].as_u64().unwrap() as u32, size[1].as_u64().unwrap() as u32);
+        let rgb = std::fs::read(d.join(format!("{name}.rgb"))).unwrap();
+        assert_eq!(rgb.len(), 3 * (w * h) as usize);
+        RgbImage { width: w, height: h, rgb }
+    }
+
+    fn run_condition(task: &str, partition: H3Partition, precision: Precision, min_cos: f64, max_rel: f64) {
+        let root = condition_dir();
+        let d = root.join(task);
+        let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+        let p = MiniMaxH3Pipeline::load_denoiser(&CheckpointFiles::new(root.join("checkpoint")), opts(precision), partition).unwrap();
+        let u = |k: &str| m[k].as_u64().unwrap() as usize;
+        let n = m["images"].as_array().unwrap().len();
+        let images: Vec<(Anchor, RgbImage)> = (0..n)
+            .map(|i| {
+                let a = match m["anchors"][i].as_str().unwrap() {
+                    "first" => Anchor::First,
+                    "last" => Anchor::Last,
+                    _ => Anchor::Reference,
+                };
+                (a, rgb(&d, &format!("image_{i}"), &m["images"][i]))
+            })
+            .collect();
+        let eps: Vec<Vec<f32>> = (0..n).map(|i| bin(&d, &format!("eps_{i}"))).collect();
+        let noise: Vec<Vec<f32>> = (0..n).map(|i| bin(&d, &format!("cond_noise_{i}"))).collect();
+        // The conditioning latents alone first.
+        let mut lat = Vec::new();
+        for ((_, im), e) in images.iter().zip(&eps) {
+            lat.extend(p.vae.encode_condition(im, e).unwrap().0);
+        }
+        assert_close("conditions", &lat, &bin(&d, "conditions"), min_cos, max_rel);
+        let tags: Vec<usize> = m["tags"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as usize).collect();
+        let req = H3Request { num_frames: u("frames"), height: Some(u("height")), width: Some(u("width")), steps: u("steps"), ..H3Request::default() };
+        let prep = Prepared { height: u("height"), width: u("width"), images };
+        let out = p.generate_from(&bin(&d, "text"), &tags, &prep, &eps, &noise, &req, &bin(&d, "video_noise"), &bin(&d, "audio_noise")).unwrap();
+        check_outputs(&out, &d, min_cos, max_rel);
+    }
+
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_fl2va_f32() {
+        run_condition("fl2va", H3Partition::Keyframe, Precision::F32, 0.999_99, 1e-3);
+    }
+
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_fl2va_bf16() {
+        run_condition("fl2va", H3Partition::Keyframe, Precision::Bf16, 0.999, 5e-2);
+    }
+
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_ref2va_f32() {
+        run_condition("ref2va", H3Partition::Reference, Precision::F32, 0.999_99, 1e-3);
+    }
+
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_ref2va_bf16() {
+        run_condition("ref2va", H3Partition::Reference, Precision::Bf16, 0.999, 5e-2);
+    }
+
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_presentation() {
+        let d = condition_dir().join("present");
+        let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+        let tok = tokenizers::Tokenizer::from_file(d.join("tokenizer.json")).unwrap();
+        // Released image processor: 16 px patches merged 2x2.
+        let counts: Vec<usize> = m["sizes"].as_array().unwrap().iter().map(|s| (s[0].as_u64().unwrap() as usize / 32) * (s[1].as_u64().unwrap() as usize / 32)).collect();
+        let (ids, tags) = presentation(&tok, m["prompt"].as_str().unwrap(), &counts).unwrap();
+        for task in ["fl2va", "ref2va"] {
+            let want: Vec<u32> = m[task]["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            let want_tags: Vec<usize> = m[task]["tags"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+            assert_eq!(ids, want, "{task} ids");
+            assert_eq!(tags, want_tags, "{task} tags");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_lanczos() {
+        let d = condition_dir().join("lanczos");
+        let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
+        let src = rgb(&d, "src", &m["src"]);
+        for (i, size) in m["outs"].as_array().unwrap().iter().enumerate() {
+            let want = rgb(&d, &format!("out_{i}"), size);
+            let got = src.lanczos(want.width, want.height);
+            let off = got.rgb.iter().zip(&want.rgb).filter(|(a, b)| a != b).count();
+            assert_eq!(off, 0, "{}x{}: {off} bytes differ", want.width, want.height);
+        }
+    }
+
+    #[test]
+    fn conditioning_layout() {
+        // A last keyframe sits one span-unit before the end of the frame times.
+        assert!((last_anchor_time(5, 2) - (5.0 + 5.0 / 3.0 * 5.0 - 5.0 / 3.0)).abs() < 1e-12);
+        let s = H3Shape { frames: 124, height: 16, width: 24, latent_frames: 2, latent_height: 4, latent_width: 6, audio_latents: 3 };
+        let (pos, tags) = layout(&[1, 0, 1], &s, [1, 2, 2], &[(3.0, 4, 4)], 4.0);
+        assert_eq!(pos.len(), 3 + 4 + 2 * 3 + 2 * 6);
+        assert_eq!(&tags[..3], &[1, 0, 1]);
+        assert!(tags[3..7].iter().all(|&t| t == VIDEO_TAG));
+        assert_eq!(pos[7][0], 4.0);
+        assert_eq!(pos[3 + 4 + 6][0], 4.0);
     }
 
     #[test]
@@ -537,5 +987,11 @@ mod tests {
     #[ignore = "needs the reference fixtures"]
     fn minimax_h3_parity_pipeline_bf16() {
         run(Precision::Bf16, 0.999, 5e-2);
+    }
+
+    #[test]
+    #[ignore = "needs the reference fixtures"]
+    fn minimax_h3_parity_pipeline_q8_0() {
+        run(Precision::Q8_0, 0.999, 5e-2);
     }
 }

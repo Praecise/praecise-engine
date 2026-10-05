@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::ggml::{Backend, Graph, HostTensor, Tn, WType, Weights};
-use crate::pipeline::{parse, CheckpointFiles, LoadOptions, Precision};
+use crate::pipeline::{parse, CheckpointFiles, LoadOptions, Precision, RgbImage};
 use crate::safetensors::SafeTensors;
 use llama_cpp_sys_2 as sys;
 
@@ -519,12 +519,62 @@ impl H3VideoVae {
     /// # Errors
     /// A pixel buffer that disagrees with its shape, or a backend failure.
     pub fn encode(&self, pixels: &[f32], frames: usize, height: usize, width: usize) -> Result<(Vec<f32>, [usize; 3])> {
+        let z = self.moments(pixels, frames, height, width)?;
+        let l = self.cfg.latent_channels as usize;
+        let mut z = z.take(0, 0, l);
+        let plane = z.len(1) * z.len(2) * z.len(3);
+        for (ch, p) in z.d.chunks_exact_mut(plane).enumerate() {
+            let (m, s) = (self.cfg.latents_mean[ch], self.cfg.latents_std[ch]);
+            for v in p {
+                *v = (*v - m) / s;
+            }
+        }
+        let dims = [z.len(1), z.len(2), z.len(3)];
+        Ok((z.d, dims))
+    }
+
+    /// Latent `[C][1][H][W]` of one 8-bit image, as a conditioning anchor:
+    /// ImageNet-normalised pixels, the posterior sampled with `eps` (standard
+    /// normal noise of the latent's size), rounded to float16, normalised.
+    ///
+    /// # Errors
+    /// Noise of the wrong size, or a backend failure.
+    pub fn encode_condition(&self, image: &RgbImage, eps: &[f32]) -> Result<(Vec<f32>, [usize; 3])> {
+        let (h, w) = (image.height as usize, image.width as usize);
+        let plane = h * w;
+        let mut px = vec![0f32; 3 * plane];
+        for (i, rgb) in image.rgb.chunks_exact(3).enumerate() {
+            for c in 0..3 {
+                px[c * plane + i] = f32::from(rgb[c]) / 255.0;
+            }
+        }
+        from_unit_rgb(&mut px);
+        let z = self.moments(&px, 1, h, w)?;
+        let l = self.cfg.latent_channels as usize;
+        let n = l * z.len(1) * z.len(2) * z.len(3);
+        if eps.len() != n {
+            return Err(Error::Request(format!("posterior noise has {} values, the latent {n}", eps.len())));
+        }
+        let lat = z.len(1) * z.len(2) * z.len(3);
+        let mut out = Vec::with_capacity(n);
+        for (i, &e) in eps.iter().enumerate() {
+            let ch = i / lat;
+            let (mean, logvar) = (z.d[i], z.d[n + i].clamp(-30.0, 20.0));
+            let v = half::f16::from_f32(mean + (0.5 * logvar).exp() * e).to_f32();
+            out.push((v - self.cfg.latents_mean[ch]) / self.cfg.latents_std[ch]);
+        }
+        Ok((out, [z.len(1), z.len(2), z.len(3)]))
+    }
+
+    /// Posterior moments `[2 C][T][H][W]` (mean channels, then log-variance)
+    /// of pixels `[3][frames][height][width]`.
+    fn moments(&self, pixels: &[f32], frames: usize, height: usize, width: usize) -> Result<Vol> {
         let c = self.cfg.in_channels as usize;
         if frames == 0 || height < 2 || width < 2 || pixels.len() != c * frames * height * width {
             return Err(Error::Request("video pixels disagree with their shape".into()));
         }
         let x = Vol::new([c, frames, height, width], pixels.to_vec());
-        let mut z = if frames == 1 {
+        let z = if frames == 1 {
             self.encode_clip(&x)?
         } else {
             let clip = self.cfg.clip_length;
@@ -541,15 +591,7 @@ impl H3VideoVae {
             let z = Vol::cat(&clips, 1);
             z.take(1, 0, z.len(1).saturating_sub(self.cfg.token_drop))
         };
-        let plane = z.len(1) * z.len(2) * z.len(3);
-        for (ch, p) in z.d.chunks_exact_mut(plane).enumerate() {
-            let (m, s) = (self.cfg.latents_mean[ch], self.cfg.latents_std[ch]);
-            for v in p {
-                *v = (*v - m) / s;
-            }
-        }
-        let dims = [z.len(1), z.len(2), z.len(3)];
-        Ok((z.d, dims))
+        Ok(z)
     }
 
     /// Decode normalised latents `[C][frames][height][width]` to pixels
@@ -695,16 +737,16 @@ impl H3VideoVae {
         g.compute()?;
         let out = g.read_f32(y);
         let (ow, oh, oc, ot) = (y.ne(0) as usize, y.ne(1) as usize, y.ne(2) as usize, y.ne(3) as usize);
-        let l = cfg.latent_channels as usize;
+        // Mean and log-variance channels both: the moments.
         let p = oh * ow;
-        let mut m = Vec::with_capacity(l * ot * p);
-        for ch in 0..l {
+        let mut m = Vec::with_capacity(oc * ot * p);
+        for ch in 0..oc {
             for f in 0..ot {
                 let o = (f * oc + ch) * p;
                 m.extend_from_slice(&out[o..o + p]);
             }
         }
-        Ok(Vol::new([l, ot, oh, ow], m))
+        Ok(Vol::new([oc, ot, oh, ow], m))
     }
 
     /// The decoder on one clip tile of raw latents.
