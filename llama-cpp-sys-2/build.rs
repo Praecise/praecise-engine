@@ -1072,6 +1072,28 @@ fn main() {
                 println!("cargo:rustc-link-search={}", vulkan_lib_path.display());
                 println!("cargo:rustc-link-lib=vulkan-1");
 
+                // Point CMake at the SDK explicitly. A cross build (cargo-xwin
+                // from Linux) confines CMake's own search to the target sysroot,
+                // where the SDK is not, and runs the host's glslc. VULKAN_GLSLC
+                // overrides the shader compiler; SPIRV_HEADERS_DIR names the
+                // directory holding SPIRV-HeadersConfig.cmake when CMake cannot
+                // find it on its own.
+                println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+                println!("cargo:rerun-if-env-changed=VULKAN_GLSLC");
+                println!("cargo:rerun-if-env-changed=SPIRV_HEADERS_DIR");
+                let vulkan_root = Path::new(&vulkan_path);
+                config.define("Vulkan_INCLUDE_DIR", vulkan_root.join("Include"));
+                config.define("Vulkan_LIBRARY", vulkan_lib_path.join("vulkan-1.lib"));
+                let glslc = env::var_os("VULKAN_GLSLC").map(PathBuf::from).unwrap_or_else(|| {
+                    vulkan_root
+                        .join("Bin")
+                        .join(if cfg!(windows) { "glslc.exe" } else { "glslc" })
+                });
+                config.define("Vulkan_GLSLC_EXECUTABLE", glslc);
+                if let Ok(spirv_dir) = env::var("SPIRV_HEADERS_DIR") {
+                    config.define("SPIRV-Headers_DIR", spirv_dir);
+                }
+
                 // workaround for this error: "FileTracker : error FTK1011: could not create the new file tracking log file"
                 // it has to do with MSBuild FileTracker not respecting the path
                 // limit configuration set in the windows registry.
