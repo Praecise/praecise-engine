@@ -280,6 +280,32 @@ mod backend_tests {
         }
     }
 
+    /// Zero padding and a roll along a dimension longer than one GPU grid
+    /// dimension holds.
+    #[test]
+    fn padding_covers_more_rows_than_one_grid_dimension() {
+        // A waveform feature map: a few channels over more time steps than a
+        // GPU launch holds in one grid dimension.
+        let backend = Backend::select(8).unwrap();
+        let (c, t, pad) = (8usize, 70_000usize, 3usize);
+        let mut g = Graph::new(&backend).unwrap();
+        let x = g.input(sys::GGML_TYPE_F32, &[c as i64, t as i64]);
+        let y = g.pad_end(x, 0, pad as i32);
+        let y = g.roll(y, 0, 1);
+        g.finish(&[y]).unwrap();
+        let xd: Vec<f32> = (0..c * t).map(|i| (i % 977) as f32 + 1.0).collect();
+        g.set_f32(x, &xd);
+        g.compute().unwrap();
+        let got = g.read_f32(y);
+        assert_eq!(got.len(), c * (t + pad));
+        for col in 0..t + pad {
+            for ch in 0..c {
+                let want = if (1..=t).contains(&col) { xd[(col - 1) * c + ch] } else { 0.0 };
+                assert_eq!(got[col * c + ch], want, "channel {ch} column {col}");
+            }
+        }
+    }
+
     /// Flash attention against a direct computation, at key lengths that are
     /// not a multiple of any tile and query counts wide enough for the
     /// pipelined kernels, with and without a mask.
