@@ -59,7 +59,10 @@ impl TrainTensor {
     /// Whether the tensor is a trainable parameter of a gradient context.
     #[must_use]
     pub fn is_param(&self) -> bool {
-        unsafe { (*self.ptr.as_ptr()).flags & llama_cpp_sys_2::GGML_TENSOR_FLAG_PARAM.cast_signed() != 0 }
+        // The flag constant is unsigned on some targets and signed on others
+        // (Windows); both widen losslessly to i64.
+        let flags = unsafe { (*self.ptr.as_ptr()).flags };
+        i64::from(flags) & i64::from(llama_cpp_sys_2::GGML_TENSOR_FLAG_PARAM) != 0
     }
 
     /// Copies the values out of the tensor's device buffer.
