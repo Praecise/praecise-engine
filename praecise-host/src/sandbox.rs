@@ -23,7 +23,7 @@
 //! before anything else. When the kernel refuses unprivileged user namespaces
 //! the host is not started at all, and the error names the setting to change.
 
-use std::ffi::{CString, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -140,17 +140,16 @@ pub fn enter_if_requested() {
     }
 }
 
-fn cstring(p: &Path) -> std::result::Result<CString, String> {
-    use std::os::unix::ffi::OsStrExt;
-    CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("path {} contains NUL", p.display()))
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Confinement, cstring};
+    use super::Confinement;
     use std::ffi::{CString, OsString};
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
+
+    fn cstring(p: &std::path::Path) -> std::result::Result<CString, String> {
+        CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("path {} contains NUL", p.display()))
+    }
 
     fn errno() -> std::io::Error {
         std::io::Error::last_os_error()
