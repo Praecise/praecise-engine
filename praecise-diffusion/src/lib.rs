@@ -42,6 +42,7 @@ pub mod schedule;
 pub mod umt5;
 pub mod unipc;
 pub mod vae;
+pub mod vla;
 pub mod video;
 pub mod wan;
 pub mod wan_dit;
