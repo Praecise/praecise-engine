@@ -1,0 +1,16 @@
+[package]
+name = "praecise-provenance"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine content credentials: signed C2PA manifests embedded in generated PNG, WAV and MP4 files, and their verification, with the signing key behind a caller-supplied signer."
+
+[dependencies]
+thiserror = "2"
+sha2 = "0.10"
+
+[dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa"] }
+
+[lints]
+workspace = true

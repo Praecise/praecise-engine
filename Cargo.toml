@@ -8,6 +8,7 @@ members = [
   "praecise-codec",
   "praecise-onnx",
   "praecise-moe",
+  "praecise-provenance",
   "praecise-train",
   "llama-cpp-sys-2",
   "llama-cpp-2",
