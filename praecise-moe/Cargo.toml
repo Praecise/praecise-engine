@@ -1,0 +1,33 @@
+[package]
+name = "praecise-moe"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine expert-parallel MoE execution: per-expert SwiGLU FFNs from safetensors blobs, top-k gating, GGUF block-quantized expert weights, a byte-bounded expert residency cache, and the combine step, on the CPU, CUDA (cuBLAS) or any other GPU through wgpu."
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+dashmap = "6"
+base64 = "0.22"
+sha2 = "0.10"
+ndarray = "0.16"
+safetensors = "0.8"
+half = "2"
+# Available memory, for the auto-sized expert residency budget.
+sysinfo = "0.31"
+# NVIDIA: cuBLAS grouped GEMM for expert projections. The driver is loaded at
+# run time.
+cudarc = { version = "0.12", optional = true, default-features = false, features = ["cuda-12040", "cublas", "driver"] }
+# Any other GPU: WGSL compute through wgpu.
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]

@@ -1,0 +1,62 @@
+[package]
+name = "praecise-onnx"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine ONNX model families: speech-to-text, object detection, promptable and text-prompted segmentation, image encoders, time-series forecasting and text embedding, on ONNX Runtime with the execution provider the machine's GPU needs."
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+base64 = "0.22"
+# ONNX Runtime. `download-binaries` fetches a prebuilt runtime where one
+# exists; a target with no prebuilt CUDA download links a CUDA ONNX Runtime
+# through ORT_LIB_LOCATION. `copy-dylibs` places the execution-provider
+# libraries (libonnxruntime_providers_*.so) next to the built binary.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+  "std",
+  "ndarray",
+  "download-binaries",
+  "copy-dylibs",
+] }
+ndarray = "0.16"
+# Image decode and resize for vision, detection and segmentation inputs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Tokenizers for text encoders and speech decoders. `onig` enables the
+# SentencePiece pre-tokenizer used by XLM-R-family models.
+tokenizers = { version = "0.20", default-features = false, features = ["onig", "esaxx_fast"] }
+# Audio decode, resample and FFT for speech-to-text.
+hound = "3.5"
+symphonia = { version = "0.5", default-features = false, features = [
+  "mp3",
+  "flac",
+  "wav",
+  "isomp4",
+  "ogg",
+  "vorbis",
+] }
+rubato = "0.16"
+realfft = "3.4"
+# Probes whether the TensorRT runtime library is installed, so a CUDA build
+# puts the TensorRT execution provider ahead of CUDA only where it can load.
+libloading = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# NVIDIA: the CUDA and TensorRT execution providers.
+cuda = ["ort/cuda", "ort/tensorrt", "dep:libloading"]
+# AMD: the ROCm and MIGraphX execution providers (needs a ROCm-built ONNX
+# Runtime through ORT_LIB_LOCATION).
+rocm = ["ort/rocm", "ort/migraphx"]
+# Marks a build whose GPU path is Vulkan. ONNX Runtime has no Vulkan
+# provider, so such a build refuses ONNX models on an NVIDIA or AMD GPU
+# instead of running them on the CPU.
+vulkan = []
+# Apple: the CoreML execution provider.
+coreml = ["ort/coreml"]

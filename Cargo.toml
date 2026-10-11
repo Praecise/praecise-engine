@@ -6,6 +6,8 @@ members = [
   "praecise-host",
   "praecise-diffusion",
   "praecise-codec",
+  "praecise-onnx",
+  "praecise-moe",
   "praecise-train",
   "llama-cpp-sys-2",
   "llama-cpp-2",

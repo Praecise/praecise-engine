@@ -218,6 +218,15 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `praecise-codec` — in-process video coding: H.264, H.265 and AV1 decoding
   from MP4 and Matroska/WebM, H.264 and AV1 encoding to MP4 (AV1 also to
   WebM) with an Opus soundtrack. Generated videos are written as MP4.
+- `praecise-onnx` — the ONNX model families: speech-to-text, object
+  detection, promptable and text-prompted segmentation, image encoders,
+  time-series forecasting and text embedding. Sessions register the execution
+  provider the machine's GPU needs (CUDA/TensorRT, ROCm/MIGraphX, CoreML) and
+  refuse a model they cannot accelerate rather than running it on the CPU.
+- `praecise-moe` — expert-parallel mixture-of-experts execution: expert FFNs
+  and gating from safetensors blobs, GGUF block-quantized expert weights, a
+  memory and disk residency cache, and the combine step, on the CPU, CUDA or
+  any other GPU through wgpu.
 
 ## Consuming Praecise Engine
 
