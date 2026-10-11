@@ -284,6 +284,26 @@ impl LlamaContext<'_> {
             })
             .collect()
     }
+
+    /// Distinct `(op, backend)` pairs of the graph the last [`Self::grad_sequence`] evaluated:
+    /// each op with the backend device the scheduler ran it on (`CPU`, `CUDA0`, ...), in
+    /// ascending order.
+    #[must_use]
+    pub fn grad_graph_placements(&self) -> Vec<(String, String)> {
+        let ctx = self.context.as_ptr();
+        let n = unsafe { llama_cpp_sys_2::llama_opt_grad_n_placements(ctx) };
+        (0..n)
+            .filter_map(|i| {
+                let p = unsafe { llama_cpp_sys_2::llama_opt_grad_placement(ctx, i) };
+                if p.is_null() {
+                    return None;
+                }
+                let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+                let (op, backend) = s.split_once('@')?;
+                Some((op.to_string(), backend.to_string()))
+            })
+            .collect()
+    }
 }
 
 impl LlamaModel {

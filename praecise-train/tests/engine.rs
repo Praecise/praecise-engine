@@ -3,6 +3,8 @@
 //! log-probs the trainer computes.
 
 #![cfg(feature = "engine")]
+// These steps run on the CPU kernel class: in a build with an accelerator, hide it
+// (`CUDA_VISIBLE_DEVICES=`), or deterministic mode refuses the ops that land on it.
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::float_cmp, clippy::case_sensitive_file_extension_comparisons)]
 
 use std::num::NonZeroU32;
@@ -219,14 +221,14 @@ fn refusals() {
     let empty = StepBatch::Sft(vec![SftExample { tokens: vec![1, 2, 3], target_mask: vec![false, false, false] }]);
     assert!(matches!(t.step(&empty), Err(Error::Refused(_))));
     assert!(matches!(t.step(&StepBatch::Dpo(vec![])), Err(Error::Refused(m)) if m.contains("objective")));
-    // deterministic mode on a backend whose kernel set is not audited refuses the step and
-    // leaves the state unchanged
+    // a deterministic run on a device the graph did not run on (here the CPU model asked to
+    // run on CUDA) refuses the step and leaves the state unchanged
     let r = recipe(adamw());
     let path = adapter_file(&r, 1);
     let gpu = EngineConfig { n_ctx: N_CTX, n_threads: 2, deterministic: Some(Backend::Cuda), pooling: None };
     let mut t = LoraTrainer::new(backend(), model(), &path, r, gpu).unwrap();
     let before = t.state().unwrap().state_root();
-    assert!(matches!(t.step(&batch(0)), Err(Error::Refused(m)) if m.contains("deterministic")));
+    assert!(matches!(t.step(&batch(0)), Err(Error::Refused(m)) if m.contains("does not leave the device")));
     assert_eq!(t.state().unwrap().state_root(), before);
     assert_eq!(t.steps_taken(), 0);
 

@@ -163,15 +163,129 @@ pub fn resolve_device(
 /// `ARGMAX` is per row with ties to the lowest index, and `COUNT_EQUAL` adds
 /// integers, which is exact in any order.
 ///
-/// GPU kernel sets are not yet audited; until they are, deterministic mode
-/// refuses every op on them rather than claiming reproducibility it has not
-/// measured.
+/// CUDA kernels reduce inside a block in a fixed order and write each output
+/// element once; none of the listed ops accumulates floats with atomics (only
+/// the multi-device all-reduce and `COUNT_EQUAL`, which adds integers, use
+/// them). Matrix products go through cuBLAS, which is bitwise reproducible run
+/// to run on one architecture with one SM count, or through the quantized
+/// kernels, whose stream-k fixup adds the partial tiles of preceding blocks in
+/// block order; both choose their split from the SM count, so the CUDA device
+/// architecture of a kernel class names it. Flash attention is not in the set:
+/// a training context turns it off.
+///
+/// Metal and Vulkan kernel sets are not yet audited; until they are,
+/// deterministic mode refuses every op on them rather than claiming
+/// reproducibility it has not measured.
 #[must_use]
 pub fn deterministic_ops(backend: Backend) -> &'static [&'static str] {
     match backend {
         Backend::Cpu => CPU_DETERMINISTIC,
-        Backend::Cuda | Backend::Metal | Backend::Vulkan => &[],
+        Backend::Cuda => CUDA_DETERMINISTIC,
+        Backend::Metal | Backend::Vulkan => &[],
     }
+}
+
+const CUDA_DETERMINISTIC: &[&str] = &[
+    "NONE",
+    "DUP",
+    "ADD",
+    "ADD1",
+    "ACC",
+    "SUB",
+    "MUL",
+    "DIV",
+    "SQR",
+    "SQRT",
+    "LOG",
+    "SIN",
+    "COS",
+    "SUM",
+    "SUM_ROWS",
+    "ARGMAX",
+    "COUNT_EQUAL",
+    "MEAN",
+    "REPEAT",
+    "REPEAT_BACK",
+    "CONCAT",
+    "NORM",
+    "RMS_NORM",
+    "RMS_NORM_BACK",
+    "MUL_MAT",
+    "MUL_MAT_ID",
+    "OUT_PROD",
+    "SCALE",
+    "SET",
+    "CPY",
+    "CONT",
+    "RESHAPE",
+    "VIEW",
+    "PERMUTE",
+    "TRANSPOSE",
+    "GET_ROWS",
+    "GET_ROWS_BACK",
+    "SET_ROWS",
+    "DIAG_MASK_INF",
+    "SOFT_MAX",
+    "SOFT_MAX_BACK",
+    "ROPE",
+    "ROPE_BACK",
+    "CLAMP",
+    "UNARY",
+    "GLU",
+    "CROSS_ENTROPY_LOSS",
+    "CROSS_ENTROPY_LOSS_BACK",
+    "OPT_STEP_ADAMW",
+    "OPT_STEP_SGD",
+    "SILU_BACK",
+];
+
+/// Ops that compute nothing: they describe a tensor over another one's memory.
+const NO_COMPUTE: &[&str] = &["NONE", "RESHAPE", "VIEW", "PERMUTE", "TRANSPOSE"];
+
+/// The backend a scheduler device name (`CPU`, `CUDA0`, `Metal`, `Vulkan0`) belongs to.
+#[must_use]
+pub fn backend_of_device(name: &str) -> Option<Backend> {
+    let lower = name.to_ascii_lowercase();
+    if lower == "cpu" {
+        Some(Backend::Cpu)
+    } else if lower.starts_with("cuda") {
+        Some(Backend::Cuda)
+    } else if lower.starts_with("metal") || lower.starts_with("mtl") {
+        Some(Backend::Metal)
+    } else if lower.starts_with("vulkan") {
+        Some(Backend::Vulkan)
+    } else {
+        None
+    }
+}
+
+/// Checks where every op of a graph ran, as `(op, device)` pairs, against a run
+/// on `backend`: every op runs on that backend, except the input embedding
+/// lookup (`GET_ROWS`), which the engine keeps beside the token table on the
+/// host, and ops that compute nothing. Each op must be in the deterministic
+/// set of the backend it ran on.
+///
+/// # Errors
+/// [`Error::Refused`] naming the first op that ran elsewhere or has no
+/// deterministic variant where it ran.
+pub fn check_placements<'a>(
+    backend: Backend,
+    placements: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<(), Error> {
+    for (op, device) in placements {
+        if NO_COMPUTE.contains(&op) {
+            continue;
+        }
+        let ran_on = backend_of_device(device)
+            .ok_or_else(|| Error::Refused(format!("op {op} ran on an unknown device {device}")))?;
+        if ran_on != backend && !(ran_on == Backend::Cpu && op == "GET_ROWS") {
+            return Err(Error::Refused(format!(
+                "op {op} ran on {device}, not on {backend}: a run does not leave the device it asked for"
+            )));
+        }
+        check_deterministic(ran_on, [op])?;
+    }
+    Ok(())
 }
 
 const CPU_DETERMINISTIC: &[&str] = &[
@@ -300,6 +414,23 @@ mod tests {
     fn unaudited_ops_and_backends_are_refused() {
         check_deterministic(Backend::Cpu, ["MUL_MAT", "OUT_PROD", "FLASH_ATTN_EXT"]).unwrap();
         assert!(check_deterministic(Backend::Cpu, ["MUL_MAT", "RWKV_WKV7"]).is_err());
-        assert!(check_deterministic(Backend::Cuda, ["MUL_MAT"]).is_err());
+        check_deterministic(Backend::Cuda, ["MUL_MAT", "OUT_PROD", "ROPE_BACK"]).unwrap();
+        assert!(check_deterministic(Backend::Cuda, ["FLASH_ATTN_EXT"]).is_err());
+        assert!(check_deterministic(Backend::Metal, ["MUL_MAT"]).is_err());
+    }
+
+    #[test]
+    fn a_run_stays_on_its_device() {
+        check_placements(
+            Backend::Cuda,
+            [("GET_ROWS", "CPU"), ("VIEW", "CPU"), ("MUL_MAT", "CUDA0"), ("OUT_PROD", "CUDA0")],
+        )
+        .unwrap();
+        let err = check_placements(Backend::Cuda, [("MUL_MAT", "CUDA0"), ("OUT_PROD", "CPU")]).unwrap_err();
+        assert!(err.to_string().contains("OUT_PROD ran on CPU"), "{err}");
+        assert!(check_placements(Backend::Cuda, [("FLASH_ATTN_EXT", "CUDA0")]).is_err());
+        assert!(check_placements(Backend::Cuda, [("MUL_MAT", "RPC[x]")]).is_err());
+        check_placements(Backend::Cpu, [("GET_ROWS", "CPU"), ("MUL_MAT", "CPU")]).unwrap();
+        assert!(check_placements(Backend::Cpu, [("MUL_MAT", "CUDA0")]).is_err());
     }
 }

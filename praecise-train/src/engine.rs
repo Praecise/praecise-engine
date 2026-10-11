@@ -24,7 +24,7 @@ use llama_cpp_2::train::{GradLoss, LoraWeight, TrainTensor, write_lora_gguf};
 use crate::Error;
 use crate::checkpoint::{Tensor, TrainState};
 use crate::hash::{Digest, domain_hash, sha256};
-use crate::kernel_class::{Backend, check_deterministic};
+use crate::kernel_class::{Backend, check_placements};
 use crate::objective::{
     dlogits, distill_token, dpo, group_advantages, grpo_token, info_nce, newton_schulz, pinball, rerank_bce, rerank_listwise,
     token_logprobs,
@@ -304,6 +304,12 @@ impl<'m> LoraTrainer<'m> {
         Ok(Self { ctx, _adapter: adapter, params, m, v, step: 0, recipe, n_vocab, deterministic: config.deterministic, embedding })
     }
 
+    /// The recipe the trainer runs.
+    #[must_use]
+    pub fn recipe(&self) -> &Recipe {
+        &self.recipe
+    }
+
     /// Optimizer steps taken.
     #[must_use]
     pub fn steps_taken(&self) -> u64 {
@@ -385,8 +391,8 @@ impl<'m> LoraTrainer<'m> {
         let toks: Vec<LlamaToken> = inputs.iter().map(|&t| LlamaToken(t)).collect();
         self.ctx.grad_sequence(&toks, Some(targets), logits).map_err(engine)?;
         if let Some(backend) = self.deterministic {
-            let ops = self.ctx.grad_graph_ops();
-            check_deterministic(backend, ops.iter().map(String::as_str))?;
+            let placed = self.ctx.grad_graph_placements();
+            check_placements(backend, placed.iter().map(|(op, dev)| (op.as_str(), dev.as_str())))?;
         }
         Ok(())
     }

@@ -119,6 +119,9 @@ fn lora_gradients_match_finite_differences() {
 
     let ops = ctx.grad_graph_ops();
     assert!(ops.iter().any(|o| o == "OUT_PROD") && ops.windows(2).all(|w| w[0] < w[1]));
+    let placed = ctx.grad_graph_placements();
+    assert!(placed.iter().any(|(o, d)| o == "OUT_PROD" && !d.is_empty()) && placed.windows(2).all(|w| w[0] < w[1]));
+    assert!(placed.iter().all(|(o, _)| ops.contains(o)));
 
     // the base weight is frozen: it has no gradient
     assert!(ctx.grad(&model.tensor("blk.0.attn_q.weight").unwrap()).is_none());

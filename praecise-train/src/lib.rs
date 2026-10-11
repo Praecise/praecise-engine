@@ -23,6 +23,8 @@
 //! - [`objective`]: token objectives (SFT, DPO, GRPO, distillation) as per-token
 //!   weights, and the Muon orthogonalization.
 //! - `engine` (feature `engine`): `LoRA` training steps on the serving graph.
+//! - `round` (feature `engine`): consecutive supervised steps over one shard,
+//!   logged, with the commitment a replay agrees on.
 //!
 //! The engine contains no network code and no multi-machine coordination:
 //! every function here is a pure function of local inputs.
@@ -40,6 +42,8 @@ pub mod objective;
 pub mod philox;
 pub mod recipe;
 pub mod reward;
+#[cfg(feature = "engine")]
+pub mod round;
 pub mod sampler;
 pub mod steplog;
 pub mod update;
