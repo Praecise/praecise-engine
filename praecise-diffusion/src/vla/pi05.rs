@@ -352,6 +352,13 @@ impl Pi05 {
         // Releases store the network either under the policy's `model.`
         // or at the top level.
         let st = if st.get("action_in_proj.weight").is_some() { st.renamed(|n| Some(format!("{HEAD}{n}")))? } else { st };
+        // Newer savers drop the `vision_model.` level under the vision tower.
+        let flat = format!("{VLM}vision_tower.");
+        let st = if st.get(&format!("{flat}embeddings.patch_embedding.weight")).is_some() {
+            st.renamed(|n| Some(n.strip_prefix(flat.as_str()).map_or_else(|| n.to_string(), |rest| format!("{flat}vision_model.{rest}"))))?
+        } else {
+            st
+        };
         let weights = Weights::load(&backend, &st, &cfg.weight_specs(linear, embed))?;
         Ok(Self { cfg, norm, tokenizer, backend, weights, exact })
     }

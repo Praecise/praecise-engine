@@ -28,6 +28,11 @@ from pathlib import Path
 
 # Small sizes with the released structure, per policy type.
 TINY = {
+    "smolvla": {
+        "text": {"hidden_size": 64, "intermediate_size": 128, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "num_hidden_layers": 4},
+        "vision": {"hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 2, "intermediate_size": 64, "patch_size": 16, "image_size": 64},
+        "scale_factor": 2,
+    },
     "pi05": {
         "vlm": {"width": 64, "depth": 2, "mlp_dim": 128, "num_heads": 2, "num_kv_heads": 1, "head_dim": 32},
         "expert": {"width": 48, "depth": 2, "mlp_dim": 96, "num_heads": 2, "num_kv_heads": 1, "head_dim": 32},
@@ -52,6 +57,23 @@ def light_policies_package(src):
     assert importlib.util.find_spec("lerobot.policies.pretrained") is not None
 
 
+def adapt_transformers():
+    """Let the reference run on a transformers release whose causal-mask
+    helper takes no cache positions (the mask the policy passes is complete)."""
+    import inspect as _inspect
+
+    import lerobot.policies.pi_gemma as pg
+
+    if "cache_position" not in _inspect.signature(pg.create_causal_mask).parameters:
+        base = pg.create_causal_mask
+
+        def create_causal_mask(**kw):
+            kw.pop("cache_position", None)
+            return base(**kw)
+
+        pg.create_causal_mask = create_causal_mask
+
+
 def policy_class(kind):
     if kind == "pi05":
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
@@ -69,7 +91,6 @@ def shrink_pi05(dims):
     import lerobot.policies.pi05.modeling_pi05 as m
 
     m.get_gemma_config = lambda v: m.GemmaConfig(**dims["vlm" if v == "gemma_2b" else "expert"])
-    base = m.CONFIG_MAPPING
     pins = {
         "hidden_size": dims["vision"]["hidden_size"],
         "num_hidden_layers": dims["vision"]["num_hidden_layers"],
@@ -78,29 +99,93 @@ def shrink_pi05(dims):
         "patch_size": dims["vision"]["patch_size"],
         "projection_dim": dims["vlm"]["width"],
     }
+    from lerobot.policies.pi_gemma import PaliGemmaForConditionalGenerationWithPiGemma as Pali
 
-    class Mapping:
-        def __getitem__(self, key):
-            make = base[key]
-            if key != "paligemma":
-                return make
+    build = Pali.__init__
 
-            def build(*args, **kw):
-                c = make(*args, **kw)
-                vc = c.vision_config
+    def init(self, config):
+        for k, v in pins.items():
+            setattr(config.vision_config, k, v)
+        build(self, config)
 
-                class Pinned(type(vc)):
-                    def __setattr__(self, name, value):
-                        super().__setattr__(name, pins.get(name, value))
+    Pali.__init__ = init
 
-                vc.__class__ = Pinned
-                for k, v in pins.items():
-                    setattr(vc, k, v)
-                return c
 
-            return build
+def make_tiny_smolvla(a, dims):
+    """Write a small backbone config next to the release and a random-weight
+    SmolVLA release to a.policy; returns the backbone directory."""
+    import shutil
 
-    m.CONFIG_MAPPING = Mapping()
+    import torch
+
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+    from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+
+    out = Path(a.policy)
+    backbone = out.parent / "backbone"
+    shutil.copytree(a.backbone, backbone, dirs_exist_ok=True)
+    bc = json.loads((backbone / "config.json").read_text())
+    bc["text_config"].update(dims["text"])
+    bc["vision_config"].update(dims["vision"])
+    bc["scale_factor"] = dims["scale_factor"]
+    (backbone / "config.json").write_text(json.dumps(bc, indent=1))
+
+    torch.manual_seed(a.seed + 1)
+    cfg = SmolVLAConfig(
+        input_features={
+            "observation.images.scene": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 48, 64)),
+            "observation.images.wrist": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+        },
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(6,))},
+        chunk_size=16,
+        n_action_steps=16,
+        resize_imgs_with_padding=(64, 64),
+        vlm_model_name=str(backbone),
+        load_vlm_weights=False,
+        num_vlm_layers=dims["text"]["num_hidden_layers"],
+        device="cpu",
+    )
+    policy = SmolVLAPolicy(cfg).to(torch.float32)
+    randomize(policy)
+    stats = random_stats(torch)
+    pre, post = make_smolvla_pre_post_processors(cfg, stats)
+    save_release(policy, cfg, pre, post, out)
+    return str(backbone)
+
+
+def randomize(policy):
+    import torch
+
+    with torch.no_grad():
+        for _, p in policy.named_parameters():
+            if p.ndim >= 2:
+                p.normal_(0.0, 1.0 / p[0].numel() ** 0.5)
+            else:
+                p.normal_(0.0, 0.2)
+
+
+def random_stats(torch):
+    stats = {}
+    for k in ("observation.state", "action"):
+        lo = torch.randn(6) * 0.5 - 1.0
+        hi = lo + 1.0 + torch.rand(6)
+        stats[k] = {"mean": (lo + hi) / 2, "std": (hi - lo) / 4, "min": lo - 0.2, "max": hi + 0.2, "q01": lo, "q99": hi,
+                    "q10": lo + 0.1, "q90": hi - 0.1}
+    return stats
+
+
+def save_release(policy, cfg, pre, post, out):
+    from safetensors.torch import save_file
+
+    out.mkdir(parents=True, exist_ok=True)
+    # The weights as the policy's own saver writes them (one tensor per name).
+    save_file({k: v.detach().clone().contiguous() for k, v in policy.state_dict().items()}, str(out / "model.safetensors"))
+    cfg.save_pretrained(out)
+    pre.save_pretrained(out)
+    post.save_pretrained(out)
 
 
 def make_tiny_release(a, dims):
@@ -128,25 +213,9 @@ def make_tiny_release(a, dims):
         device="cpu",
     )
     policy = PI05Policy(cfg).to(torch.float32)
-    with torch.no_grad():
-        for name, p in policy.named_parameters():
-            if p.ndim >= 2:
-                fan_in = p[0].numel()
-                p.normal_(0.0, 1.0 / fan_in**0.5)
-            else:
-                p.normal_(0.0, 0.2)
-    stats = {}
-    for k in ("observation.state", "action"):
-        lo = torch.randn(6) * 0.5 - 1.0
-        hi = lo + 1.0 + torch.rand(6)
-        stats[k] = {"mean": (lo + hi) / 2, "std": (hi - lo) / 4, "min": lo - 0.2, "max": hi + 0.2, "q01": lo, "q99": hi,
-                    "q10": lo + 0.1, "q90": hi - 0.1}
-    pre, post = make_pi05_pre_post_processors(cfg, stats)
-    out = Path(a.policy)
-    out.mkdir(parents=True, exist_ok=True)
-    policy.save_pretrained(out)
-    pre.save_pretrained(out)
-    post.save_pretrained(out)
+    randomize(policy)
+    pre, post = make_pi05_pre_post_processors(cfg, random_stats(torch))
+    save_release(policy, cfg, pre, post, Path(a.policy))
 
 
 def main():
@@ -160,14 +229,18 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--instruction", default="pick up the red cube and place it in the bowl")
     ap.add_argument("--hw", type=int, nargs=2, default=None)
-    ap.add_argument("--tiny", choices=["pi05"], default=None)
+    ap.add_argument("--tiny", choices=["pi05", "smolvla"], default=None)
     a = ap.parse_args()
     sys.path.insert(0, a.lerobot)
     light_policies_package(a.lerobot)
+    adapt_transformers()
     dims = TINY[a.tiny] if a.tiny else None
     if a.tiny == "pi05":
         shrink_pi05(dims)
         make_tiny_release(a, dims)
+    if a.tiny == "smolvla":
+        a.backbone = make_tiny_smolvla(a, dims)
+        dims = None
 
     import torch
     from safetensors.torch import save_file
@@ -187,7 +260,15 @@ def main():
     policy = policy.to(torch.float32).eval()
     overrides = {"device_processor": {"device": "cpu"}, "tokenizer_processor": {"tokenizer_name": a.backbone}}
     pre = PolicyProcessorPipeline.from_pretrained(a.policy, config_filename="policy_preprocessor.json", overrides=overrides)
-    post = PolicyProcessorPipeline.from_pretrained(a.policy, config_filename="policy_postprocessor.json", overrides={"device_processor": {"device": "cpu"}})
+    from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+
+    post = PolicyProcessorPipeline.from_pretrained(
+        a.policy,
+        config_filename="policy_postprocessor.json",
+        overrides={"device_processor": {"device": "cpu"}},
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
 
     cams = [k for k, f in cfg.input_features.items() if f.type.name == "VISUAL"]
     state_dim = cfg.input_features["observation.state"].shape[0]

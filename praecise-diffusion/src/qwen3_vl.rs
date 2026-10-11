@@ -302,7 +302,17 @@ impl Qwen3VlEncoder {
     /// # Errors
     /// As [`Self::load`], or a layer count of zero or beyond the model's.
     pub fn load_layers(files: &CheckpointFiles, dir: &str, opts: LoadOptions, layers: Option<usize>) -> Result<Self> {
-        let mut cfg = Qwen3VlConfig::from_json(files.json(&format!("{dir}/config.json"))?)?;
+        let cfg = Qwen3VlConfig::from_json(files.json(&format!("{dir}/config.json"))?)?;
+        Self::from_safetensors(cfg, SafeTensors::open(&files.weights(dir)?)?, opts, layers)
+    }
+
+    /// Load from an open set of tensors named in the nested or the flat
+    /// layout, keeping the first `layers` decoder layers as
+    /// [`Self::load_layers`] does.
+    ///
+    /// # Errors
+    /// As [`Self::load_layers`].
+    pub fn from_safetensors(mut cfg: Qwen3VlConfig, st: SafeTensors, opts: LoadOptions, layers: Option<usize>) -> Result<Self> {
         if let Some(n) = layers {
             let t = &mut cfg.text_config;
             if n == 0 || n > t.num_hidden_layers {
@@ -310,7 +320,7 @@ impl Qwen3VlEncoder {
             }
             t.num_hidden_layers = n;
         }
-        let st = from_flat_layout(SafeTensors::open(&files.weights(dir)?)?, &cfg)?;
+        let st = from_flat_layout(st, &cfg)?;
         let backend = opts.backend()?;
         let exact = opts.precision == Precision::F32;
         let embed = if exact { WType::F32 } else { WType::F16 };
