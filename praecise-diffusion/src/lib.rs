@@ -24,6 +24,7 @@ pub mod error;
 pub mod flux2;
 pub mod flux3;
 pub mod gemma3;
+pub mod hunyuan_image3;
 pub mod janus;
 pub mod ggml;
 pub mod ltx2;

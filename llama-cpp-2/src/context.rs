@@ -111,6 +111,7 @@ impl<'model> LlamaContext<'model> {
     ///
     /// - the returned [`std::ffi::c_int`] from llama-cpp does not fit into a i32 (this should never happen on most systems)
     pub fn decode(&mut self, batch: &mut LlamaBatch) -> Result<(), DecodeError> {
+        batch.lay_out_positions();
         let result =
             unsafe { llama_cpp_sys_2::llama_decode(self.context.as_ptr(), batch.llama_batch) };
 

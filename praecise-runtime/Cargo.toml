@@ -12,6 +12,8 @@ description = "Praecise Engine — inference-acceleration runtime: speculative d
 # backend handle, so the backend — and its GPU context — loads once rather than
 # being duplicated.
 llama-cpp-2 = { path = "../llama-cpp-2", optional = true }
+# Image heads and decoders for image generation on a language backbone.
+praecise-diffusion = { path = "../praecise-diffusion", optional = true }
 thiserror = "2"
 tracing = "0.1"
 encoding_rs = "0.8"
@@ -37,10 +39,12 @@ default = []
 bundled-llama = ["dep:llama-cpp-2"]
 # Backend accelerators — only meaningful with a bundled backend, so each implies
 # `bundled-llama`.
-cuda = ["bundled-llama", "llama-cpp-2/cuda"]
+cuda = ["bundled-llama", "llama-cpp-2/cuda", "praecise-diffusion?/cuda"]
 cuda-no-vmm = ["bundled-llama", "llama-cpp-2/cuda-no-vmm"]
 rocm = ["bundled-llama", "llama-cpp-2/rocm"]
-metal = ["bundled-llama", "llama-cpp-2/metal"]
+metal = ["bundled-llama", "llama-cpp-2/metal", "praecise-diffusion?/metal"]
 vulkan = ["bundled-llama", "llama-cpp-2/vulkan"]
 # Image and audio input in the batching engine, through llama.cpp mtmd.
 mtmd = ["bundled-llama", "llama-cpp-2/mtmd"]
+# Image generation on a language backbone, with its image side from praecise-diffusion.
+image-gen = ["bundled-llama", "dep:praecise-diffusion"]

@@ -2,8 +2,8 @@
 //! backbone, and the VQ decoder that turns a grid of image tokens into pixels.
 //!
 //! Generation alternates with the backbone: the backbone's last hidden state goes through
-//! [`JanusImageHead::logits`] to score the next image token (a codebook index), and the chosen
-//! token comes back through [`JanusImageHead::embed`] as the backbone's next input. When the
+//! [`JanusImageHead::logits_n`] to score the next image token (a codebook index), and the chosen
+//! token comes back through [`JanusImageHead::embed_n`] as the backbone's next input. When the
 //! grid is complete, [`JanusVqDecoder::decode`] reads each token's codebook vector
 //! (L2-normalised), applies the post-quantisation convolution and the decoder (residual blocks
 //! with group norm, single-head attention at the lowest resolution, nearest-neighbour
@@ -330,11 +330,15 @@ impl JanusImageHead {
         &self.cfg
     }
 
-    /// Image-token logits for `batch` hidden states (`batch * hidden` floats, row-major).
+    /// Image-token logits for `n` hidden states (`n * hidden` floats, row-major); `n` is the
+    /// batch the head was loaded for.
     ///
     /// # Errors
-    /// A wrong input size or a failed compute.
-    pub fn logits(&mut self, hidden: &[f32]) -> Result<Vec<f32>> {
+    /// A wrong count or input size, or a failed compute.
+    pub fn logits_n(&mut self, hidden: &[f32], n: usize) -> Result<Vec<f32>> {
+        if n != self.batch {
+            return Err(Error::Config(format!("image head was loaded for {} rows, called with {n}", self.batch)));
+        }
         let want = self.batch * self.cfg.image_token_embed_dim as usize;
         if hidden.len() != want {
             return Err(Error::Config(format!("image head takes {want} floats, got {}", hidden.len())));
@@ -348,7 +352,7 @@ impl JanusImageHead {
     ///
     /// # Errors
     /// A wrong count, an out-of-range token, or a failed compute.
-    pub fn embed(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+    pub fn embed_n(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         if tokens.len() != self.batch {
             return Err(Error::Config(format!("image embedder takes {} tokens, got {}", self.batch, tokens.len())));
         }

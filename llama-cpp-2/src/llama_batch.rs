@@ -16,7 +16,19 @@ pub struct LlamaBatch<'a> {
     pub(crate) llama_batch: llama_batch,
     /// Floats per position of a hidden-state batch; 0 for a token batch.
     hidden_width: usize,
+    /// Positions of a multi-position hidden-state batch (M-RoPE models).
+    multi_pos: Option<MultiPos>,
     phantom: PhantomData<&'a [LlamaToken]>,
+}
+
+/// Several positions per entry: kept per entry while the batch fills, laid out component by
+/// component over the filled entries just before a decode, in a buffer the batch owns.
+#[derive(Debug)]
+struct MultiPos {
+    n_pos: usize,
+    rows: Vec<llama_pos>,
+    laid_out: Vec<llama_pos>,
+    allocated_pos: *mut llama_pos,
 }
 
 /// Errors that can occur when adding a token to a batch.
@@ -44,6 +56,9 @@ impl<'a> LlamaBatch<'a> {
     pub fn clear(&mut self) {
         self.llama_batch.n_tokens = 0;
         self.initialized_logits.clear();
+        if let Some(mp) = self.multi_pos.as_mut() {
+            mp.rows.clear();
+        }
     }
 
     /// add a token to the batch for sequences `seq_ids` at position `pos`. If `logits` is true, the
@@ -163,6 +178,7 @@ impl<'a> LlamaBatch<'a> {
             initialized_logits: vec![],
             llama_batch: batch,
             hidden_width: 0,
+            multi_pos: None,
             phantom: PhantomData,
         }
     }
@@ -185,7 +201,64 @@ impl<'a> LlamaBatch<'a> {
             initialized_logits: vec![],
             llama_batch: batch,
             hidden_width: n_embd,
+            multi_pos: None,
             phantom: PhantomData,
+        }
+    }
+
+    /// A hidden-state batch whose entries carry `n_pos` positions each (the components of a
+    /// multi-axis rotary position), added with [`Self::add_hidden_positions`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_tokens` or `n_embd` is greater than `i32::MAX`, or `n_pos` is zero.
+    #[must_use]
+    pub fn new_hidden_positions(n_tokens: usize, n_embd: usize, n_pos: usize, n_seq_max: i32) -> Self {
+        assert!(n_pos > 0, "a multi-position batch needs n_pos > 0");
+        let mut batch = Self::new_hidden(n_tokens, n_embd, n_seq_max);
+        let mut laid_out = vec![0; n_tokens * n_pos];
+        let allocated_pos = batch.llama_batch.pos;
+        batch.llama_batch.pos = laid_out.as_mut_ptr();
+        batch.multi_pos = Some(MultiPos { n_pos, rows: Vec::with_capacity(n_tokens * n_pos), laid_out, allocated_pos });
+        batch
+    }
+
+    /// Add one entry to a batch made by [`Self::new_hidden_positions`]: its hidden state and
+    /// all of its position components.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch is full or `hidden` is not `n_embd` floats.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on another kind of batch or with the wrong number of positions.
+    pub fn add_hidden_positions(
+        &mut self,
+        hidden: &[f32],
+        positions: &[llama_pos],
+        seq_ids: &[i32],
+        logits: bool,
+    ) -> Result<(), BatchAddError> {
+        let n_pos = self.multi_pos.as_ref().expect("add_hidden_positions on a single-position batch").n_pos;
+        assert_eq!(positions.len(), n_pos, "wrong number of position components");
+        self.add_hidden(hidden, positions[0], seq_ids, logits)?;
+        let mp = self.multi_pos.as_mut().expect("checked above");
+        mp.rows.extend_from_slice(positions);
+        Ok(())
+    }
+
+    /// Write the positions of a multi-position batch component by component over the filled
+    /// entries, as the backend reads them. Called by the context before every decode.
+    pub(crate) fn lay_out_positions(&mut self) {
+        let n = usize::try_from(self.llama_batch.n_tokens).unwrap_or(0);
+        if let Some(mp) = self.multi_pos.as_mut() {
+            for i in 0..n {
+                for j in 0..mp.n_pos {
+                    mp.laid_out[j * n + i] = mp.rows[i * mp.n_pos + j];
+                }
+            }
+            self.llama_batch.pos = mp.laid_out.as_mut_ptr();
         }
     }
 
@@ -278,6 +351,7 @@ impl<'a> LlamaBatch<'a> {
                 .expect("number of tokens exceeds i32::MAX + 1")],
             llama_batch: batch,
             hidden_width: 0,
+            multi_pos: None,
             phantom: PhantomData,
         };
         Ok(batch)
@@ -303,6 +377,10 @@ impl<'a> Drop for LlamaBatch<'a> {
     /// # Ok(())
     /// # }
     fn drop(&mut self) {
+        if let Some(mp) = self.multi_pos.take() {
+            // The backend allocation is the one llama_batch_free releases.
+            self.llama_batch.pos = mp.allocated_pos;
+        }
         unsafe {
             if self.allocated > 0 {
                 llama_batch_free(self.llama_batch);

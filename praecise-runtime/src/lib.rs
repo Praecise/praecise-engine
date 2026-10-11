@@ -130,6 +130,11 @@ pub mod duplex;
 #[cfg(feature = "mtmd")]
 pub mod omni;
 
+/// Image generation on a language backbone (discrete image tokens and in-sequence flow
+/// matching). Compiled only with `image-gen`.
+#[cfg(feature = "image-gen")]
+pub mod image_gen;
+
 pub use admission::{
     Class as AdmissionClass, Client as AdmissionClient, CostModel, Decision as AdmissionDecision, Estimate, Observation,
     Policy as AdmissionPolicy, Refusal as AdmissionRefusal, Scheduler, Shape,
