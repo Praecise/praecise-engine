@@ -258,6 +258,8 @@ pub fn generate_ngram_speculative(
             // needs lives in the standard decode loop, not here.
             commitment: None,
             cached_tokens: 0,
+            forward_positions: None,
+            denoise_steps: None,
         },
         stats,
     ))

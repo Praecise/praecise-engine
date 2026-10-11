@@ -77,6 +77,12 @@ impl<'model> LlamaContext<'model> {
         unsafe { llama_cpp_sys_2::llama_n_batch(self.context.as_ptr()) }
     }
 
+    /// Whether attention is causal. A diffusion model attends both ways over
+    /// the positions it denoises; a cache then still holds only earlier ones.
+    pub fn set_causal_attn(&mut self, causal: bool) {
+        unsafe { llama_cpp_sys_2::llama_set_causal_attn(self.context.as_ptr(), causal) }
+    }
+
     /// Gets the max number of physical tokens (hardware level) to decode in batch. Must be less than or equal to [`Self::n_batch`].
     #[must_use]
     pub fn n_ubatch(&self) -> u32 {

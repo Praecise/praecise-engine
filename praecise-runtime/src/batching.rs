@@ -235,9 +235,9 @@ pub struct SequenceResume {
 }
 
 /// A request on its way to the scheduler, with the ticket it was given.
-struct Queued {
-    req: BatchRequest,
-    ticket: Option<u64>,
+pub(crate) struct Queued {
+    pub(crate) req: BatchRequest,
+    pub(crate) ticket: Option<u64>,
 }
 
 /// Where an export's answer goes.
@@ -290,6 +290,9 @@ struct EngineInner {
     control: Sender<Control>,
     /// The weights this engine serves, when it can move sequences.
     migration: Option<ModelFingerprint>,
+    /// Why sequences cannot move, when the model rules it out whatever the
+    /// engine was spawned with.
+    migration_refusal: Option<&'static str>,
     next_ticket: std::sync::atomic::AtomicU64,
 }
 
@@ -407,16 +410,13 @@ impl BatchEngine {
         // A model that does something else is refused here, with the reason,
         // rather than served into garbage or a decode error on every request.
         let traits = memory_traits(&model, swa_full());
+        if traits.diffusion {
+            return Self::spawn_denoising(model_id, model, backend, context_length, enable_thinking, projector);
+        }
         if traits.reuse() == Reuse::None {
             return Err(Error::Other(format!(
-                "{} cannot be served by the batch engine: {}",
-                model_id,
-                if traits.diffusion {
-                    "it decodes by diffusion over the whole output, not one token at a time"
-                } else {
-                    "it is an embedding or reranking model (bidirectional or pooled), which \
-                     produces vectors, not text"
-                }
+                "{model_id} cannot be served by the batch engine: it is an embedding or reranking model \
+                 (bidirectional or pooled), which produces vectors, not text"
             )));
         }
         if migration.is_some() && traits.reuse() == Reuse::EncoderOutput {
@@ -467,6 +467,61 @@ impl BatchEngine {
                 shutdown: shutdown_tx,
                 control: control_tx,
                 migration,
+                migration_refusal: None,
+                next_ticket: std::sync::atomic::AtomicU64::new(1),
+            }),
+        })
+    }
+
+    /// The engine for a model that decodes by diffusion: the same requests
+    /// and results, decoded by [`crate::denoise_engine`]. Its sequences cannot
+    /// move between engines, whatever the host asked for: there is no causal
+    /// cache to export.
+    fn spawn_denoising(
+        model_id: String,
+        model: LlamaModel,
+        backend: Arc<LlamaBackend>,
+        context_length: u32,
+        enable_thinking: bool,
+        projector: Option<Projector>,
+    ) -> Result<Self> {
+        if projector.is_some() {
+            return Err(Error::Other(format!(
+                "{model_id} decodes by diffusion, and reading images or audio is not served for such a model"
+            )));
+        }
+        let plan = crate::denoise_engine::plan_for(&model)
+            .map_err(|e| Error::Other(format!("{model_id} cannot be served: {e}")))?;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(max_slots());
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+        let (control_tx, _control_rx) = std::sync::mpsc::channel::<Control>();
+        let model_id_thread = model_id.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("denoise-{model_id}"))
+            .spawn(move || {
+                if let Err(e) = crate::denoise_engine::scheduler_loop(
+                    &model_id_thread,
+                    model,
+                    &backend,
+                    context_length,
+                    enable_thinking,
+                    plan,
+                    &rx,
+                    &shutdown_rx,
+                ) {
+                    warn!("denoising engine for {model_id_thread} exited with error: {e}");
+                }
+            })
+            .map_err(|e| Error::Other(format!("failed to spawn denoising scheduler thread: {e}")))?;
+        Ok(Self {
+            tx,
+            inner: Arc::new(EngineInner {
+                model_id,
+                handle: std::sync::Mutex::new(Some(handle)),
+                shutdown: shutdown_tx,
+                control: control_tx,
+                migration: None,
+                migration_refusal: Some("it decodes by diffusion and holds no causal cache to move"),
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
             }),
         })
@@ -553,11 +608,12 @@ impl BatchEngine {
     }
 
     fn migration(&self) -> Result<ModelFingerprint> {
-        self.inner.migration.ok_or_else(|| {
-            Error::KvSequence(format!(
+        self.inner.migration.ok_or_else(|| match self.inner.migration_refusal {
+            Some(why) => Error::KvSequence(format!("{} cannot move sequences: {why}", self.inner.model_id)),
+            None => Error::KvSequence(format!(
                 "the batch engine for {} was not spawned with migration",
                 self.inner.model_id
-            ))
+            )),
         })
     }
 
@@ -1277,12 +1333,12 @@ fn sample_block_into(
 /// A finished sequence whose streaming receiver has not taken every chunk
 /// yet. Its result is delivered once the stream is, so a caller that reads
 /// the stream to its end and then the result sees all of the text.
-struct Draining {
-    tx: Option<tokio::sync::mpsc::Sender<String>>,
-    stream: StopStream,
-    result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
-    result: InferenceResult,
-    since: Instant,
+pub(crate) struct Draining {
+    pub(crate) tx: Option<tokio::sync::mpsc::Sender<String>>,
+    pub(crate) stream: StopStream,
+    pub(crate) result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
+    pub(crate) result: InferenceResult,
+    pub(crate) since: Instant,
 }
 
 /// How long a finished sequence's stream may take to drain before its
@@ -1301,7 +1357,7 @@ fn stalled_stream() -> Error {
 /// Hand queued chunks to every draining receiver, and deliver each result
 /// whose stream has been fully taken, whose receiver is gone, or which has
 /// waited past [`STREAM_DRAIN_TIMEOUT`].
-fn drain_streams(draining: &mut Vec<Draining>) {
+pub(crate) fn drain_streams(draining: &mut Vec<Draining>) {
     let mut i = 0;
     while i < draining.len() {
         let d = &mut draining[i];
@@ -1356,6 +1412,8 @@ impl Sequence {
             stop_reason,
             commitment: self.commitment.take().and_then(|c| c.finish(self.input_tokens)),
             cached_tokens: self.cached_tokens,
+            forward_positions: None,
+            denoise_steps: None,
         };
         if self.stream.delivered() {
             let _ = result_tx.send(Ok(result));

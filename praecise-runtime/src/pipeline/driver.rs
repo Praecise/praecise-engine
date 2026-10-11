@@ -441,6 +441,8 @@ impl<'m> Pipeline<'m> {
             stop_reason,
             commitment: None,
             cached_tokens: 0,
+            forward_positions: None,
+            denoise_steps: None,
         })
     }
 

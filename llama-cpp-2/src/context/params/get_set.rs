@@ -115,6 +115,15 @@ impl LlamaContextParams {
         self
     }
 
+    /// Most positions one pass returns logits for (`0`: the batch size). A
+    /// model that reads a long input but needs the logits of only a few
+    /// positions keeps its output buffer to those.
+    #[must_use]
+    pub fn with_n_outputs_max(mut self, n_outputs_max: u32) -> Self {
+        self.context_params.n_outputs_max = n_outputs_max;
+        self
+    }
+
     /// Get the max number of sequences (i.e. distinct states for recurrent models)
     ///
     /// # Examples

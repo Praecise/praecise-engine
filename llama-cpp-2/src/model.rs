@@ -252,6 +252,29 @@ impl LlamaModel {
         LlamaToken(token)
     }
 
+    /// Condition the next forward pass of a self-conditioned diffusion model
+    /// on the previous step's canvas logits (`n_vocab` floats per canvas
+    /// position), read at one over `temp_inv` and gated by `use_sc` (`0` on
+    /// a canvas's first step). `None` turns conditioning off. The state
+    /// belongs to the model, so one canvas is conditioned per pass; it is a
+    /// no-op for any other model.
+    ///
+    /// The logits must stay alive and unmoved until the pass has run.
+    pub fn diffusion_set_self_conditioning(&self, logits: Option<&[f32]>, use_sc: f32, temp_inv: f32) {
+        let ptr = logits.map_or(std::ptr::null(), <[f32]>::as_ptr);
+        unsafe {
+            llama_cpp_sys_2::llama_diffusion_set_sc(self.model.as_ptr(), ptr, use_sc, temp_inv, logits.is_some());
+        }
+    }
+
+    /// The mask token a diffusion model denoises from, when the vocabulary
+    /// declares one.
+    #[must_use]
+    pub fn token_mask(&self) -> Option<LlamaToken> {
+        let token = unsafe { llama_cpp_sys_2::llama_vocab_mask(self.vocab_ptr()) };
+        (token >= 0).then_some(LlamaToken(token))
+    }
+
     /// Convert a string to a Vector of tokens.
     ///
     /// # Errors

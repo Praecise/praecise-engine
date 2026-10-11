@@ -358,6 +358,8 @@ mod tests {
             stop_reason: StopReason::Eos,
             commitment: None,
             cached_tokens: 0,
+            forward_positions: None,
+            denoise_steps: None,
         };
         let raw = PraeciseInferenceResult::new(inner).into_raw();
         unsafe {

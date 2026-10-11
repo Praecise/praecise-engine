@@ -16,7 +16,7 @@ use crate::config::GenerationConfig;
 /// so a request that does not ask for them samples exactly as it did before
 /// those knobs existed.
 /// Candidates kept before the sorting stages when a request names no `top_k`.
-const DEFAULT_TOP_K: i32 = 40;
+const DEFAULT_TOP_K: i32 = crate::denoise::DEFAULT_TOP_K as i32;
 
 pub fn build_sampler_chain(config: &GenerationConfig, n_vocab: i32) -> LlamaSampler {
     build_sampler_chain_with_grammar(config, None, n_vocab)

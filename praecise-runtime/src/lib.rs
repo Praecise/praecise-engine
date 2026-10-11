@@ -32,6 +32,7 @@ pub mod backend;
 /// measurement; kept as a record of a self-consistent simulation being wrong.
 pub mod bench_alloc;
 pub mod config;
+pub mod denoise;
 /// Published speculative drafters, their licences, and the known ways a
 /// deployment silently underperforms. Backend-agnostic catalogue data.
 pub mod drafters;
@@ -81,6 +82,9 @@ pub mod sampling;
 /// Continuous batching engine. Compiled only with a bundled backend.
 #[cfg(feature = "bundled-llama")]
 pub mod batching;
+
+#[cfg(feature = "bundled-llama")]
+pub mod denoise_engine;
 
 /// Loaded model + drafter handles. Compiled only with a bundled backend.
 #[cfg(feature = "bundled-llama")]

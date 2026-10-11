@@ -73,6 +73,14 @@ pub struct InferenceResult {
     /// prefilled: already counted in [`Self::input_tokens`], and computed by an
     /// earlier request.
     pub cached_tokens: u32,
+    /// Positions the model ran forward, when that is not the prompt once and
+    /// each output token once: a diffusion model reads its canvas once per
+    /// denoising step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_positions: Option<u64>,
+    /// Denoising steps a diffusion model took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denoise_steps: Option<u32>,
 }
 
 /// A chat message with role and content, for chat-template formatting.
