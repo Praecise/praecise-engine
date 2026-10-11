@@ -3,7 +3,7 @@ name = "praecise-diffusion"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Praecise Engine diffusion family: native flow-matching image generation on the same ggml backend, device and memory budget as the language-model family."
+description = "Praecise Engine diffusion family: native flow-matching image, video, audio and 3D generation on the same ggml backend, device and memory budget as the language-model family."
 
 [dependencies]
 llama-cpp-sys-2 = { path = "../llama-cpp-sys-2", default-features = false }
@@ -17,6 +17,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 praecise-codec = { path = "../praecise-codec" }
+flate2 = "1"
 
 [features]
 default = []

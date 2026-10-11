@@ -11,6 +11,10 @@
 //! frame by a causal video autoencoder. The LTX-2.3 audio-video transformer
 //! denoises video and audio latents together.
 //!
+//! The 3D family is TRELLIS.2: flow transformers over sparse voxel
+//! latents, sparse convolutional decoders to a dual-grid surface with
+//! per-voxel PBR materials, exported as a textured binary glTF.
+//!
 //! Every weight is read from the checkpoint's own safetensors files and made
 //! resident once; the optional 8-bit format is produced from those files at
 //! load, deterministically, so the files' hashes identify what runs.
@@ -20,6 +24,7 @@
 
 pub mod acestep;
 pub mod cosmos3;
+pub mod dinov3;
 pub mod error;
 pub mod flux2;
 pub mod flux3;
@@ -27,8 +32,10 @@ pub mod gemma3;
 pub mod hunyuan_image3;
 pub mod janus;
 pub mod ggml;
+pub mod glb;
 pub mod ltx2;
 pub mod matrix_game;
+pub mod mesh3d;
 pub mod minimax_h3;
 pub mod music;
 pub mod oobleck;
@@ -41,6 +48,8 @@ pub mod qwen_vl;
 pub mod s3dit;
 pub mod safetensors;
 pub mod schedule;
+pub mod sparse3d;
+pub mod trellis2;
 pub mod umt5;
 pub mod unipc;
 pub mod vae;
@@ -61,6 +70,7 @@ pub use video::{action_resolution_tier, frames_from_video, ActionMode, ActionOut
 pub use praecise_codec as codec;
 pub use world::{SessionConfig, WorldChunk, WorldModel, WorldSession};
 pub use zimage::ZImage;
+pub use trellis2::{Asset3d, Request3d, Trellis2, Trellis2Files, Trellis2Path};
 pub use qwen_image::pipeline::QwenImageEdit;
 pub use qwen_image21::pipeline::QwenImage21;
 pub use qwen_image21::QwenImage21Transformer;
