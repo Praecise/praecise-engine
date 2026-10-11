@@ -198,3 +198,61 @@ fn smolvla_rollout_matches_reference() {
     rollout_matches(&p, &norm.action, &fx, tol);
     eprintln!("wall {:.1}s", start.elapsed().as_secs_f32());
 }
+
+fn gemma_dims(v: &serde_json::Value) -> pi05::GemmaDims {
+    let u = |k: &str| v[k].as_u64().unwrap_or_else(|| panic!("dims miss {k}"));
+    pi05::GemmaDims { width: u("width"), depth: u("depth") as usize, mlp: u("mlp_dim"), heads: u("num_heads"), kv_heads: u("num_kv_heads"), head_dim: u("head_dim") }
+}
+
+/// The pi0.5 control loop against the reference policy's `select_action`
+/// loop. `PRAECISE_PI05_PARITY` names a directory with `policy/`,
+/// `backbone/tokenizer.json`, `fixture.json` and `fixture.safetensors`;
+/// network sizes recorded in the fixture (a small random-weight release)
+/// override the released ones.
+#[test]
+#[ignore = "needs a released policy and a reference fixture"]
+fn pi05_rollout_matches_reference() {
+    let dir = parity_dir("PRAECISE_PI05_PARITY");
+    let fx = Fixture::open(&dir);
+    let (opts, tol) = parity_options();
+    let dims = fx.meta.get("dims").filter(|d| !d.is_null()).map(|d| {
+        let v = &d["vision"];
+        let u = |k: &str| v[k].as_u64().unwrap();
+        pi05::Pi05Dims {
+            vlm: gemma_dims(&d["vlm"]),
+            expert: gemma_dims(&d["expert"]),
+            vision: siglip::SiglipConfig {
+                hidden_size: u("hidden_size"),
+                num_hidden_layers: u("num_hidden_layers") as usize,
+                num_attention_heads: u("num_attention_heads"),
+                intermediate_size: u("intermediate_size"),
+                patch_size: u("patch_size") as usize,
+                image_size: u("image_size") as usize,
+                layer_norm_eps: 1e-6,
+            },
+            vocab: 257_152,
+        }
+    });
+    let mut p = pi05::Pi05::load(&dir.join("policy"), &dir.join("backbone/tokenizer.json"), opts, dims).unwrap();
+    p.set_n_action_steps(fx.usize("n_action_steps"));
+    eprintln!("pi05 on {}: {} MB resident", p.device(), p.resident_bytes() >> 20);
+    let pc = read_json(&dir.join("policy/config.json")).unwrap();
+    let norm = Normalization::from_release(&dir.join("policy"), &pc).unwrap();
+    if let Some(want) = fx.meta["tokens"].as_array() {
+        let want: Vec<i32> = want.iter().map(|v| v.as_i64().unwrap() as i32).collect();
+        let states = fx.f32s("states");
+        let sd = states.len() / fx.usize("ticks");
+        let s0 = norm.state.normalize(&states[..sd]).unwrap();
+        assert_eq!(p.tokens(fx.meta["instruction"].as_str().unwrap(), &s0).unwrap(), want, "prompt tokens");
+    }
+    let start = std::time::Instant::now();
+    rollout_matches(&p, &norm.action, &fx, tol);
+    eprintln!("wall {:.1}s", start.elapsed().as_secs_f32());
+}
+
+#[test]
+fn state_bins_match_the_reference_digitisation() {
+    // Bin edges -1 + 2k/256: below -1 is -1, the top edge and above is 255.
+    assert_eq!(pi05::discretize_state(&[-1.5, -1.0, 0.0, 0.999, 1.0, 2.0]), vec![-1, 0, 128, 255, 255, 255]);
+    assert_eq!(pi05::prompt(" pick_up\nthe cube ", &[3, 200]), "Task: pick up the cube, State: 3 200;\nAction: ");
+}

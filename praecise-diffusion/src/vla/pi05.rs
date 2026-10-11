@@ -349,6 +349,9 @@ impl Pi05 {
             Precision::Q8_0 => (WType::Q8_0, WType::F16),
         };
         let st = SafeTensors::open(&[policy.join("model.safetensors")])?;
+        // Releases store the network either under the policy's `model.`
+        // or at the top level.
+        let st = if st.get("action_in_proj.weight").is_some() { st.renamed(|n| Some(format!("{HEAD}{n}")))? } else { st };
         let weights = Weights::load(&backend, &st, &cfg.weight_specs(linear, embed))?;
         Ok(Self { cfg, norm, tokenizer, backend, weights, exact })
     }
