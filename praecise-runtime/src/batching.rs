@@ -10,7 +10,8 @@
 //!
 //! ## Slot model
 //!
-//! The context is built with `n_seq_max = max_slots()` KV-cache sequence slots.
+//! The context is built with one KV-cache stream per slot, `max_slots()` slots
+//! at most (fewer when that many whole contexts do not fit, see `fit_slots`).
 //! Each in-flight request owns one slot, and its `seq_id` is that slot's index:
 //! `slots[i]` always holds the sequence decoding into KV sequence `i`. When a
 //! request finishes, its slot keeps the KV (and the checkpoints taken while it
@@ -294,6 +295,9 @@ struct EngineInner {
     /// The served model's chat template.
     chat_template: Option<crate::chat_format::ChatTemplateSource>,
     next_ticket: std::sync::atomic::AtomicU64,
+    /// Sequences this engine serves at once: [`max_slots`] at most, fewer when
+    /// that many whole contexts do not fit (see [`fit_slots`]).
+    slots: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Speculative decoding for the batch engine.
@@ -437,6 +441,8 @@ impl BatchEngine {
         // without a template still serves raw prompts.
         let chat_template = crate::chat_format::ChatTemplateSource::from_model(&model).ok();
         let model_id_thread = model_id.clone();
+        let slots = Arc::new(std::sync::atomic::AtomicUsize::new(max_slots()));
+        let slots_thread = slots.clone();
         let handle = std::thread::Builder::new()
             .name(format!("batch-{}", model_id))
             .spawn(move || {
@@ -450,6 +456,7 @@ impl BatchEngine {
                     speculation,
                     traits,
                     migration,
+                    &slots_thread,
                     &rx,
                     &control_rx,
                     &shutdown_rx,
@@ -473,6 +480,7 @@ impl BatchEngine {
                 migration_refusal: None,
                 chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
+                slots,
             }),
         })
     }
@@ -529,6 +537,7 @@ impl BatchEngine {
                 migration_refusal: Some("it decodes by diffusion and holds no causal cache to move"),
                 chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
+                slots: Arc::new(std::sync::atomic::AtomicUsize::new(max_slots())),
             }),
         })
     }
@@ -657,6 +666,13 @@ impl BatchEngine {
     /// The model this engine serves.
     pub fn model_id(&self) -> &str {
         &self.inner.model_id
+    }
+
+    /// How many sequences this engine serves at once. [`max_slots`] until the
+    /// engine has sized its KV cache, then the slots that fit (see
+    /// [`fit_slots`]); a request beyond them is refused as a full queue.
+    pub fn slots(&self) -> usize {
+        self.inner.slots.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Signal the scheduler to stop and join its thread. In-flight requests
@@ -857,7 +873,7 @@ fn measure_state_sizes(ctx: &mut llama_cpp_2::context::LlamaContext, model: &Lla
 /// override either: `BATCH_CHECKPOINT_MEMORY` is the bytes checkpoints may use
 /// across every slot, and `BATCH_UNIFIED_MEMORY` (1 or 0) says whether they
 /// share memory with the KV cache.
-fn host_checkpoint_budget(checkpoint_bytes: u64) -> (CheckpointBudget, bool) {
+fn host_checkpoint_budget(checkpoint_bytes: u64, slots: usize) -> (CheckpointBudget, bool) {
     use llama_cpp_2::LlamaBackendDeviceType as Kind;
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
     let devices = llama_cpp_2::list_llama_ggml_backend_devices();
@@ -880,10 +896,100 @@ fn host_checkpoint_budget(checkpoint_bytes: u64) -> (CheckpointBudget, bool) {
         |v| v != 0,
     );
     let budget = match env("BATCH_CHECKPOINT_MEMORY") {
-        Some(bytes) => crate::prefix_cache::budget_of(bytes, max_slots(), checkpoint_bytes),
-        None => crate::prefix_cache::checkpoint_budget(free, total, max_slots(), checkpoint_bytes),
+        Some(bytes) => crate::prefix_cache::budget_of(bytes, slots, checkpoint_bytes),
+        None => crate::prefix_cache::checkpoint_budget(free, total, slots, checkpoint_bytes),
     };
     (budget, unified)
+}
+
+/// How many sequences fit when each keeps a whole `context_length` of KV in
+/// a stream of its own: [`max_slots`] at most, at least one.
+///
+/// The bytes a slot takes are measured on a one-sequence probe context, as
+/// [`measure_state_sizes`] does, and set against the memory the KV cache may
+/// use: `BATCH_KV_MEMORY` bytes when the operator sets it, otherwise a share
+/// of what the device that holds the cache has free once the weights are
+/// loaded (nine tenths of a discrete accelerator's memory; half of host
+/// memory, which other processes share, within any cgroup limit).
+fn fit_slots(
+    model_id: &str,
+    model: &LlamaModel,
+    backend: &LlamaBackend,
+    context_length: std::num::NonZeroU32,
+    swa_full: bool,
+    kind: Reuse,
+) -> usize {
+    use llama_cpp_2::LlamaBackendDeviceType as Kind;
+    let wanted = max_slots();
+    let probe = LlamaContextParams::default()
+        .with_n_ctx(std::num::NonZeroU32::new(256))
+        .with_n_seq_max(1)
+        .with_kv_unified(false)
+        .with_swa_full(swa_full)
+        .with_n_batch(256)
+        .with_n_ubatch(256);
+    let Ok(mut ctx) = model.new_context(backend, probe) else {
+        return wanted;
+    };
+    let base = {
+        use llama_cpp_2::LlamaStateSeqFlags;
+        let mut batch = LlamaBatch::new(1, 1);
+        let _ = batch.add(model.token_bos(), 0, &[0], false);
+        let _ = ctx.decode(&mut batch);
+        let b = ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::empty()) as u64;
+        let _ = ctx.clear_kv_cache_seq(Some(0), None, None);
+        b
+    };
+    let per_token = measure_state_sizes(&mut ctx, model, kind).kv_per_token;
+    drop(ctx);
+    let per_slot = base.saturating_add(per_token.saturating_mul(u64::from(context_length.get())));
+    let budget = std::env::var("BATCH_KV_MEMORY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            let devices = llama_cpp_2::list_llama_ggml_backend_devices();
+            let host = devices.iter().find(|d| d.device_type == Kind::Cpu);
+            let host_free = host.map_or(0, |d| d.memory_free as u64);
+            let host_total = host.map_or(0, |d| d.memory_total as u64);
+            let discrete = devices
+                .iter()
+                .filter(|d| matches!(d.device_type, Kind::Gpu | Kind::Accelerator))
+                .filter(|d| host_total == 0 || (d.memory_total as u64) < host_total / 10 * 9)
+                .map(|d| d.memory_free as u64)
+                .min();
+            match discrete {
+                Some(free) => free / 10 * 9,
+                _ => cgroup_available().map_or(host_free, |c| c.min(host_free)) / 2,
+            }
+        });
+    let fit = if per_slot == 0 { wanted } else { usize::try_from(budget / per_slot).unwrap_or(usize::MAX) };
+    let slots = fit.clamp(1, wanted);
+    info!(
+        "batch engine for {}: {} bytes of KV per slot of {} tokens, {} bytes for KV: {} of {} slots",
+        model_id, per_slot, context_length, budget, slots, wanted
+    );
+    slots
+}
+
+/// Memory this process may still take under the cgroup limits it runs in
+/// (cgroup v2, Linux): the tightest `memory.max - memory.current` from its own
+/// cgroup up to the root. `None` where there is no limit or no cgroup v2.
+fn cgroup_available() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = own.lines().find_map(|l| l.strip_prefix("0::"))?.trim().to_string();
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let mut tightest: Option<u64> = None;
+    loop {
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current")) {
+            let left = max.saturating_sub(current);
+            tightest = Some(tightest.map_or(left, |t| t.min(left)));
+        }
+        if dir.as_os_str() == "/sys/fs/cgroup" || !dir.pop() {
+            break;
+        }
+    }
+    tightest
 }
 
 /// Identity of a text-only prompt.
@@ -1478,32 +1584,41 @@ fn scheduler_loop(
     speculation: Option<BatchSpeculation>,
     traits: MemoryTraits,
     migration: Option<ModelFingerprint>,
+    slots_out: &std::sync::atomic::AtomicUsize,
     rx: &Receiver<Queued>,
     control_rx: &Receiver<Control>,
     shutdown_rx: &Receiver<()>,
 ) -> Result<()> {
     use std::num::NonZeroU32;
 
-    let n_ctx = NonZeroU32::new(context_length).unwrap_or(NonZeroU32::new(8192).unwrap());
     let kind = traits.reuse();
+    let context_length = NonZeroU32::new(context_length).unwrap_or(NonZeroU32::new(8192).unwrap());
+    let n_slots = fit_slots(model_id, &model, backend, context_length, traits.swa_full, kind);
+    slots_out.store(n_slots, std::sync::atomic::Ordering::Release);
     // An engine that moves sequences stages copies through one sequence id
     // past the slots, which no request ever decodes into.
-    let scratch = max_slots() as i32;
-    let seq_ids = max_slots() as u32 + u32::from(migration.is_some());
+    let scratch = n_slots as i32;
+    let seq_ids = n_slots as u32 + u32::from(migration.is_some());
     // Rolling back rejected drafts on a recurrent layer defers the restore to
     // the next decode (see `Sequence::rollback_pending`).
     let recurrent_state = model.is_recurrent() || model.is_hybrid();
+    // Every sequence keeps its KV in a stream of its own, and llama.cpp splits
+    // `n_ctx` evenly between the streams, so each is given the whole context.
+    let n_ctx = context_length.saturating_mul(NonZeroU32::new(seq_ids).expect("at least one slot"));
 
-    // One long-lived context with max_slots() sequence slots. n_batch/n_ubatch
+    // One long-lived context with `n_slots` sequence slots. n_batch/n_ubatch
     // cover the interleaved prefill+extend batch.
     let context_params = |n_ctx: NonZeroU32| {
         let mut params = LlamaContextParams::default()
             .with_n_ctx(Some(n_ctx))
             .with_n_seq_max(seq_ids)
-            // One KV pool shared by every sequence. Without it `n_ctx` is split
-            // evenly, so each request is capped at `n_ctx / slots` however little
-            // the others use — at 32 slots a 131k model answers in 4k.
-            .with_kv_unified(true)
+            // A KV stream per sequence. In one pool shared by every sequence a
+            // new sequence's cells sit after whatever earlier requests left
+            // resident, and attention sums over the pool in cell order, so the
+            // same request rounds differently, and can decode different tokens,
+            // depending on what ran before it. In its own stream a sequence
+            // always occupies the same cells.
+            .with_kv_unified(false)
             .with_swa_full(traits.swa_full)
             .with_n_batch(physical_batch() as u32)
             .with_n_ubatch(physical_batch() as u32);
@@ -1524,31 +1639,7 @@ fn scheduler_loop(
     let mut per_slot = 0;
     if kind.needs_checkpoints() && checkpoint_cap() > 0 {
         let sizes = measure_state_sizes(&mut ctx, &model, kind);
-        let (mut budget, unified) = host_checkpoint_budget(sizes.checkpoint);
-        // Where checkpoints and the KV cache draw on the same memory, a
-        // context too large to leave room for the fewest useful checkpoints is
-        // shrunk until it does, never below a quarter of what was asked or 8K.
-        if unified
-            && let Some(release) = crate::prefix_cache::context_to_release(
-                budget,
-                max_slots(),
-                sizes.checkpoint,
-                sizes.kv_per_token,
-                ctx.n_ctx(),
-                (n_ctx.get() / 4).max(8192),
-            )
-        {
-            let smaller = NonZeroU32::new(ctx.n_ctx() - release).expect("above the floor");
-            drop(ctx);
-            ctx = model
-                .new_context(backend, context_params(smaller))
-                .map_err(|e| Error::Other(format!("batch context init failed: {}", e)))?;
-            budget = host_checkpoint_budget(sizes.checkpoint).0;
-            info!(
-                "batch engine for {}: context {} -> {} tokens, so every slot can keep its checkpoints",
-                model_id, n_ctx, smaller
-            );
-        }
+        let (budget, unified) = host_checkpoint_budget(sizes.checkpoint, n_slots);
         per_slot = budget.per_slot.min(checkpoint_cap());
         info!(
             "batch engine for {}: {:?} memory, {} checkpoints per slot of {} bytes each ({} bytes budgeted{})",
@@ -1566,12 +1657,13 @@ fn scheduler_loop(
         per_slot,
     };
 
-    let ctx_size = ctx.n_ctx() as i32;
+    // The most positions one sequence may hold.
+    let ctx_size = (ctx.n_ctx() / seq_ids) as i32;
 
     info!(
-        "batch engine for {} online: {} slots, ctx={}",
+        "batch engine for {} online: {} slots, ctx={} per slot",
         model_id,
-        max_slots(),
+        n_slots,
         ctx_size
     );
 
@@ -1586,8 +1678,8 @@ fn scheduler_loop(
         Some(kind) if spec_n_max > 0 => {
             let drafter: &LlamaModel = draft_model.as_ref().unwrap_or(&model);
             let mut params = LlamaContextParams::default()
-                .with_n_ctx(Some(n_ctx))
-                .with_n_seq_max(max_slots() as u32)
+                .with_n_ctx(Some(context_length))
+                .with_n_seq_max(n_slots as u32)
                 .with_kv_unified(true)
                 .with_n_batch(physical_batch() as u32)
                 .with_n_ubatch(physical_batch() as u32);
@@ -1616,7 +1708,7 @@ fn scheduler_loop(
             };
             // SAFETY: both contexts live in this function and are dropped only
             // after `spec`, explicitly, at the end of it.
-            match unsafe { SpeculativeBatch::new(&ctx, dctx, params, max_slots() as u32) } {
+            match unsafe { SpeculativeBatch::new(&ctx, dctx, params, n_slots as u32) } {
                 Ok(s) => {
                     info!(
                         "batch engine for {}: speculative decoding on ({}, up to {} drafted tokens per sequence)",
@@ -1643,10 +1735,10 @@ fn scheduler_loop(
     }
 
     // Slots: None == free.
-    let mut slots: Vec<Option<Sequence>> = (0..max_slots()).map(|_| None).collect();
+    let mut slots: Vec<Option<Sequence>> = (0..n_slots).map(|_| None).collect();
     // What each slot's KV still holds between requests, so a follow-up turn can
     // start from the divergence instead of from zero.
-    let mut cached: Vec<CachedPrefix> = (0..max_slots()).map(|_| CachedPrefix::default()).collect();
+    let mut cached: Vec<CachedPrefix> = (0..n_slots).map(|_| CachedPrefix::default()).collect();
     // Finished sequences whose streams are still being handed over.
     let mut draining: Vec<Draining> = Vec::new();
     // An encoder-decoder model keeps one encoder output in its context, so it
@@ -1660,7 +1752,7 @@ fn scheduler_loop(
     let mut encoded: Option<(Namespace, Vec<LlamaToken>)> = None;
     // Counts admissions, for least-recently-used eviction.
     let mut tick: u64 = 0;
-    let mut batch = LlamaBatch::new(physical_batch(), max_slots() as i32);
+    let mut batch = LlamaBatch::new(physical_batch(), n_slots as i32);
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -1844,7 +1936,7 @@ fn scheduler_loop(
         // Build the interleaved batch. `logits_slot` maps a batch logits index
         // back to the slot that owns it.
         batch.clear();
-        let mut logits_slot: Vec<(i32, usize)> = Vec::with_capacity(max_slots());
+        let mut logits_slot: Vec<(i32, usize)> = Vec::with_capacity(n_slots);
         let mut step: Vec<StepRow> = Vec::new();
 
         // Extension first: every running sequence contributes exactly one token,
