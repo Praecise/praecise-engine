@@ -189,7 +189,7 @@ fn trellis2_parity_image_preparation() {
     let rgb = image::crop_to_object(&image::RgbaImage { width: w, height: h, data }).unwrap();
     let crop: Vec<u8> = i32s("image_crop").iter().map(|&v| v as u8).collect();
     assert_eq!((rgb.width, rgb.height), (m["image"]["crop"][0].as_u64().unwrap() as u32, m["image"]["crop"][1].as_u64().unwrap() as u32));
-    assert_eq!(rgb.data, crop, "cropped pixels");
+    assert_eq!(rgb.rgb, crop, "cropped pixels");
     let x = image::encoder_input(&rgb, ENCODER_SIDE);
     check("encoder input", &x, &f32s("image_encoder_input"), 1e-12);
 }

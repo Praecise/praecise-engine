@@ -453,14 +453,14 @@ pub fn simplify(mesh: &mut Mesh, max_faces: usize) -> usize {
         if shared.is_empty() || shared.len() > 2 {
             continue;
         }
-        let neigh = |fs: &[u32], skip: u32| -> Vec<u32> {
+        let neigh = |faces: &[[u32; 3]], fs: &[u32], skip: u32| -> Vec<u32> {
             let mut v: Vec<u32> = fs.iter().flat_map(|&f| faces[f as usize]).filter(|&x| x != skip).collect();
             v.sort_unstable();
             v.dedup();
             v
         };
-        let na = neigh(&fa, a);
-        let nb = neigh(&fb, b);
+        let na = neigh(&faces, &fa, a);
+        let nb = neigh(&faces, &fb, b);
         let common = na.iter().filter(|x| nb.contains(x) && **x != a && **x != b).count();
         if common != shared.len() {
             continue;
@@ -505,10 +505,7 @@ pub fn simplify(mesh: &mut Mesh, max_faces: usize) -> usize {
         let s = stamp[a as usize].max(stamp[b as usize]) + 1;
         stamp[a as usize] = s;
         collapses += 1;
-        for x in neigh(&vfaces[a as usize].iter().copied().filter(|&f| alive[f as usize]).collect::<Vec<_>>(), a) {
-            stamp[x as usize] = stamp[x as usize].max(s);
-        }
-        let around: Vec<u32> = neigh(&vfaces[a as usize].iter().copied().filter(|&f| alive[f as usize]).collect::<Vec<_>>(), a);
+        let around: Vec<u32> = neigh(&faces, &vfaces[a as usize].iter().copied().filter(|&f| alive[f as usize]).collect::<Vec<_>>(), a);
         for x in around {
             let (lo, hi) = (a.min(x), a.max(x));
             let mut qq = quad[lo as usize];

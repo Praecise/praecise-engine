@@ -180,14 +180,14 @@ pub fn crop_to_object(img: &RgbaImage) -> Result<RgbImage> {
             }
         }
     }
-    Ok(RgbImage { width: cw as u32, height: chh as u32, data: rgb })
+    Ok(RgbImage { width: cw as u32, height: chh as u32, rgb })
 }
 
 /// Resize to `side x side` and normalise with the ImageNet mean and
 /// deviation: `[3, side, side]` row-major floats.
 #[must_use]
 pub fn encoder_input(img: &RgbImage, side: usize) -> Vec<f32> {
-    let px = resize_lanczos(&img.data, img.width as usize, img.height as usize, 3, side, side);
+    let px = resize_lanczos(&img.rgb, img.width as usize, img.height as usize, 3, side, side);
     let mean = [0.485f32, 0.456, 0.406];
     let std = [0.229f32, 0.224, 0.225];
     let mut out = vec![0f32; 3 * side * side];

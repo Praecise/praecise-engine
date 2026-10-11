@@ -2975,6 +2975,7 @@ dependencies = [
 name = "praecise-diffusion"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "half",
  "llama-cpp-sys-2",
  "memmap2",

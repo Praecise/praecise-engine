@@ -77,7 +77,7 @@ impl OccupancyDecoder {
         };
         let ch = &cfg.channels;
         conv("input_layer", ch[0], cfg.latent_channels, &mut host)?;
-        let mut res = |p: &str, c: usize, host: &mut Vec<HostTensor>| -> Result<()> {
+        let res = |p: &str, c: usize, host: &mut Vec<HostTensor>| -> Result<()> {
             norm(&format!("{p}.norm1"), c, host)?;
             norm(&format!("{p}.norm2"), c, host)?;
             conv(&format!("{p}.conv1"), c, c, host)?;
