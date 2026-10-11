@@ -32,6 +32,13 @@ pub fn cpu_params() -> LlamaModelParams {
     LlamaModelParams::default().with_n_gpu_layers(0)
 }
 
+/// Model parameters with `PRAECISE_TEST_GPU_LAYERS` layers offloaded (none
+/// when unset), for the tests that may run on an accelerator.
+pub fn params() -> LlamaModelParams {
+    let layers = std::env::var("PRAECISE_TEST_GPU_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    LlamaModelParams::default().with_n_gpu_layers(layers)
+}
+
 pub fn load(path: &str) -> LlamaModel {
     LlamaModel::load_from_file(backend(), path, &cpu_params()).expect("load model")
 }

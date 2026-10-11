@@ -87,7 +87,7 @@ fn decode_plan(s: &str) -> PipelinePlan {
 }
 
 fn load_stage(path: &str, r: LayerRange) -> LlamaModel {
-    let params: LlamaModelParams = common::cpu_params().with_layer_stage(r.begin, r.end);
+    let params: LlamaModelParams = common::params().with_layer_stage(r.begin, r.end);
     LlamaModel::load_from_file(common::backend(), path, &params).expect("load stage")
 }
 
@@ -299,4 +299,153 @@ fn three_processes_match_one_process() {
     assert!(matches!(err, PipelineError::StageFailed { stage: 2, .. }), "{err}");
     let err = pipe.step(1, b.len() as i32, next).unwrap_err();
     assert!(matches!(err, PipelineError::StageFailed { stage: 2, .. }), "{err}");
+}
+
+/// One model split in two across machines: this process drives the first half,
+/// a `stage_process` on another host serves the second, started with the plan
+/// this test prints. Needs `PRAECISE_PIPELINE_TEST_REMOTE` (the remote stage's
+/// `host:port`) besides the model; `PRAECISE_PIPELINE_TEST_TOKENS` sets the
+/// generation length (default 64) and `PRAECISE_PIPELINE_TEST_TOL` the logit
+/// tolerance (default 1e-3), since two different accelerators may round apart.
+#[test]
+#[ignore = "needs a second host: PRAECISE_PIPELINE_TEST_REMOTE"]
+fn remote_stage_matches_one_process() {
+    let remote =
+        std::env::var("PRAECISE_PIPELINE_TEST_REMOTE").expect("PRAECISE_PIPELINE_TEST_REMOTE");
+    let tokens: usize = std::env::var("PRAECISE_PIPELINE_TEST_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let tol: f32 = std::env::var("PRAECISE_PIPELINE_TEST_TOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1e-3);
+    let path = common::model_path();
+    let full = LlamaModel::load_from_file(common::backend(), &path, &common::params())
+        .expect("load model");
+    let n_layer = full.n_layer();
+    let ranges = split_layers(n_layer, &[1, 1]).unwrap();
+    let plan = PipelinePlan {
+        model_digest: ModelFingerprint::of_file(&path).unwrap().0,
+        n_layer,
+        n_embd: full.n_embd() as u32,
+        stages: vec![
+            StageSpec {
+                identity: identity(0),
+                address: "local".into(),
+                layers: ranges[0],
+            },
+            StageSpec {
+                identity: identity(1),
+                address: remote.clone(),
+                layers: ranges[1],
+            },
+        ],
+    };
+    plan.validate().unwrap();
+    println!("PLAN={}", encode_plan(&plan));
+    eprintln!("start the remote stage with {STAGE_ENV}=1 and {PLAN_ENV} set to the plan above");
+
+    let head = load_stage(&path, plan.stages[0].layers);
+    let dopts = DriverOptions {
+        stage: opts(),
+        max_in_flight: 4,
+        answer_timeout: Duration::from_secs(120),
+    };
+    let started = std::time::Instant::now();
+    let mut pipe = loop {
+        match Pipeline::connect(
+            common::backend(),
+            &head,
+            &plan,
+            &Fixture(identity(0)),
+            &dopts,
+        ) {
+            Ok(p) => break p,
+            Err(e) if started.elapsed() < Duration::from_secs(900) => {
+                eprintln!("waiting for the remote stage: {e}");
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            Err(e) => panic!("remote stage never answered: {e}"),
+        }
+    };
+    let mut reference = Reference::new(&full);
+    let tol_close = |what: &str, got: &[f32], want: &[f32]| -> f32 {
+        assert_eq!(got.len(), want.len(), "{what}: vocabulary width");
+        let diff = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff <= tol, "{what}: logits differ by {diff}");
+        assert_eq!(argmax(got), argmax(want), "{what}: argmax differs");
+        diff
+    };
+
+    let a: Vec<LlamaToken> = full.str_to_token(TEXT_A, AddBos::Always).unwrap();
+    let want = reference.run(0, 0, &a);
+    let mut worst = tol_close(
+        "prefill",
+        &pipe.prefill(0, 0, &a, MICRO_BATCH).expect("prefill"),
+        &want,
+    );
+    let mut next = LlamaToken(argmax(&want) as i32);
+    for step in 0..tokens {
+        let pos = (a.len() + step) as i32;
+        let got = pipe.step(0, pos, next).expect("step");
+        let want = reference.run(0, pos as usize, &[next]);
+        worst = worst.max(tol_close(&format!("decode {step}"), &got, &want));
+        next = LlamaToken(argmax(&want) as i32);
+    }
+    eprintln!(
+        "prefill + {tokens} decode steps: greedy tokens equal, max |pipeline - single| = {worst:e}"
+    );
+
+    // whole generations, timed: through the pipeline, and in one process
+    pipe.truncate(0, -1).unwrap();
+    let config = GenerationConfig {
+        temperature: 0.0,
+        repeat_penalty: 1.0,
+        max_tokens: tokens as u32,
+        ..Default::default()
+    };
+    let t = std::time::Instant::now();
+    let result = pipe
+        .generate(
+            &BatchPrompt::Raw(TEXT_B.to_string()),
+            &config,
+            false,
+            None,
+            None,
+        )
+        .expect("generate");
+    let pipe_secs = t.elapsed().as_secs_f64();
+    reference
+        .ctx
+        .clear_kv_cache_seq(Some(0), None, None)
+        .unwrap();
+    let b: Vec<LlamaToken> = full.str_to_token(TEXT_B, AddBos::Always).unwrap();
+    let t = std::time::Instant::now();
+    let mut logits = reference.run(0, 0, &b);
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut want_text = String::new();
+    let mut n = 0;
+    for i in 0..tokens {
+        let tok = LlamaToken(argmax(&logits) as i32);
+        if full.is_eog_token(tok) {
+            break;
+        }
+        want_text.push_str(&full.token_to_piece(tok, &mut decoder, false, None).unwrap());
+        logits = reference.run(0, b.len() + i, &[tok]);
+        n += 1;
+    }
+    let single_secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "generate {} tokens: pipeline {:.1} tok/s (engine reports {:.1}), single process {:.1} tok/s",
+        result.output_tokens,
+        f64::from(result.output_tokens) / pipe_secs,
+        result.tokens_per_second,
+        n as f64 / single_secs
+    );
+    assert_eq!(result.text, want_text);
 }
