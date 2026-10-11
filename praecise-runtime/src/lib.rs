@@ -122,6 +122,14 @@ pub mod media;
 #[cfg(feature = "mtmd")]
 pub mod speech;
 
+/// Full-duplex speech sessions: turn-taking and barge-in over a live stream.
+pub mod duplex;
+
+/// Spoken replies from an omni model: the reading model writes, the talker
+/// speaks while it writes. Compiled only with `mtmd`.
+#[cfg(feature = "mtmd")]
+pub mod omni;
+
 pub use admission::{
     Class as AdmissionClass, Client as AdmissionClient, CostModel, Decision as AdmissionDecision, Estimate, Observation,
     Policy as AdmissionPolicy, Refusal as AdmissionRefusal, Scheduler, Shape,

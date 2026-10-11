@@ -182,6 +182,31 @@ impl<'model> LlamaContext<'model> {
         }
     }
 
+    /// Keep (or stop keeping) the input of layer `layer` (the output of the
+    /// layer before it) for every token of each following decode. Only some
+    /// architectures expose it; reading it on others aborts in the backend.
+    pub fn set_layer_input_capture(&mut self, layer: u32, on: bool) {
+        unsafe { llama_set_embeddings_layer_inp(self.context.as_ptr(), layer, on) }
+    }
+
+    /// The captured input of layer `layer` for the `n_tokens` tokens of the
+    /// last decode, `n_embd` floats per token in batch order.
+    ///
+    /// # Errors
+    ///
+    /// When capture was not turned on for `layer`.
+    pub fn layer_input(&self, layer: u32, n_tokens: usize) -> Result<&[f32], EmbeddingsError> {
+        let n_embd = usize::try_from(self.model.n_embd()).expect("n_embd does not fit into a usize");
+        unsafe {
+            let rows = llama_get_embeddings_layer_inp(self.context.as_ptr(), layer);
+            if rows.is_null() {
+                Err(EmbeddingsError::NotEnabled)
+            } else {
+                Ok(slice::from_raw_parts(rows, n_embd * n_tokens))
+            }
+        }
+    }
+
     /// Get the embeddings for the `i`th token in the current context.
     ///
     /// # Returns
@@ -442,4 +467,10 @@ impl Drop for LlamaContext<'_> {
     fn drop(&mut self) {
         unsafe { llama_cpp_sys_2::llama_free(self.context.as_ptr()) }
     }
+}
+
+// Staging API of the backend (src/llama-ext.h), not part of the generated bindings.
+unsafe extern "C" {
+    fn llama_set_embeddings_layer_inp(ctx: *mut llama_cpp_sys_2::llama_context, lid: u32, value: bool);
+    fn llama_get_embeddings_layer_inp(ctx: *mut llama_cpp_sys_2::llama_context, lid: u32) -> *mut f32;
 }

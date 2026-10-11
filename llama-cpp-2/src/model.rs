@@ -219,6 +219,19 @@ impl LlamaModel {
         LlamaToken(token)
     }
 
+    /// Tokens the model's own generation settings never sample (from the
+    /// GGUF's suppress list); empty when it has none.
+    #[must_use]
+    pub fn suppress_tokens(&self) -> Vec<LlamaToken> {
+        let mut n = 0i32;
+        let ptr = unsafe { llama_cpp_sys_2::llama_vocab_get_suppress_tokens(self.vocab_ptr(), &raw mut n) };
+        if ptr.is_null() || n <= 0 {
+            return Vec::new();
+        }
+        let len = usize::try_from(n).unwrap_or(0);
+        unsafe { std::slice::from_raw_parts(ptr, len) }.iter().copied().map(LlamaToken).collect()
+    }
+
     /// Get the end of stream token.
     #[must_use]
     pub fn token_eos(&self) -> LlamaToken {

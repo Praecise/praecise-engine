@@ -1083,6 +1083,9 @@ pub enum MtmdGenAudioType {
     Qwen3Tts,
     /// Pocket TTS: continuous latents decoded to a waveform.
     PocketTts,
+    /// Qwen3-Omni talker: speaks the reply of the model it is paired with,
+    /// conditioned on that model's turn rather than on raw text.
+    Qwen3Omni,
 }
 
 impl MtmdContext {
@@ -1097,6 +1100,7 @@ impl MtmdContext {
             llama_cpp_sys_2::MTMD_GEN_AUDIO_TYPE_NONE => Ok(MtmdGenAudioType::None),
             llama_cpp_sys_2::MTMD_GEN_AUDIO_TYPE_QWEN3TTS => Ok(MtmdGenAudioType::Qwen3Tts),
             llama_cpp_sys_2::MTMD_GEN_AUDIO_TYPE_POCKETTTS => Ok(MtmdGenAudioType::PocketTts),
+            llama_cpp_sys_2::MTMD_GEN_AUDIO_TYPE_QWEN3OMNI => Ok(MtmdGenAudioType::Qwen3Omni),
             other => Err(MtmdGenAudioError::UnknownType(i64::from(other))),
         }
     }
@@ -1119,6 +1123,32 @@ pub struct MtmdGenAudioInput<'a> {
     pub seed: u32,
 }
 
+/// `MTMD_HELPER_GEN_AUDIO_NEEDS_TEXT` from mtmd-helper.h: the step made no
+/// frame and waits for more reply text.
+const GEN_AUDIO_NEEDS_TEXT: i32 = 2;
+
+/// What a conditioned pipeline speaks about: the user turns its paired
+/// reading model answered.
+#[derive(Debug)]
+pub struct MtmdGenAudioCond<'a> {
+    /// The user turns as the reading model saw them, one token per position;
+    /// media positions hold the model's placeholder token.
+    pub user_tokens: &'a [LlamaToken],
+    /// One row of the reading model's inner hidden state per media position,
+    /// in order, each `hidden_width` wide.
+    pub hidden: &'a [f32],
+    /// Width of a hidden row.
+    pub hidden_width: usize,
+    /// Voice name.
+    pub voice: &'a str,
+    /// Top-k for the projector's own sampling.
+    pub top_k: i32,
+    /// Top-p for the projector's own sampling.
+    pub top_p: f32,
+    /// Seed for the projector's own sampling.
+    pub seed: u32,
+}
+
 /// One frame step's result.
 #[derive(Debug, Clone, Copy)]
 pub struct MtmdGenAudioStep {
@@ -1126,6 +1156,9 @@ pub struct MtmdGenAudioStep {
     pub h_state: Option<*const f32>,
     /// The model reached the end of speech.
     pub stop: bool,
+    /// No frame was made: the pipeline has spoken all reply text handed to it
+    /// so far and needs more (or the end of the reply) first.
+    pub needs_text: bool,
 }
 
 /// Audio generation over a language-model context and its projector: the
@@ -1185,6 +1218,65 @@ impl MtmdGenAudio {
         }
     }
 
+    /// Start a generation that speaks the reply to `cond`; the reply arrives
+    /// through [`Self::push_text`].
+    ///
+    /// # Errors
+    ///
+    /// When the pipeline does not take a reading model's turn, the voice is
+    /// unknown, the rows do not match the media positions, or the backend
+    /// refuses the input.
+    pub fn set_cond(&mut self, cond: &MtmdGenAudioCond<'_>) -> Result<(), MtmdGenAudioError> {
+        unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_reset(self.ptr.as_ptr()) };
+        self.text = CString::new(cond.voice)?;
+        self.language = None;
+        let width = i32::try_from(cond.hidden_width).map_err(|_| MtmdGenAudioError::Step(-1))?;
+        let n_hidden = if cond.hidden_width == 0 { 0 } else { cond.hidden.len() / cond.hidden_width };
+        if n_hidden * cond.hidden_width != cond.hidden.len() {
+            return Err(MtmdGenAudioError::Step(-1));
+        }
+        let tokens: Vec<llama_cpp_sys_2::llama_token> = cond.user_tokens.iter().map(|t| t.0).collect();
+        let inp = llama_cpp_sys_2::mtmd_helper_gen_audio_inp {
+            seq_id: 0,
+            prompt: std::ptr::null(),
+            prompt_len: 0,
+            speaker_ref: std::ptr::null_mut(),
+            lang: std::ptr::null(),
+            top_k: cond.top_k,
+            top_p: cond.top_p,
+            seed: cond.seed,
+            out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
+        };
+        let c = llama_cpp_sys_2::mtmd_helper_gen_audio_cond {
+            tokens: tokens.as_ptr(),
+            n_tokens: i32::try_from(tokens.len()).map_err(|_| MtmdGenAudioError::Step(-1))?,
+            hidden: if cond.hidden.is_empty() { std::ptr::null() } else { cond.hidden.as_ptr() },
+            n_hidden: i32::try_from(n_hidden).map_err(|_| MtmdGenAudioError::Step(-1))?,
+            n_hidden_embd: width,
+            speaker: self.text.as_ptr(),
+        };
+        match unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_set_cond(self.ptr.as_ptr(), &raw const inp, &raw const c) } {
+            0 => Ok(()),
+            code => Err(MtmdGenAudioError::Step(code)),
+        }
+    }
+
+    /// Hand over reply tokens as the reading model produces them, including
+    /// its end-of-turn token; `done` marks the end of the reply.
+    ///
+    /// # Errors
+    ///
+    /// When a token is outside the reading model's vocabulary or the reply
+    /// was already complete.
+    pub fn push_text(&mut self, tokens: &[LlamaToken], done: bool) -> Result<(), MtmdGenAudioError> {
+        let raw: Vec<llama_cpp_sys_2::llama_token> = tokens.iter().map(|t| t.0).collect();
+        let n = i32::try_from(raw.len()).map_err(|_| MtmdGenAudioError::Step(-1))?;
+        match unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_push_text(self.ptr.as_ptr(), raw.as_ptr(), n, done) } {
+            0 => Ok(()),
+            code => Err(MtmdGenAudioError::Step(code)),
+        }
+    }
+
     /// Read at most `n_batch` prompt tokens; returns how many remain.
     ///
     /// # Errors
@@ -1223,12 +1315,14 @@ impl MtmdGenAudio {
                 &raw mut stop,
             )
         };
-        if code != 0 {
+        let needs_text = code == GEN_AUDIO_NEEDS_TEXT;
+        if code != 0 && !needs_text {
             return Err(MtmdGenAudioError::Step(code));
         }
         Ok(MtmdGenAudioStep {
             h_state: (!out.is_null()).then_some(out),
             stop,
+            needs_text,
         })
     }
 
