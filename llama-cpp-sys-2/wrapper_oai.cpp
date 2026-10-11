@@ -336,7 +336,7 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
             out_result->grammar = llama_rs_dup_string(params.grammar);
         }
         if (!params.parser.empty()) {
-            out_result->parser = llama_rs_dup_string(params.parser);
+            out_result->parser = llama_rs_dup_string(params.parser.save());
         }
         if (!params.generation_prompt.empty()) {
             out_result->generation_prompt = llama_rs_dup_string(params.generation_prompt);
@@ -476,7 +476,7 @@ static llama_rs_status apply_chat_template_oaicompat(
             out_result->grammar = llama_rs_dup_string(params_out.grammar);
         }
         if (!params_out.parser.empty()) {
-            out_result->parser = llama_rs_dup_string(params_out.parser);
+            out_result->parser = llama_rs_dup_string(params_out.parser.save());
         }
         if (!params_out.generation_prompt.empty()) {
             out_result->generation_prompt = llama_rs_dup_string(params_out.generation_prompt);
@@ -538,15 +538,17 @@ extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
     try {
         common_chat_parser_params syntax;
         syntax.format = static_cast<common_chat_format>(chat_format);
-        syntax.parse_tool_calls = parse_tool_calls;
+        // The parser built with the template decides what is parsed: a template
+        // applied without tools has no tool-call rules.
+        (void) parse_tool_calls;
         if (generation_prompt && std::strlen(generation_prompt) > 0) {
-            syntax.generation_prompt = generation_prompt;
+            syntax.generation_prompt = common_chat_input(std::string(generation_prompt));
         }
         if (parser_data && std::strlen(parser_data) > 0) {
             syntax.parser.load(parser_data);
         }
 
-        auto msg = common_chat_parse(input, is_partial, syntax);
+        auto msg = common_chat_parse(common_chat_input(std::string(input)), is_partial, syntax);
         std::vector<std::string> ids_cache;
         msg.set_tool_call_ids(ids_cache, []() { return random_string(); });
         auto json_msg = msg.to_json_oaicompat().dump();
@@ -620,9 +622,11 @@ extern "C" struct llama_rs_chat_parse_state_oaicompat * llama_rs_chat_parse_stat
     try {
         common_chat_parser_params syntax;
         syntax.format = static_cast<common_chat_format>(chat_format);
-        syntax.parse_tool_calls = parse_tool_calls;
+        // The parser built with the template decides what is parsed: a template
+        // applied without tools has no tool-call rules.
+        (void) parse_tool_calls;
         if (generation_prompt && std::strlen(generation_prompt) > 0) {
-            syntax.generation_prompt = generation_prompt;
+            syntax.generation_prompt = common_chat_input(std::string(generation_prompt));
         }
         if (parser_data && std::strlen(parser_data) > 0) {
             syntax.parser.load(parser_data);
@@ -652,7 +656,7 @@ extern "C" llama_rs_status llama_rs_chat_parse_state_update_oaicompat(
             state->generated_text += text_added;
         }
         auto msg_prv_copy = state->chat_msg;
-        auto new_msg = common_chat_parse(state->generated_text, is_partial, state->syntax);
+        auto new_msg = common_chat_parse(common_chat_input(state->generated_text), is_partial, state->syntax);
         std::vector<common_chat_msg_diff> diffs;
         if (!new_msg.empty()) {
             new_msg.set_tool_call_ids(state->generated_tool_call_ids, []() {

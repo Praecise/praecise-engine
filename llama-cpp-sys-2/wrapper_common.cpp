@@ -226,6 +226,30 @@ struct llama_rs_mtp_speculative {
 
 static constexpr llama_seq_id LLAMA_RS_MTP_SEQ_ID = 0;
 
+// The speculative contexts read a common_batch: the token, position, sequence
+// ids and output flag of each entry. A token batch from the caller is mirrored
+// into one; the draft contexts decode their own batches.
+static common_batch llama_rs_common_batch_from(const struct llama_batch & batch) {
+    common_batch out;
+    out.tokens.reserve(batch.n_tokens);
+    for (int32_t k = 0; k < batch.n_tokens; ++k) {
+        common_batch::token t{};
+        t.id = batch.token ? batch.token[k] : LLAMA_TOKEN_NULL;
+        t.pos.fill(0);
+        t.pos[0] = batch.pos ? batch.pos[k] : k;
+        const int32_t n_seq = batch.n_seq_id ? batch.n_seq_id[k] : 0;
+        t.seq_id = n_seq > 0 && batch.seq_id ? batch.seq_id[k][0] : 0;
+        for (int32_t s = 1; s < n_seq; ++s) {
+            t.seq_ids_extra.push_back(batch.seq_id[k][s]);
+        }
+        t.output = batch.logits ? batch.logits[k] != 0 : k == batch.n_tokens - 1;
+        t.embd   = { nullptr, 0, 0 };
+        t.state  = { nullptr, 0, 0 };
+        out.tokens.push_back(std::move(t));
+    }
+    return out;
+}
+
 static bool llama_rs_mtp_batch_compatible(const struct llama_batch & batch) {
     if (batch.n_tokens <= 0 || !batch.token || batch.embd || !batch.pos || !batch.n_seq_id ||
         !batch.seq_id) {
@@ -324,7 +348,7 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_process(
     }
 
     try {
-        return common_speculative_process(spec->spec, *batch)
+        return common_speculative_process(spec->spec, llama_rs_common_batch_from(*batch))
             ? LLAMA_RS_STATUS_OK
             : LLAMA_RS_STATUS_EXCEPTION;
     } catch (...) {
@@ -565,7 +589,7 @@ extern "C" llama_rs_status llama_rs_spec_batch_process(
         return LLAMA_RS_STATUS_INVALID_ARGUMENT;
     }
     try {
-        return common_speculative_process(spec->spec, *batch)
+        return common_speculative_process(spec->spec, llama_rs_common_batch_from(*batch))
             ? LLAMA_RS_STATUS_OK
             : LLAMA_RS_STATUS_EXCEPTION;
     } catch (...) {
