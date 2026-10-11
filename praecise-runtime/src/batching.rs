@@ -54,8 +54,7 @@ use std::time::{Duration, Instant};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
-use llama_cpp_2::openai::OpenAIChatTemplateParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 #[cfg(feature = "mtmd")]
@@ -68,9 +67,8 @@ use crate::kv_migration::{ModelFingerprint, SequenceExport, SequenceImport};
 use crate::prefix_cache::{
     CheckpointBudget, CheckpointStore, MediaSpan, MemoryTraits, Namespace, PrefixId, Reuse, Rewind, TurnEnds,
 };
-use crate::prompt::render_chatml_prompt;
 use crate::result::{ChatMessage, InferenceResult, StopReason};
-use crate::stream::{ReasoningFrame, StopStream};
+use crate::stream::{ReplyFormat, StopStream};
 use crate::toploc::{InferenceCommitment, StepRecord};
 use llama_cpp_2::context::params::LlamaContextType;
 use llama_cpp_2::speculative::{MtpSpeculativeParams, SpeculativeBatch};
@@ -210,9 +208,9 @@ pub struct SequenceHandoff {
     pub text: String,
     /// All reasoning generated before the handoff.
     pub thinking: Option<String>,
-    /// The reasoning markers the sequence was split on, with
-    /// `open_at_start` set when it was inside a reasoning span.
-    pub reasoning: ReasoningFrame,
+    /// Everything the sequence decoded before the handoff, so the destination
+    /// reads its continuation as the rest of the same reply.
+    pub generated: String,
 }
 
 /// A sequence to rebuild from its blob chain and continue, for
@@ -222,8 +220,8 @@ pub struct SequenceResume {
     pub blobs: Vec<Vec<u8>>,
     /// [`SequenceHandoff::next_token`].
     pub next_token: i32,
-    /// [`SequenceHandoff::reasoning`].
-    pub reasoning: ReasoningFrame,
+    /// [`SequenceHandoff::generated`].
+    pub generated: String,
     /// Sampling for the continuation. `max_tokens` counts tokens generated
     /// after the resume; the imported positions are the request's input.
     pub config: GenerationConfig,
@@ -293,6 +291,8 @@ struct EngineInner {
     /// Why sequences cannot move, when the model rules it out whatever the
     /// engine was spawned with.
     migration_refusal: Option<&'static str>,
+    /// The served model's chat template.
+    chat_template: Option<crate::chat_format::ChatTemplateSource>,
     next_ticket: std::sync::atomic::AtomicU64,
 }
 
@@ -433,6 +433,9 @@ impl BatchEngine {
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<Control>();
 
+        // Read before the model moves onto the scheduler thread. A model
+        // without a template still serves raw prompts.
+        let chat_template = crate::chat_format::ChatTemplateSource::from_model(&model).ok();
         let model_id_thread = model_id.clone();
         let handle = std::thread::Builder::new()
             .name(format!("batch-{}", model_id))
@@ -468,6 +471,7 @@ impl BatchEngine {
                 control: control_tx,
                 migration,
                 migration_refusal: None,
+                chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
             }),
         })
@@ -495,6 +499,7 @@ impl BatchEngine {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(max_slots());
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
         let (control_tx, _control_rx) = std::sync::mpsc::channel::<Control>();
+        let chat_template = crate::chat_format::ChatTemplateSource::from_model(&model).ok();
         let model_id_thread = model_id.clone();
         let handle = std::thread::Builder::new()
             .name(format!("denoise-{model_id}"))
@@ -522,6 +527,7 @@ impl BatchEngine {
                 control: control_tx,
                 migration: None,
                 migration_refusal: Some("it decodes by diffusion and holds no causal cache to move"),
+                chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
             }),
         })
@@ -639,6 +645,13 @@ impl BatchEngine {
                 Error::Other(format!("batch engine for {} is no longer running", self.inner.model_id))
             }
         })
+    }
+
+    /// The served model's chat template, for rendering a turn with
+    /// [`ChatFormat`](crate::chat_format::ChatFormat) and reading its reply.
+    /// `None` for a model that carries none.
+    pub fn chat_template(&self) -> Option<&crate::chat_format::ChatTemplateSource> {
+        self.inner.chat_template.as_ref()
     }
 
     /// The model this engine serves.
@@ -767,7 +780,7 @@ fn probe_turn_ends(model: &LlamaModel) -> TurnEnds {
         ChatMessage::new("assistant", probes[1]),
         ChatMessage::new("user", probes[2]),
     ];
-    if let Ok(rendered) = render_prompt(model, &BatchPrompt::Chat(messages), false, None) {
+    if let Ok((rendered, _)) = render_prompt(model, &BatchPrompt::Chat(messages), false, None) {
         for probe in &probes[..2] {
             let Some(at) = rendered.find(probe) else { continue };
             let after = &rendered[at + probe.len()..];
@@ -973,9 +986,12 @@ impl Sequence {
 
     /// Close this sequence's stream for a handoff and tell its caller.
     fn hand_off(mut self, blob: Vec<u8>) -> SequenceHandoff {
-        let reasoning = ReasoningFrame { open_at_start: self.stream.in_reasoning(), ..self.stream.frame() };
+        let generated = self.stream.generated().to_string();
         let token_tx = self.token_tx.take();
-        let (text, thinking) = self.stream.close(token_tx.as_ref());
+        // A reader that refused the text has already ended the sequence, so a
+        // sequence being handed off has a readable reply.
+        let reply = self.stream.close(token_tx.as_ref()).unwrap_or_default();
+        let (text, thinking) = (reply.text, reply.thinking);
         let _ = self.stream.flush(token_tx.as_ref());
         self.fail(Error::SequenceHandedOff);
         SequenceHandoff {
@@ -984,7 +1000,7 @@ impl Sequence {
             generated_tokens: self.output_tokens - self.forced_tokens,
             text,
             thinking,
-            reasoning,
+            generated,
         }
     }
 }
@@ -1218,14 +1234,14 @@ fn reasoning_budget(config: &GenerationConfig) -> Option<u32> {
     })
 }
 
-/// The tokens that close a reasoning block in this template: `</think>` and the
-/// blank line Qwen's template puts after it, or Gemma 4's `<channel|>`.
-fn close_marker_tokens(model: &LlamaModel, frame: ReasoningFrame) -> Vec<LlamaToken> {
-    let text = if frame == ReasoningFrame::GEMMA4_THOUGHT || frame.close == ReasoningFrame::GEMMA4_THOUGHT.close {
-        frame.close.to_string()
-    } else {
-        format!("{}\n\n", frame.close)
+/// The tokens that close a reasoning block in the reply's format, followed by
+/// the blank line templates write after an XML-style closing tag. Empty when
+/// the format has no reasoning block, which leaves the budget unenforced.
+fn close_marker_tokens(model: &LlamaModel, format: Option<&Arc<dyn ReplyFormat>>) -> Vec<LlamaToken> {
+    let Some(end) = format.and_then(|f| f.reasoning_end()) else {
+        return Vec::new();
     };
+    let text = if end.starts_with("</") { format!("{end}\n\n") } else { end.to_string() };
     model.str_to_token(&text, AddBos::Never).unwrap_or_default()
 }
 
@@ -1396,15 +1412,23 @@ impl Sequence {
         };
         let token_tx = self.token_tx.take();
         let stalled = self.stream.stalled();
-        let (text, thinking) = self.stream.close(token_tx.as_ref());
+        let reply = self.stream.close(token_tx.as_ref());
         let result_tx = self.result_tx.take()?;
         if stalled {
             let _ = result_tx.send(Err(stalled_stream()));
             return None;
         }
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => {
+                let _ = result_tx.send(Err(e));
+                return None;
+            }
+        };
         let result = InferenceResult {
-            text,
-            thinking,
+            text: reply.text,
+            thinking: reply.thinking,
+            tool_calls: reply.tool_calls,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens - self.forced_tokens,
             generation_time_ms,
@@ -2236,11 +2260,11 @@ fn admit_resume(
         resume.config,
         resume.token_tx,
         resume.result_tx,
-        resume.reasoning,
         staged,
         namespace,
         max_pos,
     );
+    seq.stream = std::mem::replace(&mut seq.stream, StopStream::new(Vec::new())).continuing(&resume.generated);
     // The cache already holds every position: nothing to prefill, and the
     // first decode feeds the token the source sampled last.
     seq.pending_prompt = None;
@@ -2378,7 +2402,7 @@ struct Staged {
 const MEDIA_PLACEHOLDER: LlamaToken = LlamaToken(-1);
 
 /// Render the request's prompt with its thinking mode and effort level.
-fn render_request(model: &LlamaModel, req: &BatchRequest, enable_thinking: bool) -> Result<String> {
+fn render_request(model: &LlamaModel, req: &BatchRequest, enable_thinking: bool) -> Result<Rendered> {
     render_with_config(model, &req.prompt, &req.config, enable_thinking)
 }
 
@@ -2389,7 +2413,7 @@ pub(crate) fn render_with_config(
     prompt: &BatchPrompt,
     config: &GenerationConfig,
     enable_thinking: bool,
-) -> Result<String> {
+) -> Result<Rendered> {
     // The engine's thinking mode is the default; a request may override it.
     // This is what lets one served model answer plainly to API callers and
     // show its reasoning to a client that asked to see it.
@@ -2486,14 +2510,19 @@ fn admit(
         }));
         return None;
     }
+    let mut req = req;
     let prompt = match render_request(model, &req, enable_thinking) {
-        Ok(p) => p,
+        Ok((p, format)) => {
+            if req.config.reply_format.is_none() {
+                req.config.reply_format = format;
+            }
+            p
+        }
         Err(e) => {
             let _ = req.result_tx.send(Err(e));
             return None;
         }
     };
-    let frame = ReasoningFrame::for_prompt(&prompt);
     let staged = if req.media.is_empty() {
         stage_text(model, &prompt)
     } else {
@@ -2530,7 +2559,7 @@ fn admit(
         0
     };
     let max_pos = ctx_size.min(input_tokens as i32 + req.config.max_tokens as i32);
-    let seq = Sequence::new(model, req.config, req.token_tx, req.result_tx, frame, staged, namespace, max_pos);
+    let seq = Sequence::new(model, req.config, req.token_tx, req.result_tx, staged, namespace, max_pos);
     install(slots, slot_idx, seq);
     Some(PrefixReuse { slot_idx, shared })
 }
@@ -2544,7 +2573,6 @@ impl Sequence {
         config: GenerationConfig,
         token_tx: Option<tokio::sync::mpsc::Sender<String>>,
         result_tx: tokio::sync::oneshot::Sender<Result<InferenceResult>>,
-        frame: ReasoningFrame,
         staged: Staged,
         namespace: Namespace,
         max_pos: i32,
@@ -2571,8 +2599,11 @@ impl Sequence {
             forced_tokens: 0,
             max_pos,
             reasoning_budget: reasoning_budget(&config),
-            close_tokens: close_marker_tokens(model, frame),
-            stream: StopStream::new(config.stop).framed(frame).nonblocking().with_reasoning(config.reasoning_tx),
+            close_tokens: close_marker_tokens(model, config.reply_format.as_ref()),
+            stream: StopStream::new(config.stop)
+                .reading(config.reply_format.as_ref())
+                .nonblocking()
+                .with_reasoning(config.reasoning_tx),
             started: Instant::now(),
             speculate: false,
             reasoning_tokens: 0,
@@ -2613,7 +2644,14 @@ fn admit_encoder_decoder(
         )));
         return;
     }
-    let prompt = match render_request(model, &req, enable_thinking).and_then(|p| stage_text(model, &p)) {
+    let mut req = req;
+    let rendered = render_request(model, &req, enable_thinking).and_then(|(p, format)| {
+        if req.config.reply_format.is_none() {
+            req.config.reply_format = format;
+        }
+        stage_text(model, &p)
+    });
+    let prompt = match rendered {
         Ok(s) if !s.tokens.is_empty() => s.tokens,
         Ok(_) => {
             let _ = req.result_tx.send(Err(Error::Other("empty prompt".into())));
@@ -2650,7 +2688,6 @@ fn admit_encoder_decoder(
         t if t.0 >= 0 => t,
         _ => model.token_bos(),
     };
-    let frame = ReasoningFrame::default();
     let staged = Staged {
         ids: text_ids(&[start]),
         tokens: vec![start],
@@ -2659,7 +2696,7 @@ fn admit_encoder_decoder(
         media: None,
     };
     let max_pos = ctx_size.min(1 + req.config.max_tokens as i32);
-    let mut seq = Sequence::new(model, req.config, req.token_tx, req.result_tx, frame, staged, namespace, max_pos);
+    let mut seq = Sequence::new(model, req.config, req.token_tx, req.result_tx, staged, namespace, max_pos);
     // Billed and reported against the encoder input, which is the prompt.
     seq.input_tokens = prompt.len() as u32;
     seq.max_pos = max_pos + seq.input_tokens as i32 - 1;
@@ -2851,88 +2888,35 @@ struct PrefixReuse {
     shared: usize,
 }
 
-/// Render a [`BatchPrompt`] to the final prompt string fed to the tokenizer.
-///
-/// Backend-generic: uses the model's own embedded GGUF chat template, falling
-/// back to ChatML. A host with model-specific templating (e.g. tool-calling
-/// grammars or arch-specific native chat formats) renders upstream and submits
-/// a [`BatchPrompt::Raw`]. `_enable_thinking` is reserved for templates that
-/// take a reasoning-toggle variable; this binding's `apply_chat_template` does
-/// not, so the model's template default applies.
+/// A rendered prompt and, for a chat turn, the format its reply is read in.
+pub(crate) type Rendered = (String, Option<Arc<dyn ReplyFormat>>);
+
 /// Render the prompt the engine will prefill.
 ///
-/// The thinking switch and effort level are template variables, so they only
-/// exist if the render passes them: the model's own Jinja template reads
-/// `enable_thinking` (a Qwen-family template prefills `<think>\n\n</think>\n\n`
-/// when it is false, and opens a `<think>` block when it is true or absent)
-/// and `reasoning_effort`. The legacy three-argument render carries neither,
-/// which is how a model served here thought on every request whatever the
-/// caller sent — the flag was plumbed all the way to a function that dropped
-/// it. Measured on qwen3.8-flash-next: 1,200-3,800 characters of reasoning
-/// with `enable_thinking: false`, and an empty answer at a 300-token budget.
-///
-/// Rendering goes through the OpenAI-compatible entry point with the
-/// variables set; a template that cannot be applied that way falls back to
-/// the legacy render, then to ChatML, exactly as before.
+/// A raw prompt is used as given. Chat turns are rendered through the model's
+/// own template, with the thinking switch and effort level as template
+/// variables, and the reply is read in the format of that render. A model
+/// without a usable template is refused: a prompt in a format the model was
+/// not trained on produces echoes and loops, not an answer.
 fn render_prompt(
     model: &LlamaModel,
     prompt: &BatchPrompt,
     enable_thinking: bool,
     reasoning: Option<(&str, &str)>,
-) -> Result<String> {
+) -> Result<Rendered> {
     match prompt {
-        BatchPrompt::Raw(s) => Ok(s.clone()),
+        BatchPrompt::Raw(s) => Ok((s.clone(), None)),
         BatchPrompt::Chat(messages) => {
-            if let Ok(tmpl) = model.chat_template(None) {
-                if let Ok(messages_json) = serde_json::to_string(messages) {
-                    let kwargs = reasoning.and_then(|(name, value)| {
-                        let mut map = serde_json::Map::new();
-                        map.insert(name.to_string(), serde_json::Value::String(value.to_string()));
-                        serde_json::to_string(&serde_json::Value::Object(map)).ok()
-                    });
-                    let params = OpenAIChatTemplateParams {
-                        messages_json: &messages_json,
-                        tools_json: None,
-                        tool_choice: None,
-                        json_schema: None,
-                        grammar: None,
-                        reasoning_format: None,
-                        chat_template_kwargs: kwargs.as_deref(),
-                        add_generation_prompt: true,
-                        use_jinja: true,
-                        parallel_tool_calls: false,
-                        enable_thinking,
-                        // The tokenizer adds BOS at prefill (`AddBos::Always`);
-                        // adding it here as well would double it.
-                        add_bos: false,
-                        add_eos: false,
-                        parse_tool_calls: false,
-                        force_pure_content: false,
-                    };
-                    if let Ok(rendered) = model.apply_chat_template_oaicompat(&tmpl, &params)
-                        && !rendered.prompt.trim().is_empty()
-                    {
-                        return Ok(rendered.prompt);
-                    }
-                }
-
-                // Legacy render: no template variables, so thinking follows the
-                // template's own default. Kept only as the fallback for a
-                // template the Jinja path cannot apply.
-                let llama_messages: Vec<LlamaChatMessage> = messages
-                    .iter()
-                    .map(|m| {
-                        LlamaChatMessage::new(m.role.clone(), m.content.clone())
-                            .map_err(|e| Error::Other(format!("Invalid chat message: {}", e)))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if let Ok(rendered) = model.apply_chat_template(&tmpl, &llama_messages, true)
-                    && !rendered.trim().is_empty()
-                {
-                    return Ok(rendered);
-                }
-            }
-            Ok(render_chatml_prompt(messages))
+            let source = crate::chat_format::ChatTemplateSource::from_model(model)?;
+            let kwargs = reasoning.map(|(name, value)| serde_json::json!({ name: value }));
+            let turn = crate::chat_format::ChatTurn {
+                enable_thinking,
+                template_kwargs: kwargs.as_ref(),
+                ..crate::chat_format::ChatTurn::new(messages)
+            };
+            let format = crate::chat_format::ChatFormat::render(&source, &turn)?;
+            let prompt = format.prompt().to_string();
+            Ok((prompt, Some(Arc::new(format))))
         }
     }
 }

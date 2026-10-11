@@ -129,7 +129,9 @@ pub fn generate_ngram_speculative(
 
     let mut sampler = build_sampler_chain(config, model.n_vocab());
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut stream = StopStream::new(config.stop.clone());
+    let mut stream = StopStream::new(config.stop.clone())
+        .reading(config.reply_format.as_ref())
+        .with_reasoning(config.reasoning_tx.clone());
 
     let mut n_past = tokens_list.len() as i32;
     let mut id_last = sampler.sample(&ctx, -1);
@@ -243,12 +245,13 @@ pub fn generate_ngram_speculative(
         0.0
     };
     let stop_reason = StopReason::from_loop(stream.hit_stop(), output_tokens, config.max_tokens);
-    let (text, thinking) = stream.finish_parts(token_tx);
+    let reply = stream.finish_parts(token_tx)?;
 
     Ok((
         InferenceResult {
-            text,
-            thinking,
+            text: reply.text,
+            thinking: reply.thinking,
+            tool_calls: reply.tool_calls,
             input_tokens,
             output_tokens,
             generation_time_ms,

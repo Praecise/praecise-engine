@@ -99,6 +99,16 @@ llama_rs_status llama_rs_apply_chat_template_oaicompat(
     const struct llama_rs_chat_template_oaicompat_params * params,
     struct llama_rs_chat_template_result * out_result);
 
+// As llama_rs_apply_chat_template_oaicompat, from a template source alone: no
+// loaded model is needed. `bos_token` and `eos_token` are the text the template
+// sees for those variables; NULL is the empty string.
+llama_rs_status llama_rs_apply_chat_template_source_oaicompat(
+    const char * chat_template,
+    const char * bos_token,
+    const char * eos_token,
+    const struct llama_rs_chat_template_oaicompat_params * params,
+    struct llama_rs_chat_template_result * out_result);
+
 llama_rs_status llama_rs_chat_parse_to_oaicompat(
     const char * input,
     bool is_partial,

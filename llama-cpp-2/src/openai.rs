@@ -117,6 +117,10 @@ impl ChatParseStateOaicompat {
     }
 }
 
+// SAFETY: the state is a parser object owned by this handle alone, with no
+// thread affinity; moving it to another thread is sound. It is not `Sync`.
+unsafe impl Send for ChatParseStateOaicompat {}
+
 impl Drop for ChatParseStateOaicompat {
     fn drop(&mut self) {
         unsafe { llama_cpp_sys_2::llama_rs_chat_parse_state_free_oaicompat(self.state.as_ptr()) };

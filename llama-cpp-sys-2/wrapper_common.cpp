@@ -54,6 +54,9 @@ extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template
     if (result->generation_prompt) {
         std::free(result->generation_prompt);
     }
+    if (result->thinking_end_tag) {
+        std::free(result->thinking_end_tag);
+    }
     if (result->grammar_triggers) {
         for (size_t i = 0; i < result->grammar_triggers_count; ++i) {
             std::free(result->grammar_triggers[i].value);

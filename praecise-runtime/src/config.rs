@@ -68,10 +68,11 @@ pub struct GenerationConfig {
     /// at most 2048) for the answer and lets reasoning have the rest.
     #[serde(default)]
     pub reasoning_budget: Option<u32>,
-    /// The reasoning frame of the prompt this config is generating from, set
-    /// where the prompt is rendered. `None` is `<think>`, not already open.
+    /// The chat format the reply is read in, set where a chat turn is
+    /// rendered: the answer, reasoning and tool calls come back split by it.
+    /// `None` returns the generated text as the answer.
     #[serde(skip)]
-    pub reasoning_frame: Option<crate::stream::ReasoningFrame>,
+    pub reply_format: Option<std::sync::Arc<dyn crate::stream::ReplyFormat>>,
     /// Where the model's reasoning is streamed as it is produced, apart from
     /// the answer's token channel. `None` returns the reasoning only on the
     /// finished result's `thinking`.
@@ -123,7 +124,7 @@ impl Default for GenerationConfig {
             reasoning_effort: None,
             reasoning_kwarg: None,
             reasoning_budget: None,
-            reasoning_frame: None,
+            reply_format: None,
             reasoning_tx: None,
             response_format: None,
             enable_thinking: None,

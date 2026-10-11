@@ -110,7 +110,7 @@ pub fn generate_speculative(
     let mut output_tokens: u32 = 0;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut stream = StopStream::new(config.stop.clone())
-        .framed(config.reasoning_frame.unwrap_or_default())
+        .reading(config.reply_format.as_ref())
         .with_reasoning(config.reasoning_tx.clone());
     let max_pos = (n_ctx_target.get() as i32).min(input_tokens as i32 + config.max_tokens as i32);
     let commitment_k = config.commitment_k.map(|k| usize::from(crate::toploc::commitment_k_for(k)));
@@ -282,10 +282,11 @@ pub fn generate_speculative(
         StopReason::Eos if n_past >= max_pos && !target_model.is_eog_token(id_last) => StopReason::Length,
         reason => reason,
     };
-    let (text, thinking) = stream.finish_parts(token_tx);
+    let reply = stream.finish_parts(token_tx)?;
     Ok(InferenceResult {
-        text,
-        thinking,
+        text: reply.text,
+        thinking: reply.thinking,
+        tool_calls: reply.tool_calls,
         input_tokens,
         output_tokens,
         generation_time_ms,

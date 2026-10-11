@@ -291,6 +291,7 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
     out_result->grammar = nullptr;
     out_result->parser = nullptr;
     out_result->generation_prompt = nullptr;
+    out_result->thinking_end_tag = nullptr;
     out_result->chat_format = 0;
     out_result->grammar_lazy = false;
     out_result->grammar_triggers = nullptr;
@@ -377,9 +378,36 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
     }
 }
 
+static llama_rs_status apply_chat_template_oaicompat(
+    const struct llama_model * model,
+    const char * chat_template,
+    const char * bos_token,
+    const char * eos_token,
+    const struct llama_rs_chat_template_oaicompat_params * params,
+    struct llama_rs_chat_template_result * out_result);
+
 extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
     const struct llama_model * model,
     const char * chat_template,
+    const struct llama_rs_chat_template_oaicompat_params * params,
+    struct llama_rs_chat_template_result * out_result) {
+    return apply_chat_template_oaicompat(model, chat_template, nullptr, nullptr, params, out_result);
+}
+
+extern "C" llama_rs_status llama_rs_apply_chat_template_source_oaicompat(
+    const char * chat_template,
+    const char * bos_token,
+    const char * eos_token,
+    const struct llama_rs_chat_template_oaicompat_params * params,
+    struct llama_rs_chat_template_result * out_result) {
+    return apply_chat_template_oaicompat(nullptr, chat_template, bos_token, eos_token, params, out_result);
+}
+
+static llama_rs_status apply_chat_template_oaicompat(
+    const struct llama_model * model,
+    const char * chat_template,
+    const char * bos_token,
+    const char * eos_token,
     const struct llama_rs_chat_template_oaicompat_params * params,
     struct llama_rs_chat_template_result * out_result) {
     if (!chat_template || !params || !out_result) {
@@ -394,6 +422,7 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
     out_result->grammar = nullptr;
     out_result->parser = nullptr;
     out_result->generation_prompt = nullptr;
+    out_result->thinking_end_tag = nullptr;
     out_result->chat_format = 0;
     out_result->grammar_lazy = false;
     out_result->grammar_triggers = nullptr;
@@ -404,7 +433,8 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
     out_result->additional_stops_count = 0;
 
     try {
-        auto tmpls = common_chat_templates_init(model, chat_template);
+        auto tmpls = common_chat_templates_init(
+            model, chat_template, bos_token ? bos_token : "", eos_token ? eos_token : "");
         common_chat_templates_inputs inputs;
         inputs.add_generation_prompt = params->add_generation_prompt;
         inputs.use_jinja = params->use_jinja;
@@ -450,6 +480,9 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
         }
         if (!params_out.generation_prompt.empty()) {
             out_result->generation_prompt = llama_rs_dup_string(params_out.generation_prompt);
+        }
+        if (!params_out.thinking_end_tags.empty() && !params_out.thinking_end_tags.front().empty()) {
+            out_result->thinking_end_tag = llama_rs_dup_string(params_out.thinking_end_tags.front());
         }
         out_result->chat_format = static_cast<int>(params_out.format);
         out_result->grammar_lazy = params_out.grammar_lazy;

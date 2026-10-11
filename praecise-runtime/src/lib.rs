@@ -79,6 +79,12 @@ pub mod toploc;
 #[cfg(feature = "bundled-llama")]
 pub mod sampling;
 
+/// Chat turns rendered through the model's own template, and replies read
+/// back into answer, reasoning and tool calls. Compiled only with a bundled
+/// backend.
+#[cfg(feature = "bundled-llama")]
+pub mod chat_format;
+
 /// Continuous batching engine. Compiled only with a bundled backend.
 #[cfg(feature = "bundled-llama")]
 pub mod batching;
@@ -136,13 +142,15 @@ pub use staging::StagedWeights;
 pub use ngram::NgramCache;
 pub use spec_policy::{plan as plan_speculation, LoadState, ModelProfile, SpecMethod, SpecPlan, SpecPolicy};
 pub use prompt::render_chatml_prompt;
-pub use result::{ChatMessage, InferenceResult, StopReason};
-pub use stream::{matched_stop_len, StopStream};
+pub use result::{ChatMessage, InferenceResult, ParsedReply, ParsedToolCall, ReplyDelta, StopReason};
+pub use stream::{matched_stop_len, Reply, ReplyFormat, ReplyReader, StopStream};
 
 #[cfg(feature = "bundled-llama")]
 pub use batching::{
     max_slots, BatchEngine, BatchPrompt, BatchRequest, SequenceHandoff, SequenceResume, SequenceTicket,
 };
+#[cfg(feature = "bundled-llama")]
+pub use chat_format::{ChatFormat, ChatStream, ChatTemplateSource, ChatTurn};
 #[cfg(feature = "bundled-llama")]
 pub use loaded::{attach_adapter, AdapterSpec, LoadedDrafter, LoadedModel};
 #[cfg(feature = "bundled-llama")]

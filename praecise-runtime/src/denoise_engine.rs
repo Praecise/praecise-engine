@@ -41,7 +41,7 @@ use crate::denoise::{
 };
 use crate::error::{Error, Result};
 use crate::result::{InferenceResult, StopReason};
-use crate::stream::{ReasoningFrame, StopStream};
+use crate::stream::StopStream;
 
 /// How a model is decoded.
 #[derive(Debug, Clone, PartialEq)]
@@ -308,7 +308,7 @@ impl Running {
         };
         let stalled = self.stream.stalled();
         let token_tx = self.token_tx.take();
-        let (text, thinking) = self.stream.close(token_tx.as_ref());
+        let reply = self.stream.close(token_tx.as_ref());
         let result_tx = self.result_tx.take()?;
         if stalled {
             let _ = result_tx.send(Err(Error::Inference(
@@ -318,9 +318,17 @@ impl Running {
             )));
             return None;
         }
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => {
+                let _ = result_tx.send(Err(e));
+                return None;
+            }
+        };
         let result = InferenceResult {
-            text,
-            thinking,
+            text: reply.text,
+            thinking: reply.thinking,
+            tool_calls: reply.tool_calls,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             generation_time_ms,
@@ -350,12 +358,17 @@ fn admit(
     window: usize,
     n_ctx: usize,
 ) -> std::result::Result<Running, (tokio::sync::oneshot::Sender<Result<InferenceResult>>, Error)> {
-    let BatchRequest { prompt, config, token_tx, result_tx, media } = req;
+    let BatchRequest { prompt, mut config, token_tx, result_tx, media } = req;
     if !media.is_empty() {
         return Err((result_tx, Error::Other("this diffusion model reads text only; the request carries media".into())));
     }
     let rendered = match render_with_config(model, &prompt, &config, enable_thinking) {
-        Ok(p) => p,
+        Ok((p, format)) => {
+            if config.reply_format.is_none() {
+                config.reply_format = format;
+            }
+            p
+        }
         Err(e) => return Err((result_tx, e)),
     };
     let tokens = match model.str_to_token(&rendered, AddBos::Always) {
@@ -380,7 +393,6 @@ fn admit(
             )),
         ));
     }
-    let frame = ReasoningFrame::for_prompt(&rendered);
     let prompt_ids: Vec<i32> = tokens.iter().map(|t| t.0).collect();
     let mut rng = Rng::new(config.seed);
     let (canvas, answer_len, forbid) = match plan {
@@ -414,7 +426,7 @@ fn admit(
         answer_len,
         hit_end: false,
         decoder: encoding_rs::UTF_8.new_decoder(),
-        stream: StopStream::new(config.stop).framed(frame).nonblocking().with_reasoning(config.reasoning_tx),
+        stream: StopStream::new(config.stop).reading(config.reply_format.as_ref()).nonblocking().with_reasoning(config.reasoning_tx),
         token_tx,
         result_tx: Some(result_tx),
         started: Instant::now(),

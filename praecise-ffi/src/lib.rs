@@ -360,6 +360,7 @@ mod tests {
             cached_tokens: 0,
             forward_positions: None,
             denoise_steps: None,
+            tool_calls: Vec::new(),
         };
         let raw = PraeciseInferenceResult::new(inner).into_raw();
         unsafe {

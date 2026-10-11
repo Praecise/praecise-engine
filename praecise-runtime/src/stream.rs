@@ -1,11 +1,16 @@
-//! Streaming stop-sequence and reasoning-span handling.
+//! Streaming stop sequences and the reading of a reply in its chat format.
 //!
-//! Backend-free: this is pure text bookkeeping over decoded pieces, so it
-//! compiles and runs without a bundled backend. It accumulates decoded token
-//! pieces, splits reasoning spans (`<think>` … `</think>`) from visible text,
-//! detects stop sequences (which may span several tokens), and — when the
-//! caller is streaming — releases bytes only once they can no longer turn out
-//! to be the leading part of a stop sequence or a reasoning marker.
+//! Backend-free: this is text bookkeeping over decoded pieces, so it compiles
+//! and runs without a bundled backend. It accumulates decoded token pieces,
+//! detects stop sequences (which may span several tokens), and, when the
+//! generation has a chat format, hands the text to that format's
+//! [`ReplyReader`], which splits it into answer, reasoning and tool calls.
+//! When the caller is streaming, bytes are released only once they can no
+//! longer turn out to be the leading part of a stop sequence.
+
+use std::sync::Arc;
+
+use crate::result::{ParsedToolCall, ReplyDelta};
 
 /// Byte length of the longest stop sequence that `text` ends with, or `None`
 /// when no stop sequence matched. The caller truncates by that many bytes so
@@ -17,114 +22,81 @@ pub fn matched_stop_len(text: &str, stop: &[String]) -> Option<usize> {
         .max()
 }
 
-/// Where a generation's reasoning span is, as its chat template frames it.
-///
-/// Two things differ by template, and a splitter that guesses either one leaks
-/// reasoning into the answer:
-///
-/// * **The markers.** Qwen-family templates wrap reasoning in `<think>` …
-///   `</think>`. Gemma 4 uses a thought channel, `<|channel>thought` …
-///   `<channel|>`, and never emits `<think>` at all.
-/// * **Whether the prompt already opened the span.** Qwen3.8's generation
-///   prompt ends `<|im_start|>assistant\n<think>\n` whenever thinking is on,
-///   so the model's output begins mid-reasoning and only the close marker ever
-///   appears. Gemma 4 opens its channel in the prompt only for the turn after a
-///   tool response. A splitter that starts outside the span streams the
-///   reasoning as answer text, and by the time the close marker arrives those
-///   bytes have already been sent. That was measured on qwen3.8-27b: correct
-///   when not streaming (nothing had been released, so the text was
-///   reclaimable), and the whole reasoning in `content` when streaming.
-///
-/// Both are read off the rendered prompt, the one place that knows, which is
-/// what the reference parsers do: vLLM's and SGLang's `qwen3` parsers start in
-/// reasoning when thinking is enabled, and llama.cpp re-parses the output
-/// prefixed with the generation prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReasoningFrame {
-    /// Marker that opens a reasoning span.
-    pub open: &'static str,
-    /// Marker that closes it.
-    pub close: &'static str,
-    /// Whether the prompt ended inside an open span.
-    pub open_at_start: bool,
+/// Reads one generated reply in its chat format, as it arrives.
+pub trait ReplyReader: Send {
+    /// Read the next generated text.
+    ///
+    /// # Errors
+    /// Text the format cannot read.
+    fn read(&mut self, text: &str) -> crate::Result<Vec<ReplyDelta>>;
+
+    /// The reply is complete.
+    ///
+    /// # Errors
+    /// As [`read`](Self::read).
+    fn finish(&mut self) -> crate::Result<Vec<ReplyDelta>>;
 }
 
-impl ReasoningFrame {
-    /// `<think>` … `</think>`, not already open.
-    pub const THINK: Self = Self {
-        open: "<think>",
-        close: "</think>",
-        open_at_start: false,
-    };
+/// The chat format a generation is read in.
+pub trait ReplyFormat: Send + Sync + std::fmt::Debug {
+    /// A reader for one reply.
+    ///
+    /// # Errors
+    /// A format whose reader cannot be built.
+    fn reader(&self) -> crate::Result<Box<dyn ReplyReader>>;
 
-    /// Gemma 4's thought channel, not already open.
-    pub const GEMMA4_THOUGHT: Self = Self {
-        open: "<|channel>thought",
-        close: "<channel|>",
-        open_at_start: false,
-    };
-
-    /// The frame a rendered prompt implies.
-    pub fn for_prompt(prompt: &str) -> Self {
-        // `<|turn>` is Gemma 4's turn marker; no other supported template has it.
-        let base = if prompt.contains("<|turn>") {
-            Self::GEMMA4_THOUGHT
-        } else {
-            Self::THINK
-        };
-        // Trailing whitespace is the template's own newline after the marker.
-        // A prompt that opened and closed an empty span (thinking switched off)
-        // ends with the close marker, so it is correctly not open.
-        Self {
-            open_at_start: prompt.trim_end().ends_with(base.open),
-            ..base
-        }
-    }
+    /// The text that ends a reasoning block, for an engine that has to end
+    /// one itself. `None` for a format without reasoning blocks.
+    fn reasoning_end(&self) -> Option<&str>;
 }
 
-impl Default for ReasoningFrame {
-    fn default() -> Self {
-        Self::THINK
-    }
+/// A finished reply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Reply {
+    /// The answer.
+    pub text: String,
+    /// The reasoning, when there was any.
+    pub thinking: Option<String>,
+    /// The tool calls, in the order written.
+    pub tool_calls: Vec<ParsedToolCall>,
 }
 
-/// Length of the longest suffix of `s` that is a strict prefix of `marker`.
-///
-/// Those bytes cannot be classified yet: `<thi` is either the start of a marker
-/// or four literal characters, and only the next piece decides. Holding them is
-/// the same trick the stop-sequence path uses.
-fn dangling_prefix(s: &str, marker: &str) -> usize {
-    let max = s.len().min(marker.len() - 1);
-    (1..=max)
-        .rev()
-        .find(|&k| {
-            s.is_char_boundary(s.len() - k) && s.as_bytes()[s.len() - k..] == marker.as_bytes()[..k]
-        })
-        .unwrap_or(0)
+/// A tool call being assembled from streamed steps.
+#[derive(Default)]
+struct CallParts {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
-/// Accumulates decoded token pieces, detects stop sequences, and — when the
-/// caller is streaming — releases bytes only once they can no longer turn out
-/// to be the leading part of a stop sequence.
+/// Accumulates decoded token pieces, detects stop sequences, reads the reply
+/// in its chat format, and — when the caller is streaming — releases answer
+/// text only once it can no longer turn out to be the leading part of a stop
+/// sequence.
 ///
 /// A stop sequence may span several tokens, so the last `hold` bytes are kept
 /// back until either more text disambiguates them or generation ends. With no
-/// stop sequences configured `hold` is zero and every piece is released the
-/// moment it is decoded.
+/// stop sequences configured `hold` is zero and every piece is read the moment
+/// it is decoded.
 pub struct StopStream {
-    /// Text the caller is meant to see: reasoning spans removed.
+    /// Everything decoded, less a matched stop sequence.
+    raw: String,
+    /// Bytes of `raw` handed to the reader.
+    read: usize,
+    /// The answer.
     text: String,
-    /// The model's reasoning, accumulated separately.
+    /// The reasoning.
     reasoning: String,
-    /// Bytes decoded but not yet classified, because they could still turn out
-    /// to be the leading part of a `<think>` / `</think>` marker.
-    pending: String,
+    calls: Vec<CallParts>,
+    /// Whether the text read most recently was reasoning.
+    in_reasoning: bool,
+    reader: Option<Box<dyn ReplyReader>>,
+    /// The reader's refusal, reported when the stream closes.
+    failed: Option<crate::Error>,
     emitted: usize,
     hold: usize,
     stop: Vec<String>,
     hit: bool,
-    in_think: bool,
-    frame: ReasoningFrame,
     /// Chunks a non-blocking stream could not hand over yet, because the
     /// receiver's channel was full. `None` for a blocking stream.
     outbox: Option<Outbox>,
@@ -176,7 +148,8 @@ impl Outbox {
 }
 
 impl StopStream {
-    /// Build a stream that trims the given stop sequences.
+    /// Build a stream that trims the given stop sequences and passes the
+    /// text through as the answer.
     pub fn new(stop: Vec<String>) -> Self {
         let hold = stop
             .iter()
@@ -185,24 +158,67 @@ impl StopStream {
             .max()
             .unwrap_or(0);
         Self {
+            raw: String::new(),
+            read: 0,
             text: String::new(),
             reasoning: String::new(),
-            pending: String::new(),
+            calls: Vec::new(),
+            in_reasoning: false,
+            reader: None,
+            failed: None,
             emitted: 0,
             hold,
             stop,
             hit: false,
-            in_think: false,
-            frame: ReasoningFrame::THINK,
             outbox: None,
             reasoning_sink: None,
         }
     }
 
+    /// Read the text in `format`, when the generation has one: the answer,
+    /// reasoning and tool calls are split by the format rather than passed
+    /// through as text. A format whose reader cannot be built fails the
+    /// stream: the first [`push`](Self::push) stops the generation and
+    /// [`close`](Self::close) reports why.
+    pub fn reading(mut self, format: Option<&Arc<dyn ReplyFormat>>) -> Self {
+        match format.map(|f| f.reader()).transpose() {
+            Ok(reader) => self.reader = reader,
+            Err(e) => self.failed = Some(e),
+        }
+        self
+    }
+
+    /// Continue a reply another stream began: `generated` is everything it
+    /// decoded. The reader is brought to where that text left it, and none of
+    /// it is reported again.
+    pub fn continuing(mut self, generated: &str) -> Self {
+        self.raw = generated.to_string();
+        self.read = self.raw.len();
+        if let Some(reader) = self.reader.as_mut() {
+            match reader.read(generated) {
+                Ok(deltas) => {
+                    if let Some(last) = deltas.last() {
+                        self.in_reasoning = matches!(last, ReplyDelta::Reasoning(_));
+                    }
+                }
+                Err(e) => self.failed = Some(e),
+            }
+        }
+        self
+    }
+
+    /// Everything decoded so far, less a matched stop sequence.
+    pub fn generated(&self) -> &str {
+        &self.raw
+    }
+
     /// Stream the reasoning to `tx` as it is produced, separately from the
     /// visible text. Without this, reasoning is only returned at the end.
     pub fn with_reasoning(mut self, tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
-        self.reasoning_sink = tx.map(|tx| ReasoningSink { tx, unsent: String::new() });
+        self.reasoning_sink = tx.map(|tx| ReasoningSink {
+            tx,
+            unsent: String::new(),
+        });
         self
     }
 
@@ -219,7 +235,9 @@ impl StopStream {
     /// only stops the reasoning stream, not the generation.
     fn send_reasoning(&mut self) {
         let blocking = self.outbox.is_none();
-        let Some(sink) = self.reasoning_sink.as_mut() else { return };
+        let Some(sink) = self.reasoning_sink.as_mut() else {
+            return;
+        };
         if sink.unsent.is_empty() {
             return;
         }
@@ -261,112 +279,132 @@ impl StopStream {
     /// Whether every released chunk has reached the receiver.
     pub fn delivered(&self) -> bool {
         self.outbox.as_ref().is_none_or(|o| o.chunks.is_empty())
-            && self.reasoning_sink.as_ref().is_none_or(|r| r.unsent.is_empty())
+            && self
+                .reasoning_sink
+                .as_ref()
+                .is_none_or(|r| r.unsent.is_empty())
     }
 
     /// Whether the receiver has fallen [`STREAM_BACKLOG_LIMIT`] bytes behind.
     pub fn stalled(&self) -> bool {
-        self.outbox.as_ref().is_some_and(|o| o.bytes > STREAM_BACKLOG_LIMIT)
-            || self.reasoning_sink.as_ref().is_some_and(|r| r.unsent.len() > STREAM_BACKLOG_LIMIT)
+        self.outbox
+            .as_ref()
+            .is_some_and(|o| o.bytes > STREAM_BACKLOG_LIMIT)
+            || self
+                .reasoning_sink
+                .as_ref()
+                .is_some_and(|r| r.unsent.len() > STREAM_BACKLOG_LIMIT)
     }
 
-    /// Split reasoning with this template's markers, starting inside a span
-    /// when the prompt left one open.
     /// Whether the text arriving now is reasoning.
     pub fn in_reasoning(&self) -> bool {
-        self.in_think
-    }
-
-    /// The reasoning markers this stream splits on.
-    pub fn frame(&self) -> ReasoningFrame {
-        self.frame
-    }
-
-    pub fn framed(mut self, frame: ReasoningFrame) -> Self {
-        self.in_think = frame.open_at_start;
-        self.frame = frame;
-        self
+        self.in_reasoning
     }
 
     /// Absorb one decoded piece. Returns `false` when the stream receiver has
-    /// been dropped, which the generation loops treat as "stop generating".
+    /// been dropped, or the reader refused the text, which the generation
+    /// loops treat as "stop generating".
     pub fn push(&mut self, piece: &str, tx: Option<&tokio::sync::mpsc::Sender<String>>) -> bool {
-        self.pending.push_str(piece);
-        self.classify();
-        if let Some(n) = matched_stop_len(&self.text, &self.stop) {
-            self.text.truncate(self.text.len() - n);
-            self.emitted = self.emitted.min(self.text.len());
+        self.raw.push_str(piece);
+        if let Some(n) = matched_stop_len(&self.raw, &self.stop) {
+            self.raw.truncate(self.raw.len() - n);
             self.hit = true;
         }
-        self.release(tx)
+        let mut boundary = if self.hit {
+            self.raw.len()
+        } else {
+            self.raw.len().saturating_sub(self.hold)
+        };
+        while boundary > self.read && !self.raw.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        if boundary > self.read {
+            let settled = self.raw[self.read..boundary].to_string();
+            self.read = boundary;
+            self.absorb(&settled, false);
+        }
+        self.release(tx) && self.failed.is_none()
     }
 
-    /// Move settled bytes out of `pending` into either the visible text or the
-    /// reasoning buffer, leaving behind only what a marker could still claim.
-    fn classify(&mut self) {
-        loop {
-            if self.in_think {
-                if let Some(i) = self.pending.find(self.frame.close) {
-                    let span = self.pending[..i].to_string();
-                    self.think(&span);
-                    self.pending.drain(..i + self.frame.close.len());
-                    self.in_think = false;
-                    continue;
-                }
-                let keep = dangling_prefix(&self.pending, self.frame.close);
-                let take = self.pending.len() - keep;
-                let span = self.pending[..take].to_string();
-                self.think(&span);
-                self.pending.drain(..take);
-                return;
-            }
+    /// [`push`](Self::push) for a caller that takes the answer itself rather
+    /// than through a channel: the answer text this piece settled, or `None`
+    /// once the reader has refused the text.
+    pub fn push_text(&mut self, piece: &str) -> Option<String> {
+        self.push(piece, None);
+        if self.failed.is_some() {
+            return None;
+        }
+        let settled = self.text[self.emitted..].to_string();
+        self.emitted = self.text.len();
+        Some(settled)
+    }
 
-            if let Some(i) = self.pending.find(self.frame.open) {
-                self.text.push_str(&self.pending[..i]);
-                self.pending.drain(..i + self.frame.open.len());
-                self.in_think = true;
-                continue;
-            }
-
-            // A close with no open: the chat template opened the block in the
-            // prompt, so the model's output starts mid-thought. Everything so
-            // far was reasoning — reclaimable only while nothing has been
-            // streamed yet, since bytes already sent cannot be recalled.
-            if let Some(i) = self.pending.find(self.frame.close) {
-                self.text.push_str(&self.pending[..i]);
-                self.pending.drain(..i + self.frame.close.len());
-                if self.emitted == 0 {
-                    let span = std::mem::take(&mut self.text);
-                    self.think(&span);
-                }
-                continue;
-            }
-
-            let keep = dangling_prefix(&self.pending, self.frame.open)
-                .max(dangling_prefix(&self.pending, self.frame.close));
-            let take = self.pending.len() - keep;
-            self.text.push_str(&self.pending[..take]);
-            self.pending.drain(..take);
+    /// Pass settled text to the reader, or to the answer when there is none.
+    fn absorb(&mut self, settled: &str, done: bool) {
+        if self.failed.is_some() {
             return;
+        }
+        let Some(reader) = self.reader.as_mut() else {
+            self.text.push_str(settled);
+            return;
+        };
+        let mut deltas = if settled.is_empty() {
+            Ok(Vec::new())
+        } else {
+            reader.read(settled)
+        };
+        if done && let Ok(d) = deltas.as_mut() {
+            match reader.finish() {
+                Ok(rest) => d.extend(rest),
+                Err(e) => deltas = Err(e),
+            }
+        }
+        match deltas {
+            Ok(deltas) => deltas.into_iter().for_each(|d| self.apply(d)),
+            Err(e) => self.failed = Some(e),
+        }
+    }
+
+    fn apply(&mut self, delta: ReplyDelta) {
+        match delta {
+            ReplyDelta::Content(c) => {
+                self.in_reasoning = false;
+                self.text.push_str(&c);
+            }
+            ReplyDelta::Reasoning(r) => {
+                self.in_reasoning = true;
+                self.think(&r);
+            }
+            ReplyDelta::ToolCall {
+                index,
+                id,
+                name,
+                arguments,
+            } => {
+                self.in_reasoning = false;
+                if self.calls.len() <= index {
+                    self.calls.resize_with(index + 1, CallParts::default);
+                }
+                let call = &mut self.calls[index];
+                if let Some(id) = id {
+                    call.id = id;
+                }
+                if let Some(name) = name {
+                    call.name.push_str(&name);
+                }
+                call.arguments.push_str(&arguments);
+            }
         }
     }
 
     fn release(&mut self, tx: Option<&tokio::sync::mpsc::Sender<String>>) -> bool {
         self.send_reasoning();
         let Some(tx) = tx else { return true };
-        let mut boundary = if self.hit {
-            self.text.len()
-        } else {
-            self.text.len().saturating_sub(self.hold)
-        };
-        while boundary > self.emitted && !self.text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        if boundary <= self.emitted {
+        if self.text.len() <= self.emitted {
             return true;
         }
-        let chunk = self.text[self.emitted..boundary].to_string();
-        self.emitted = boundary;
+        let chunk = self.text[self.emitted..].to_string();
+        self.emitted = self.text.len();
         match self.outbox.as_mut() {
             None => tx.blocking_send(chunk).is_ok(),
             Some(outbox) => {
@@ -382,234 +420,206 @@ impl StopStream {
         self.hit
     }
 
-    /// Release anything still held back, then hand over the visible text and
-    /// the reasoning span the model produced, if any.
+    /// Release anything still held back, then hand over the reply.
+    ///
+    /// # Errors
+    /// Text the reply's format could not read.
     pub fn finish_parts(
         mut self,
         tx: Option<&tokio::sync::mpsc::Sender<String>>,
-    ) -> (String, Option<String>) {
+    ) -> crate::Result<Reply> {
         self.close(tx)
     }
 
     /// [`Self::finish_parts`] without consuming the stream, so a non-blocking
     /// stream keeps what the receiver has not taken yet for later
     /// [`Self::flush`]es.
-    pub fn close(&mut self, tx: Option<&tokio::sync::mpsc::Sender<String>>) -> (String, Option<String>) {
-        let leftover = std::mem::take(&mut self.pending);
-        if self.in_think {
-            self.think(&leftover);
-        } else if !self.frame.open.starts_with(&leftover) && !self.frame.close.starts_with(&leftover) {
-            self.text.push_str(&leftover);
-        }
+    ///
+    /// # Errors
+    /// As [`Self::finish_parts`].
+    pub fn close(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> crate::Result<Reply> {
+        let rest = self.raw[self.read..].to_string();
+        self.read = self.raw.len();
+        self.absorb(&rest, true);
         self.hit = true;
         self.release(tx);
+        if let Some(e) = self.failed.take() {
+            return Err(e);
+        }
         let reasoning = self.reasoning.trim().to_string();
         self.reasoning.clear();
         self.emitted = 0;
-        (std::mem::take(&mut self.text), (!reasoning.is_empty()).then_some(reasoning))
+        let tool_calls = std::mem::take(&mut self.calls)
+            .into_iter()
+            .filter(|c| !c.name.is_empty())
+            .map(|c| ParsedToolCall {
+                id: if c.id.is_empty() {
+                    crate::result::new_call_id()
+                } else {
+                    c.id
+                },
+                name: c.name,
+                arguments: crate::result::call_arguments(&c.arguments),
+            })
+            .collect();
+        Ok(Reply {
+            text: std::mem::take(&mut self.text),
+            thinking: (!reasoning.is_empty()).then_some(reasoning),
+            tool_calls,
+        })
     }
 }
 
 #[cfg(test)]
-mod reasoning_frame_tests {
-    use super::{ReasoningFrame, StopStream};
+mod tests {
+    use std::sync::Arc;
 
-    fn stream_all(frame: ReasoningFrame, pieces: &[&str]) -> (String, String, Option<String>) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1024);
-        let mut s = StopStream::new(vec![]).framed(frame);
-        for p in pieces {
+    use super::{ReplyFormat, ReplyReader, StopStream};
+    use crate::result::ReplyDelta;
+
+    /// Reads `<r>`…`</r>` as reasoning and `@name(args)` as a call; enough to
+    /// check the routing without a backend.
+    #[derive(Debug)]
+    struct Tagged;
+
+    struct TaggedReader {
+        buf: String,
+        in_r: bool,
+        calls: usize,
+    }
+
+    impl ReplyFormat for Tagged {
+        fn reader(&self) -> crate::Result<Box<dyn ReplyReader>> {
+            Ok(Box::new(TaggedReader {
+                buf: String::new(),
+                in_r: false,
+                calls: 0,
+            }))
+        }
+        fn reasoning_end(&self) -> Option<&str> {
+            Some("</r>")
+        }
+    }
+
+    impl TaggedReader {
+        fn drain(&mut self, done: bool) -> Vec<ReplyDelta> {
+            let mut out = Vec::new();
+            loop {
+                if self.in_r {
+                    if let Some(i) = self.buf.find("</r>") {
+                        out.push(ReplyDelta::Reasoning(self.buf[..i].to_string()));
+                        self.buf.drain(..i + 4);
+                        self.in_r = false;
+                        continue;
+                    }
+                } else if let Some(i) = self.buf.find("<r>") {
+                    out.push(ReplyDelta::Content(self.buf[..i].to_string()));
+                    self.buf.drain(..i + 3);
+                    self.in_r = true;
+                    continue;
+                } else if let (Some(a), Some(b)) = (self.buf.find('@'), self.buf.find(')')) {
+                    let open = self.buf.find('(').unwrap();
+                    out.push(ReplyDelta::Content(self.buf[..a].to_string()));
+                    out.push(ReplyDelta::ToolCall {
+                        index: self.calls,
+                        id: None,
+                        name: Some(self.buf[a + 1..open].to_string()),
+                        arguments: self.buf[open + 1..b].to_string(),
+                    });
+                    self.calls += 1;
+                    self.buf.drain(..=b);
+                    continue;
+                }
+                if done {
+                    let rest = std::mem::take(&mut self.buf);
+                    out.push(if self.in_r {
+                        ReplyDelta::Reasoning(rest)
+                    } else {
+                        ReplyDelta::Content(rest)
+                    });
+                }
+                return out;
+            }
+        }
+    }
+
+    impl ReplyReader for TaggedReader {
+        fn read(&mut self, text: &str) -> crate::Result<Vec<ReplyDelta>> {
+            self.buf.push_str(text);
+            Ok(self.drain(false))
+        }
+        fn finish(&mut self) -> crate::Result<Vec<ReplyDelta>> {
+            Ok(self.drain(true))
+        }
+    }
+
+    fn tagged() -> Arc<dyn ReplyFormat> {
+        Arc::new(Tagged)
+    }
+
+    #[test]
+    fn without_a_format_the_text_is_the_answer() {
+        let mut s = StopStream::new(vec!["END".into()]);
+        for p in ["<r>a", "</r>b", "EN", "D"] {
+            s.push(p, None);
+        }
+        let r = s.finish_parts(None).unwrap();
+        assert_eq!(r.text, "<r>a</r>b");
+        assert_eq!(r.thinking, None);
+    }
+
+    #[test]
+    fn a_format_splits_reasoning_answer_and_calls() {
+        let mut s = StopStream::new(vec![]).reading(Some(&tagged()));
+        for p in ["<r>wei", "gh</r>ok ", "@get(", "{\"a\":1})"] {
+            s.push(p, None);
+        }
+        let r = s.finish_parts(None).unwrap();
+        assert_eq!(r.thinking.as_deref(), Some("weigh"));
+        assert_eq!(r.text, "ok ");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].name, "get");
+        assert_eq!(r.tool_calls[0].arguments, serde_json::json!({"a": 1}));
+        assert!(!r.tool_calls[0].id.is_empty());
+    }
+
+    #[test]
+    fn a_stop_sequence_is_matched_before_the_format_reads() {
+        let mut s = StopStream::new(vec!["<|end|>".into()]).reading(Some(&tagged()));
+        for p in ["<r>x</r>an", "swer<|en", "d|>"] {
+            s.push(p, None);
+        }
+        assert!(s.hit_stop());
+        let r = s.finish_parts(None).unwrap();
+        assert_eq!(r.text, "answer");
+        assert_eq!(r.thinking.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn streamed_answer_and_reasoning_go_to_their_own_channels() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (rtx, mut rrx) = tokio::sync::mpsc::channel(64);
+        let mut s = StopStream::new(vec![])
+            .reading(Some(&tagged()))
+            .with_reasoning(Some(rtx))
+            .nonblocking();
+        for p in ["<r>th", "ink</r>", "hel", "lo"] {
             assert!(s.push(p, Some(&tx)));
         }
-        let (text, reasoning) = s.finish_parts(Some(&tx));
-        drop(tx);
-        let mut streamed = String::new();
-        while let Ok(chunk) = rx.try_recv() {
-            streamed.push_str(&chunk);
+        let r = s.close(Some(&tx)).unwrap();
+        let mut answer = String::new();
+        while let Ok(c) = rx.try_recv() {
+            answer.push_str(&c);
         }
-        (streamed, text, reasoning)
-    }
-
-    #[test]
-    fn qwen_prompt_that_opened_think_streams_no_reasoning() {
-        let prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
-        let frame = ReasoningFrame::for_prompt(prompt);
-        assert!(frame.open_at_start);
-        let (streamed, text, reasoning) = stream_all(
-            frame,
-            &["The user", " wants a greeting.", "\n</thi", "nk>\n\n", "Hello", "!"],
-        );
-        assert_eq!(streamed.trim(), "Hello!", "reasoning must never reach the stream");
-        assert_eq!(text.trim(), "Hello!");
-        assert_eq!(reasoning.as_deref(), Some("The user wants a greeting."));
-    }
-
-    #[test]
-    fn reasoning_reaches_its_own_receiver_while_it_is_produced() {
-        let prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
-        let frame = ReasoningFrame::for_prompt(prompt);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-        let (rtx, mut rrx) = tokio::sync::mpsc::channel::<String>(64);
-        let mut s = StopStream::new(vec![]).framed(frame).nonblocking().with_reasoning(Some(rtx));
-        s.push("The user", Some(&tx));
-        s.push(" wants a greeting.", Some(&tx));
-        // Before the block closes, and before any answer text, the reasoning
-        // so far is already with its receiver.
         let mut reasoning = String::new();
         while let Ok(c) = rrx.try_recv() {
             reasoning.push_str(&c);
         }
-        assert_eq!(reasoning, "The user wants a greeting.");
-        assert!(rx.try_recv().is_err(), "no answer text yet");
-        for p in ["\n</thi", "nk>\n\n", "Hello", "!"] {
-            s.push(p, Some(&tx));
-        }
-        let (text, thinking) = s.close(Some(&tx));
-        while let Ok(c) = rrx.try_recv() {
-            reasoning.push_str(&c);
-        }
-        let mut streamed = String::new();
-        while let Ok(c) = rx.try_recv() {
-            streamed.push_str(&c);
-        }
-        assert_eq!(reasoning.trim(), "The user wants a greeting.", "reasoning never repeats or leaks the marker");
-        assert_eq!(streamed.trim(), "Hello!", "reasoning never reaches the answer stream");
-        assert_eq!(text.trim(), "Hello!");
-        assert_eq!(thinking.as_deref(), Some("The user wants a greeting."));
-        assert!(s.delivered());
-    }
-
-    #[test]
-    fn a_full_or_gone_reasoning_receiver_holds_back_nothing_else() {
-        let frame = ReasoningFrame { open_at_start: true, ..ReasoningFrame::THINK };
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-        // Capacity 1 and never read: the second delta waits in the sink.
-        let (rtx, mut rrx) = tokio::sync::mpsc::channel::<String>(1);
-        let mut s = StopStream::new(vec![]).framed(frame).nonblocking().with_reasoning(Some(rtx));
-        assert!(s.push("one ", Some(&tx)));
-        assert!(s.push("two ", Some(&tx)));
-        assert!(!s.delivered(), "the second delta is still queued");
-        assert!(s.push("</think>answer", Some(&tx)), "the answer stream stays open");
-        assert_eq!(rx.try_recv().as_deref(), Ok("answer"));
-        assert_eq!(rrx.try_recv().as_deref(), Ok("one "));
-        assert!(s.flush(Some(&tx)));
-        assert_eq!(rrx.try_recv().as_deref(), Ok("two "));
-        assert!(s.delivered());
-        // A reasoning receiver that goes away ends only the reasoning stream.
-        drop(rrx);
-        let mut s2 = StopStream::new(vec![]).framed(frame).nonblocking();
-        let (rtx2, rrx2) = tokio::sync::mpsc::channel::<String>(4);
-        drop(rrx2);
-        s2 = s2.with_reasoning(Some(rtx2));
-        assert!(s2.push("thinking</think>ok", Some(&tx)));
-        assert!(s2.delivered());
-        assert_eq!(rx.try_recv().as_deref(), Ok("ok"));
-    }
-
-    #[test]
-    fn qwen_prompt_with_thinking_off_is_not_open() {
-        let prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-        let frame = ReasoningFrame::for_prompt(prompt);
-        assert!(!frame.open_at_start);
-        let (streamed, _, reasoning) = stream_all(frame, &["Hello", "!"]);
-        assert_eq!(streamed, "Hello!");
-        assert_eq!(reasoning, None);
-    }
-
-    #[test]
-    fn unclosed_span_at_the_token_limit_is_all_reasoning() {
-        let frame = ReasoningFrame::for_prompt("<|im_start|>assistant\n<think>\n");
-        let (streamed, text, reasoning) = stream_all(frame, &["still ", "thinking"]);
-        assert_eq!(streamed, "");
-        assert_eq!(text, "");
-        assert_eq!(reasoning.as_deref(), Some("still thinking"));
-    }
-
-    #[test]
-    fn gemma4_thought_channel_is_split() {
-        let prompt = "<|turn>user\nhi<turn|>\n<|turn>model\n";
-        let frame = ReasoningFrame::for_prompt(prompt);
-        assert_eq!(frame.open, "<|channel>thought");
-        assert!(!frame.open_at_start);
-        let (streamed, text, reasoning) = stream_all(
-            frame,
-            &["<|channel>", "thought\nweigh it", "<channel|>", "Answer."],
-        );
-        assert_eq!(streamed, "Answer.");
-        assert_eq!(text, "Answer.");
-        assert_eq!(reasoning.as_deref(), Some("weigh it"));
-    }
-
-    #[test]
-    fn gemma4_prompt_after_a_tool_response_starts_in_the_channel() {
-        let prompt = "<|turn>model\n<|tool_call>call:f{}<tool_call|><|tool_response>response:f{}<tool_response|><|channel>thought\n";
-        let frame = ReasoningFrame::for_prompt(prompt);
-        assert!(frame.open_at_start);
-        let (streamed, _, reasoning) = stream_all(frame, &["the tool said yes", "<channel|>", "Yes."]);
-        assert_eq!(streamed, "Yes.");
-        assert_eq!(reasoning.as_deref(), Some("the tool said yes"));
-    }
-
-    #[test]
-    fn gemma4_prompt_with_thinking_off_closes_the_empty_channel() {
-        let frame = ReasoningFrame::for_prompt("<|turn>model\n<|channel>thought\n<channel|>");
-        assert!(!frame.open_at_start);
-    }
-
-    #[test]
-    fn a_full_channel_never_blocks_a_nonblocking_stream() {
-        // Capacity 1 and nobody reading: a blocking stream would park here
-        // forever on the second chunk.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
-        let mut s = StopStream::new(vec![]).nonblocking();
-        for piece in ["one ", "two ", "three"] {
-            assert!(s.push(piece, Some(&tx)), "an open receiver keeps the stream open");
-        }
-        assert!(!s.delivered(), "two chunks are still queued");
-        let (text, _) = s.close(Some(&tx));
-        assert_eq!(text, "one two three", "the result carries the whole text regardless");
-        let mut got = String::new();
-        while !s.delivered() {
-            while let Ok(c) = rx.try_recv() {
-                got.push_str(&c);
-            }
-            assert!(s.flush(Some(&tx)));
-        }
-        while let Ok(c) = rx.try_recv() {
-            got.push_str(&c);
-        }
-        assert_eq!(got, "one two three", "every chunk arrives, in order");
-    }
-
-    #[test]
-    fn a_receiver_that_stops_reading_is_stalled_not_waited_on() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
-        let mut s = StopStream::new(vec![]).nonblocking();
-        let piece = "x".repeat(64 * 1024);
-        let mut open = true;
-        for _ in 0..(super::STREAM_BACKLOG_LIMIT / piece.len() + 2) {
-            open = s.push(&piece, Some(&tx));
-            if !open {
-                break;
-            }
-        }
-        assert!(!open, "past the backlog limit the stream gives up on the receiver");
-        assert!(s.stalled());
-    }
-
-    #[test]
-    fn a_dropped_receiver_closes_a_nonblocking_stream() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
-        drop(rx);
-        let mut s = StopStream::new(vec![]).nonblocking();
-        assert!(!s.push("hello", Some(&tx)));
-        assert!(!s.stalled(), "gone is not the same as slow");
-    }
-
-    #[test]
-    fn a_template_with_no_reasoning_passes_text_through() {
-        let frame = ReasoningFrame::for_prompt("<|start|>assistant");
-        let (streamed, _, reasoning) = stream_all(frame, &["plain ", "answer"]);
-        assert_eq!(streamed, "plain answer");
-        assert_eq!(reasoning, None);
+        assert_eq!(answer, "hello");
+        assert_eq!(reasoning, "think");
+        assert_eq!(r.text, "hello");
     }
 }

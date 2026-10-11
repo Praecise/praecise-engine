@@ -141,7 +141,7 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
     dst.resume(SequenceResume {
         blobs: vec![blob1, blob2, handoff.blob.clone()],
         next_token: handoff.next_token,
-        reasoning: handoff.reasoning,
+        generated: handoff.generated.clone(),
         config: greedy(MAX_TOKENS - handoff.generated_tokens),
         token_tx: None,
         result_tx,
@@ -208,7 +208,7 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
     dst.resume(SequenceResume {
         blobs: chain,
         next_token: handoff.next_token,
-        reasoning: handoff.reasoning,
+        generated: handoff.generated.clone(),
         config: greedy(MAX_TOKENS - handoff.generated_tokens),
         token_tx: None,
         result_tx,
@@ -230,7 +230,7 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
         .resume(SequenceResume {
             blobs: vec![first_blob],
             next_token: handoff.next_token,
-            reasoning: handoff.reasoning,
+            generated: handoff.generated.clone(),
             config: greedy(4),
             token_tx: None,
             result_tx,

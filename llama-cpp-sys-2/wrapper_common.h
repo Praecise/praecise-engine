@@ -22,6 +22,8 @@ struct llama_rs_chat_template_result {
     char * grammar;
     char * parser;
     char * generation_prompt;
+    // The text that ends a reasoning block, when the template has one.
+    char * thinking_end_tag;
     int chat_format;
     bool grammar_lazy;
     struct llama_rs_grammar_trigger * grammar_triggers;

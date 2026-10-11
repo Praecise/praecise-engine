@@ -81,6 +81,71 @@ pub struct InferenceResult {
     /// Denoising steps a diffusion model took.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denoise_steps: Option<u32>,
+    /// Tool calls the model made, read in the chat format of the turn it was
+    /// answering. Empty when the generation had no chat format or made none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ParsedToolCall>,
+}
+
+/// A reply split into its parts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ParsedReply {
+    /// The answer, without reasoning or call markup.
+    pub content: String,
+    /// The reasoning, when the model wrote any.
+    pub reasoning: Option<String>,
+    /// The tool calls, in the order written.
+    pub tool_calls: Vec<ParsedToolCall>,
+}
+
+/// One tool call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParsedToolCall {
+    /// The id the model gave the call, or a generated one.
+    pub id: String,
+    /// The tool's name.
+    pub name: String,
+    /// The arguments. An object for a complete call; the argument text so far
+    /// when it is not valid JSON (a reply cut short).
+    pub arguments: serde_json::Value,
+}
+
+/// One step of a reply read as it is generated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReplyDelta {
+    /// More of the answer.
+    Content(String),
+    /// More of the reasoning.
+    Reasoning(String),
+    /// A step of the tool call at `index`: its id and name when first seen,
+    /// then argument text as it arrives.
+    ToolCall {
+        /// The call's position in the reply.
+        index: usize,
+        /// The call's id, on the step that starts it.
+        id: Option<String>,
+        /// The tool's name, on the step that names it.
+        name: Option<String>,
+        /// Argument text added by this step.
+        arguments: String,
+    },
+}
+
+/// A fresh tool-call id, for a call the model did not name.
+pub(crate) fn new_call_id() -> String {
+    let mut bytes = [0u8; 12];
+    // An id only has to be unique within a conversation; on the rare
+    // platform without an entropy source the zero id is still well formed.
+    let _ = getrandom::getrandom(&mut bytes);
+    format!("call_{}", hex::encode(bytes))
+}
+
+/// Call arguments as written: a JSON value when they parse, else the text.
+pub(crate) fn call_arguments(text: &str) -> serde_json::Value {
+    if text.trim().is_empty() {
+        return serde_json::Value::Object(Default::default());
+    }
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
 }
 
 /// A chat message with role and content, for chat-template formatting.

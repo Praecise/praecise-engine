@@ -370,8 +370,9 @@ impl<'m> Pipeline<'m> {
 
         const SEQ: i32 = 0;
         let started = Instant::now();
-        let rendered = crate::batching::render_with_config(self.model, prompt, config, enable_thinking)
+        let (rendered, format) = crate::batching::render_with_config(self.model, prompt, config, enable_thinking)
             .map_err(|e| PipelineError::Engine(format!("prompt: {e}")))?;
+        let format = config.reply_format.clone().or(format);
         let tokens = self
             .model
             .str_to_token(&rendered, AddBos::Always)
@@ -390,7 +391,7 @@ impl<'m> Pipeline<'m> {
         let n_vocab = self.model.n_vocab();
         let mut sampler = crate::sampling::build_sampler_chain(config, n_vocab);
         let mut stream = crate::stream::StopStream::new(config.stop.clone())
-            .framed(crate::stream::ReasoningFrame::for_prompt(&rendered))
+            .reading(format.as_ref())
             .with_reasoning(config.reasoning_tx.clone());
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output_tokens = 0u32;
@@ -424,7 +425,7 @@ impl<'m> Pipeline<'m> {
             let pos = (tokens.len() + output_tokens as usize - 1) as i32;
             logits = self.step(SEQ, pos, token)?;
         }
-        let (text, thinking) = stream.close(token_tx);
+        let reply = stream.close(token_tx).map_err(|e| PipelineError::Engine(format!("reading the reply: {e}")))?;
         let stop_reason = if eos {
             crate::result::StopReason::Eos
         } else {
@@ -432,8 +433,9 @@ impl<'m> Pipeline<'m> {
         };
         let decode_secs = decode_started.elapsed().as_secs_f64();
         Ok(crate::result::InferenceResult {
-            text,
-            thinking,
+            text: reply.text,
+            thinking: reply.thinking,
+            tool_calls: reply.tool_calls,
             input_tokens: tokens.len() as u32,
             output_tokens,
             generation_time_ms: started.elapsed().as_millis() as u64,

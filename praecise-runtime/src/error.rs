@@ -106,6 +106,10 @@ pub enum Error {
     #[error("Adapter error: {0}")]
     Adapter(String),
 
+    /// A chat template that would not render, or a reply its format could not read.
+    #[error("Chat format error: {0}")]
+    ChatFormat(String),
+
     /// JSON serialization error.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

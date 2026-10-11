@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use praecise_runtime::{ChatMessage, GenerationConfig, InferenceResult, StopReason};
+use praecise_runtime::{ChatMessage, GenerationConfig, InferenceResult, StopReason, StopStream};
 use serde_json::{Value, json};
 
 use crate::engines::{HostedModel, Usage};
@@ -39,15 +39,40 @@ pub fn generate(
 ) -> Result<InferenceResult> {
     let started = Instant::now();
     let request = request(prompt, config)?;
+    // The engine streams raw text; a chat turn's reply is read in its format
+    // here, so the caller sees the answer and reasoning, never the markup.
+    let mut stream = StopStream::new(Vec::new())
+        .reading(config.reply_format.as_ref())
+        .with_reasoning(config.reasoning_tx.clone());
+    let mut sent = 0usize;
     let (reply, usage) = model.generate(&request, |event| {
         let text = event.get("text").and_then(Value::as_str).unwrap_or_default();
-        if text.is_empty() || on_text(text) {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let answer = stream
+            .push_text(text)
+            .ok_or_else(|| Error::Failed(format!("{}: the reply could not be read", model.model_id())))?;
+        sent += answer.len();
+        if answer.is_empty() || on_text(&answer) {
             Ok(())
         } else {
             Err(Error::Failed(format!("{}: the caller went away", model.model_id())))
         }
     })?;
-    Ok(result(&reply, usage, config, started.elapsed()))
+    let read = stream
+        .finish_parts(None)
+        .map_err(|e| Error::Failed(format!("{}: reading the reply: {e}", model.model_id())))?;
+    if read.text.len() > sent && read.text.is_char_boundary(sent) {
+        on_text(&read.text[sent..]);
+    }
+    let mut result = result(&reply, usage, config, started.elapsed());
+    if config.reply_format.is_some() {
+        result.text = read.text;
+        result.thinking = read.thinking;
+        result.tool_calls = read.tool_calls;
+    }
+    Ok(result)
 }
 
 /// The protocol request for `prompt` under `config`.
@@ -93,6 +118,7 @@ fn result(reply: &Value, usage: Usage, config: &GenerationConfig, elapsed: Durat
         cached_tokens: 0,
         forward_positions: None,
         denoise_steps: None,
+        tool_calls: Vec::new(),
     }
 }
 
