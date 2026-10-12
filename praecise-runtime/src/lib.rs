@@ -101,6 +101,9 @@ pub mod loaded;
 #[cfg(feature = "bundled-llama")]
 pub mod ngram_decode;
 
+/// Drafting from a sequence's own earlier tokens; backend-agnostic.
+pub mod prompt_lookup;
+
 /// Self-speculative decode (DFlash / MTP). Compiled only with a bundled backend.
 #[cfg(feature = "bundled-llama")]
 pub mod speculative;
@@ -155,7 +158,8 @@ pub use stream::{matched_stop_len, Reply, ReplyFormat, ReplyReader, StopStream};
 
 #[cfg(feature = "bundled-llama")]
 pub use batching::{
-    max_slots, BatchEngine, BatchPrompt, BatchRequest, SequenceHandoff, SequenceResume, SequenceTicket,
+    max_slots, BatchEngine, BatchPrompt, BatchRequest, BatchSpeculation, SequenceHandoff, SequenceResume,
+    SequenceTicket, SpeculationReport,
 };
 #[cfg(feature = "bundled-llama")]
 pub use chat_format::{ChatFormat, ChatStream, ChatTemplateSource, ChatTurn};

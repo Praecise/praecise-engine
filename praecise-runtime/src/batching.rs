@@ -298,6 +298,8 @@ struct EngineInner {
     /// Sequences this engine serves at once: [`max_slots`] at most, fewer when
     /// that many whole contexts do not fit (see [`fit_slots`]).
     slots: Arc<std::sync::atomic::AtomicUsize>,
+    /// What the scheduler reports about speculation.
+    speculation: Arc<std::sync::Mutex<SpeculationReport>>,
 }
 
 /// Speculative decoding for the batch engine.
@@ -307,14 +309,90 @@ struct EngineInner {
 /// its own sampler agrees with. On a model whose decode is bound by memory
 /// bandwidth, verifying a few tokens costs little more than decoding one, so
 /// the accepted drafts are close to free.
+///
+/// The sampler walks the verified rows in order and draws once per token it
+/// emits, exactly as plain decoding does, so greedy and seeded sampling give
+/// the tokens plain decoding gives provided the backend computes a row's
+/// logits to the same bits whether the row is decoded alone or inside a block.
+/// `tests/speculative_matches_plain.rs` checks that precondition and the
+/// outputs. The CPU's repacked weight layouts break it: their multi-row kernel
+/// rounds differently from the one-row kernel, so a model served with exact
+/// speculation on the CPU loads without them.
 pub struct BatchSpeculation {
-    /// 0 drafts with the target's own MTP head, 1 with a DFlash block-diffusion
-    /// drafter.
+    /// How drafts are made: [`Self::MTP_HEAD`], [`Self::DFLASH`],
+    /// [`Self::DSPARK`] or [`Self::PROMPT_LOOKUP`].
     pub spec_type: i32,
     /// Most tokens a sequence drafts in one step.
     pub n_max: u8,
     /// A separately shipped drafter. `None` drafts with the target model.
     pub draft_model: Option<LlamaModel>,
+}
+
+impl BatchSpeculation {
+    /// Draft with the target's own multi-token-prediction head.
+    pub const MTP_HEAD: i32 = 0;
+    /// Draft with a DFlash block-diffusion drafter.
+    pub const DFLASH: i32 = 1;
+    /// Draft with a DSpark drafter.
+    pub const DSPARK: i32 = 2;
+    /// Draft from the sequence's own earlier tokens (see
+    /// [`crate::prompt_lookup`]). Needs no drafter and no draft context, so it
+    /// serves any text model at no memory cost.
+    pub const PROMPT_LOOKUP: i32 = 3;
+    /// Prompt lookup with one token of every block replaced and short blocks
+    /// padded with wrong tokens. Only for checking that drafts never change
+    /// what is generated.
+    #[doc(hidden)]
+    pub const CORRUPTED_LOOKUP: i32 = 99;
+
+    /// Prompt-lookup drafting of up to `n_max` tokens per step.
+    pub fn prompt_lookup(n_max: u8) -> Self {
+        Self { spec_type: Self::PROMPT_LOOKUP, n_max, draft_model: None }
+    }
+
+    /// The name logged and reported for a drafting method.
+    pub fn method_name(spec_type: i32) -> &'static str {
+        match spec_type {
+            Self::MTP_HEAD => "mtp-head",
+            Self::DFLASH => "dflash",
+            Self::DSPARK => "dspark",
+            Self::PROMPT_LOOKUP => "prompt-lookup",
+            Self::CORRUPTED_LOOKUP => "corrupted-lookup",
+            _ => "unknown",
+        }
+    }
+}
+
+/// Whether an engine speculates, and how well its drafts are doing.
+///
+/// Read with [`BatchEngine::speculation`]. An engine that was asked to
+/// speculate and could not says why here as well as in its log, so a caller
+/// never mistakes plain decoding for speculation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeculationReport {
+    /// The drafting method in use, `None` when the engine decodes plainly.
+    pub method: Option<&'static str>,
+    /// Most tokens a sequence drafts in one step.
+    pub n_max: u8,
+    /// Why the engine is not speculating: not asked to, or the reason the
+    /// requested method could not start or stopped.
+    pub off_reason: Option<String>,
+    /// Tokens drafted and sent for verification since the engine started.
+    pub drafted: u64,
+    /// Drafted tokens the target's sampler agreed with.
+    pub accepted: u64,
+    /// Sequence steps that verified a non-empty draft.
+    pub verify_steps: u64,
+}
+
+impl SpeculationReport {
+    /// The reason reported while the engine is still starting.
+    pub const STARTING: &'static str = "engine starting";
+
+    /// Accepted over drafted, when anything was drafted.
+    pub fn acceptance_rate(&self) -> Option<f64> {
+        (self.drafted > 0).then(|| self.accepted as f64 / self.drafted as f64)
+    }
 }
 
 impl BatchEngine {
@@ -384,6 +462,22 @@ impl BatchEngine {
         Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, projector, None, None)
     }
 
+    /// [`spawn`](Self::spawn), drafting and verifying speculatively on every
+    /// text sequence. The output is what plain decoding gives: drafts only
+    /// decide how many tokens one decode step commits. Whether speculation is
+    /// on, and why not when it is off, is reported by
+    /// [`speculation`](Self::speculation).
+    pub fn spawn_with_speculation(
+        model_id: String,
+        model: LlamaModel,
+        backend: Arc<LlamaBackend>,
+        context_length: u32,
+        enable_thinking: bool,
+        speculation: Option<BatchSpeculation>,
+    ) -> Result<Self> {
+        Self::spawn_inner(model_id, model, backend, context_length, enable_thinking, None, speculation, None)
+    }
+
     /// [`spawn_with_projector`](Self::spawn_with_projector), drafting and
     /// verifying speculatively on every sequence.
     #[cfg(feature = "mtmd")]
@@ -443,6 +537,13 @@ impl BatchEngine {
         let model_id_thread = model_id.clone();
         let slots = Arc::new(std::sync::atomic::AtomicUsize::new(max_slots()));
         let slots_thread = slots.clone();
+        // Until the scheduler has set up its contexts it cannot say whether it
+        // speculates; it replaces this before serving the first request.
+        let speculation_report = Arc::new(std::sync::Mutex::new(SpeculationReport {
+            off_reason: Some(SpeculationReport::STARTING.into()),
+            ..Default::default()
+        }));
+        let speculation_thread = speculation_report.clone();
         let handle = std::thread::Builder::new()
             .name(format!("batch-{}", model_id))
             .spawn(move || {
@@ -457,6 +558,7 @@ impl BatchEngine {
                     traits,
                     migration,
                     &slots_thread,
+                    &speculation_thread,
                     &rx,
                     &control_rx,
                     &shutdown_rx,
@@ -481,6 +583,7 @@ impl BatchEngine {
                 chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
                 slots,
+                speculation: speculation_report,
             }),
         })
     }
@@ -538,6 +641,10 @@ impl BatchEngine {
                 chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
                 slots: Arc::new(std::sync::atomic::AtomicUsize::new(max_slots())),
+                speculation: Arc::new(std::sync::Mutex::new(SpeculationReport {
+                    off_reason: Some("it decodes by diffusion".into()),
+                    ..Default::default()
+                })),
             }),
         })
     }
@@ -673,6 +780,13 @@ impl BatchEngine {
     /// [`fit_slots`]); a request beyond them is refused as a full queue.
     pub fn slots(&self) -> usize {
         self.inner.slots.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this engine speculates, with which method, and how many of its
+    /// drafts were accepted. When it was asked to speculate and does not, the
+    /// report says why.
+    pub fn speculation(&self) -> SpeculationReport {
+        self.inner.speculation.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
     /// Signal the scheduler to stop and join its thread. In-flight requests
@@ -1585,6 +1699,7 @@ fn scheduler_loop(
     traits: MemoryTraits,
     migration: Option<ModelFingerprint>,
     slots_out: &std::sync::atomic::AtomicUsize,
+    spec_out: &std::sync::Mutex<SpeculationReport>,
     rx: &Receiver<Queued>,
     control_rx: &Receiver<Control>,
     shutdown_rx: &Receiver<()>,
@@ -1674,8 +1789,17 @@ fn scheduler_loop(
         Some(s) => (s.draft_model, Some(s.spec_type), s.n_max),
         None => (None, None, 0),
     };
+    // Prompt lookup drafts from each sequence's own tokens: no draft context.
+    let corrupt_drafts = spec_type == Some(BatchSpeculation::CORRUPTED_LOOKUP);
+    let lookup = (spec_type == Some(BatchSpeculation::PROMPT_LOOKUP) || corrupt_drafts) && spec_n_max > 0;
+    let n_vocab = model.n_vocab().max(1);
+    let mut spec_off: Option<String> = match spec_type {
+        None => Some("not requested".into()),
+        Some(_) if spec_n_max == 0 => Some("requested with no drafted tokens per step".into()),
+        Some(_) => None,
+    };
     let mut draft_ctx = match spec_type {
-        Some(kind) if spec_n_max > 0 => {
+        Some(kind) if spec_n_max > 0 && !lookup => {
             let drafter: &LlamaModel = draft_model.as_ref().unwrap_or(&model);
             let mut params = LlamaContextParams::default()
                 .with_n_ctx(Some(context_length))
@@ -1692,6 +1816,7 @@ fn scheduler_loop(
                 Ok(c) => Some(c),
                 Err(e) => {
                     warn!("batch engine for {}: no draft context ({}), serving without speculation", model_id, e);
+                    spec_off = Some(format!("no draft context: {e}"));
                     None
                 }
             }
@@ -1724,6 +1849,7 @@ fn scheduler_loop(
                 }
                 Err(e) => {
                     warn!("batch engine for {}: speculation unavailable ({}), serving without it", model_id, e);
+                    spec_off = Some(format!("speculation unavailable: {e}"));
                     None
                 }
             }
@@ -1733,6 +1859,32 @@ fn scheduler_loop(
     if spec.is_none() {
         draft_ctx = None;
     }
+    if lookup {
+        info!(
+            "batch engine for {}: speculative decoding on (prompt lookup, up to {} drafted tokens per sequence)",
+            model_id, spec_n_max
+        );
+    } else if let (Some(kind), Some(reason)) = (spec_type, spec_off.as_ref()) {
+        warn!(
+            "batch engine for {}: {} speculation requested but off: {}",
+            model_id,
+            BatchSpeculation::method_name(kind),
+            reason
+        );
+    }
+    let spec_on = lookup || spec.is_some();
+    if let Ok(mut r) = spec_out.lock() {
+        *r = SpeculationReport {
+            method: spec_type.filter(|_| spec_on).map(BatchSpeculation::method_name),
+            n_max: if spec_on { spec_n_max } else { 0 },
+            off_reason: if spec_on { None } else { spec_off.clone() },
+            ..Default::default()
+        };
+    }
+    // Draft counters, published to the report once per step that verified any.
+    let mut spec_drafted: u64 = 0;
+    let mut spec_accepted: u64 = 0;
+    let mut spec_steps: u64 = 0;
 
     // Slots: None == free.
     let mut slots: Vec<Option<Sequence>> = (0..n_slots).map(|_| None).collect();
@@ -1898,6 +2050,37 @@ fn scheduler_loop(
             .flatten()
             .filter(|s| s.pending_token.is_some())
             .count();
+        if lookup && generating <= spec_max_active(BatchSpeculation::PROMPT_LOOKUP) {
+            for (slot_idx, maybe_seq) in slots.iter_mut().enumerate() {
+                let Some(seq) = maybe_seq.as_mut() else {
+                    continue;
+                };
+                let Some(id_last) = seq.pending_token else {
+                    continue;
+                };
+                if seq.multimodal || !seq.forced.is_empty() {
+                    continue;
+                }
+                let room = seq.max_pos - seq.n_past - 1;
+                let n = i32::from(spec_n_max).min(room);
+                if n <= 0 {
+                    continue;
+                }
+                // The pending token ends the history it drafts from; it is
+                // taken back off before the extension below adds it for real.
+                seq.resident.push(id_last);
+                drafts[slot_idx] = crate::prompt_lookup::draft(&seq.resident, n as usize);
+                seq.resident.pop();
+                if corrupt_drafts {
+                    let block = &mut drafts[slot_idx];
+                    while block.len() < n as usize {
+                        block.push(LlamaToken((id_last.0 + 1 + block.len() as i32) % n_vocab));
+                    }
+                    let at = seq.n_past as usize % block.len();
+                    block[at] = LlamaToken((block[at].0 + 1) % n_vocab);
+                }
+            }
+        }
         if let Some(sp) = spec.as_mut().filter(|_| generating <= spec_max_active(spec_type.unwrap_or(0))) {
             let mut asked = false;
             for seq in slots.iter().flatten() {
@@ -2084,6 +2267,11 @@ fn scheduler_loop(
             for seq in slots.iter_mut().flatten() {
                 seq.speculate = false;
             }
+            if let Ok(mut r) = spec_out.lock() {
+                r.method = None;
+                r.n_max = 0;
+                r.off_reason = Some(format!("the drafter lost step with the target: {e}"));
+            }
             for block in &mut drafts {
                 block.clear();
             }
@@ -2135,6 +2323,9 @@ fn scheduler_loop(
             } else {
                 let (done, accepted) =
                     sample_block_into(&model, &ctx, &mut slots, slot_idx, logits_idx, &block, model_id);
+                spec_drafted += block.len() as u64;
+                spec_accepted += u64::from(accepted);
+                spec_steps += 1;
                 if let Some(seq) = slots[slot_idx].as_mut() {
                     // Rejected drafts were written into both caches; take them out.
                     let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), Some(seq.n_past as u32), None);
@@ -2149,6 +2340,14 @@ fn scheduler_loop(
             if done {
                 finalize_and_free(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, policy.kind, slot_idx, &mut draining);
             }
+        }
+        if spec_on
+            && let Ok(mut r) = spec_out.lock()
+            && r.verify_steps != spec_steps
+        {
+            r.drafted = spec_drafted;
+            r.accepted = spec_accepted;
+            r.verify_steps = spec_steps;
         }
     }
 
