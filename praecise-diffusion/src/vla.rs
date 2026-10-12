@@ -100,11 +100,18 @@ pub struct FeatureNorm {
 }
 
 impl FeatureNorm {
-    /// Read the statistics of `feature` from a statistics file.
+    /// Read the statistics of `feature` from a statistics file. A feature
+    /// the file holds no statistics for at all passes through unchanged, as
+    /// the reference processor treats it (some releases keep their
+    /// statistics under other names, e.g. per robot).
     ///
     /// # Errors
-    /// When the statistics the mode needs are missing.
+    /// When the feature has statistics but not the ones the mode needs.
     pub fn read(stats: &SafeTensors, feature: &str, mode: NormMode, eps: f32) -> Result<Self> {
+        let prefix = format!("{feature}.");
+        if !stats.names().any(|n| n.starts_with(&prefix)) {
+            return Ok(Self { mode: NormMode::Identity, lo: Vec::new(), hi: Vec::new(), eps });
+        }
         let (lo, hi) = match mode {
             NormMode::Identity => return Ok(Self { mode, lo: Vec::new(), hi: Vec::new(), eps }),
             NormMode::MeanStd => ("mean", "std"),
