@@ -23,7 +23,7 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 
-use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
@@ -93,13 +93,17 @@ fn janus_image_matches_the_source_checkpoint() {
         if gpu { LlamaModelParams::default().with_n_gpu_layers(1000) } else { LlamaModelParams::default() };
     let model = LlamaModel::load_from_file(&backend, &gguf, &model_params).expect("load");
     let n_ctx = (cond.len() + tokens.len() + 16) as u32;
+    // the reference keeps attention in float32; so does the backbone here
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(2 * n_ctx))
         .with_n_batch(2 * n_ctx)
         .with_n_ubatch(2 * n_ctx)
         .with_n_seq_max(2)
         .with_embeddings(true)
-        .with_pooling_type(LlamaPoolingType::None);
+        .with_pooling_type(LlamaPoolingType::None)
+        .with_type_k(KvCacheType::F32)
+        .with_type_v(KvCacheType::F32)
+        .with_flash_attention(false);
     let mut ctx = model.new_context(&backend, ctx_params).expect("context");
 
     let device = if gpu { Device::Auto } else { Device::Cpu };
