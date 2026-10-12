@@ -1089,6 +1089,53 @@ pub enum MtmdGenAudioType {
 }
 
 impl MtmdContext {
+    /// Decode `codes` (frame-major, `per_frame` codes each) to a waveform with
+    /// the projector's waveform decoder, `window` frames per call with its
+    /// state carried between calls, as a stream would be decoded. Returns the
+    /// sample rate and the mono samples.
+    ///
+    /// # Errors
+    ///
+    /// When the projector does not decode codes, a code is out of range, or the
+    /// backend fails.
+    pub fn decode_codes(
+        &self,
+        codes: &[i32],
+        per_frame: usize,
+        window: usize,
+    ) -> Result<(u32, Vec<f32>), MtmdGenAudioError> {
+        if per_frame == 0 || window == 0 || codes.len() % per_frame != 0 {
+            return Err(MtmdGenAudioError::Step(-1));
+        }
+        let info = unsafe { llama_cpp_sys_2::mtmd_gen_audio_get_info(self.context.as_ptr()) };
+        let rate = u32::try_from(info.sample_rate).map_err(|_| MtmdGenAudioError::Step(info.sample_rate))?;
+        let mut state: Vec<u8> = Vec::new();
+        let mut pcm = Vec::new();
+        for chunk in codes.chunks(per_frame * window) {
+            let mut frames = chunk.to_vec();
+            let mut inp = unsafe { llama_cpp_sys_2::mtmd_gen_inp_default(self.context.as_ptr()) };
+            inp.type_ = llama_cpp_sys_2::MTMD_GEN_PROCESS_TYPE_GEN_WAV;
+            inp.codes = frames.as_mut_ptr();
+            inp.n_codes = frames.len();
+            inp.state_data = if state.is_empty() { std::ptr::null() } else { state.as_ptr().cast() };
+            inp.state_size = state.len();
+            let mut out: llama_cpp_sys_2::mtmd_gen_out = unsafe { std::mem::zeroed() };
+            let code = unsafe { llama_cpp_sys_2::mtmd_gen_audio_process(self.context.as_ptr(), &raw const inp, &raw mut out) };
+            if code != 0 {
+                return Err(MtmdGenAudioError::Step(code));
+            }
+            if !out.audio.is_null() && out.n_samples > 0 {
+                pcm.extend_from_slice(unsafe { slice::from_raw_parts(out.audio, out.n_samples) });
+            }
+            state = if out.state_data.is_null() {
+                Vec::new()
+            } else {
+                unsafe { slice::from_raw_parts(out.state_data.cast::<u8>(), out.state_size) }.to_vec()
+            };
+        }
+        Ok((rate, pcm))
+    }
+
     /// The kind of audio this projector generates.
     ///
     /// # Errors

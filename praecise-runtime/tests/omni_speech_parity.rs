@@ -15,13 +15,15 @@
 //! `PRAECISE_OMNI_TALKER_FIXTURES` points at another fixture directory of the
 //! same layout (a full-size checkpoint's reference, written by
 //! `tests/parity/make_omni_talker_real_reference.py`); `PRAECISE_OMNI_TALKER_GPU=1`
-//! offloads the talker to the GPU.
+//! offloads the talker to the GPU; `PRAECISE_OMNI_TALKER_TOLERANCE` sets the
+//! bound (default 1e-3, the CPU float32 bound); `PRAECISE_OMNI_TALKER_DUMP` names a
+//! directory the engine's waveform is written to.
 #![cfg(feature = "mtmd")]
 
 use std::ops::ControlFlow;
 use std::path::Path;
 
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
@@ -55,6 +57,10 @@ fn talker_waveform_matches_the_source_checkpoint() {
     let fixtures = std::env::var("PRAECISE_OMNI_TALKER_FIXTURES").ok();
     let dir = fixtures.as_deref().map_or(default_dir, Path::new);
     let gpu = std::env::var("PRAECISE_OMNI_TALKER_GPU").as_deref() == Ok("1");
+    // a GPU run is compared with a CPU float32 reference: its own bound, named when it is set
+    let tolerance: f32 = std::env::var("PRAECISE_OMNI_TALKER_TOLERANCE")
+        .ok()
+        .map_or(1e-3, |t| t.parse().expect("PRAECISE_OMNI_TALKER_TOLERANCE is a number"));
     let expected = dir.join("expected.json");
     let exp: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&expected).unwrap_or_else(|e| panic!("{}: {e}", expected.display())),
@@ -92,14 +98,30 @@ fn talker_waveform_matches_the_source_checkpoint() {
         let reference = f32s(&dir.join(name).join("pcm.f32"));
         let frames = usize::try_from(case["frames"].as_u64().expect("frames")).expect("frames");
 
-        let mut ctx = model
-            .new_context(
-                &backend,
-                LlamaContextParams::default()
-                    .with_n_ctx(std::num::NonZeroU32::new(2048))
-                    .with_embeddings(true),
-            )
-            .expect("context");
+        // the waveform decoder alone, on the reference's own codes, when the fixture has them
+        let codes_file = dir.join(name).join("codes.i32");
+        if codes_file.exists() {
+            let codes: Vec<i32> = std::fs::read(&codes_file)
+                .expect("codes")
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let per_frame = codes.len() / frames;
+            let (_, pcm) = mtmd.decode_codes(&codes, per_frame, 3).expect("decode codes");
+            assert_eq!(pcm.len(), reference.len(), "{name}: decoder sample count");
+            let worst = pcm.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("{name}: decoder alone on the reference codes, max |diff| {worst:e}");
+            assert!(worst < tolerance, "{name}: the waveform decoder differs from the reference by {worst}");
+        }
+
+        // the reference keeps attention in float32; so does the backbone here
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(2048))
+            .with_embeddings(true)
+            .with_type_k(KvCacheType::F32)
+            .with_type_v(KvCacheType::F32)
+            .with_flash_attention(false);
+        let mut ctx = model.new_context(&backend, ctx_params).expect("context");
 
         // the thinker's reply arrives one token at a time
         let mut next = 0usize;
@@ -136,6 +158,18 @@ fn talker_waveform_matches_the_source_checkpoint() {
         )
         .expect("speak");
 
+        if let Ok(out) = std::env::var("PRAECISE_OMNI_TALKER_DUMP") {
+            // the engine's waveform, little-endian f32, beside the reference for a closer look
+            let bytes: Vec<u8> = speech.samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(Path::new(&out).join(format!("{name}.f32")), bytes).expect("dump");
+        }
+        let agree = speech
+            .samples
+            .iter()
+            .zip(&reference)
+            .take_while(|(a, b)| (*a - *b).abs() < tolerance)
+            .count();
+        eprintln!("{name}: first {agree} samples agree within {tolerance:e}");
         assert!(chunks > 1, "{name}: the waveform must arrive in more than one chunk");
         assert_eq!(speech.samples.len(), reference.len(), "{name}: sample count");
         let max_diff = speech
@@ -145,6 +179,6 @@ fn talker_waveform_matches_the_source_checkpoint() {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         eprintln!("{name}: {} frames, {} samples, max |diff| {max_diff:e}", speech.frames, speech.samples.len());
-        assert!(max_diff < 1e-3, "{name}: waveform differs from the reference by {max_diff}");
+        assert!(max_diff < tolerance, "{name}: waveform differs from the reference by {max_diff}");
     }
 }

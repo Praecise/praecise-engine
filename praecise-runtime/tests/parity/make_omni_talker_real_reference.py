@@ -39,6 +39,21 @@ def load_part(ckpt: Path, prefix: str):
     return out
 
 
+def fuse_experts(state: dict, n_layers: int, n_experts: int) -> dict:
+    """The checkpoint stores one tensor per expert; the module holds them stacked
+    (gate and up concatenated), as from_pretrained would convert them."""
+    for i in range(n_layers):
+        p = f"model.layers.{i}.mlp.experts."
+        if p + "0.gate_proj.weight" not in state:
+            continue
+        gate = [state.pop(f"{p}{e}.gate_proj.weight") for e in range(n_experts)]
+        up = [state.pop(f"{p}{e}.up_proj.weight") for e in range(n_experts)]
+        down = [state.pop(f"{p}{e}.down_proj.weight") for e in range(n_experts)]
+        state[p + "gate_up_proj"] = torch.stack([torch.cat((g, u), dim=0) for g, u in zip(gate, up)])
+        state[p + "down_proj"] = torch.stack(down)
+    return state
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoint")
@@ -53,8 +68,11 @@ def main():
     config = AutoConfig.from_pretrained(ckpt)
     tok = AutoTokenizer.from_pretrained(ckpt)
     talker = Qwen3OmniMoeTalkerForConditionalGeneration._from_config(config.talker_config, dtype=torch.float32)
-    missing = talker.load_state_dict(load_part(ckpt, "talker."), strict=False)
+    text_cfg = config.talker_config.text_config
+    state = fuse_experts(load_part(ckpt, "talker."), text_cfg.num_hidden_layers, text_cfg.num_experts)
+    missing = talker.load_state_dict(state, strict=False)
     assert not missing.missing_keys, missing.missing_keys[:5]
+    assert not missing.unexpected_keys, missing.unexpected_keys[:5]
     code2wav = Qwen3OmniMoeCode2Wav._from_config(config.code2wav_config, dtype=torch.float32)
     missing = code2wav.load_state_dict(load_part(ckpt, "code2wav."), strict=False)
     assert not missing.missing_keys, missing.missing_keys[:5]
@@ -102,6 +120,8 @@ def main():
     case_dir = out_dir / "text"
     case_dir.mkdir(parents=True, exist_ok=True)
     wav.numpy().astype("<f4").tofile(case_dir / "pcm.f32")
+    # the codes, frame-major, for a check of the waveform decoder on its own
+    codes[0].transpose(0, 1).contiguous().cpu().numpy().astype("<i4").tofile(case_dir / "codes.i32")
     revision = (ckpt / ".revision").read_text().strip() if (ckpt / ".revision").exists() else ""
     case = {
         "name": "text",

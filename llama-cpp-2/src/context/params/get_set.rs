@@ -317,6 +317,16 @@ impl LlamaContextParams {
         LlamaAttentionType::from(self.context_params.attention_type)
     }
 
+    /// Turn flash attention on or off (rather than leaving the choice to the backend).
+    #[must_use]
+    pub fn with_flash_attention(self, enabled: bool) -> Self {
+        self.with_flash_attention_policy(if enabled {
+            llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED
+        } else {
+            llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED
+        })
+    }
+
     /// Set the flash attention policy using llama.cpp enum
     #[must_use]
     pub fn with_flash_attention_policy(
