@@ -101,7 +101,8 @@ def main():
     gc = model.generation_config
     messages = [{"role": "user", "content": [{"type": "text", "text": a.prompt}]}]
     prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-    inputs = processor(text=prompt, generation_mode="image", return_tensors="pt")
+    # A bare string is taken as a batch of characters; the prompt goes in as a one-item batch.
+    inputs = processor(text=[prompt], generation_mode="image", return_tensors="pt")
     cond = inputs["input_ids"][0]
 
     bos = gc.bos_token_id
@@ -143,6 +144,9 @@ def main():
         gen = model.generate(
             **inputs,
             logits_processor=LogitsProcessorList([StepProgress(n_tok)]),
+            # generate() sizes its static KV cache from max_length; left at the default it is
+            # allocated for the full context and runs the host out of memory.
+            max_length=ids.shape[1] + n_tok,
             generation_mode="image",
             do_sample=False,
             guidance_scale=a.guidance,
