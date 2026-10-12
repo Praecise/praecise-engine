@@ -83,6 +83,13 @@ impl<'model> LlamaContext<'model> {
         unsafe { llama_cpp_sys_2::llama_set_causal_attn(self.context.as_ptr(), causal) }
     }
 
+    /// Whether F32 matrix products run in full FP32 on a backend that
+    /// otherwise rounds them to a narrower format (TF32 tensor ops on CUDA).
+    /// No effect on other backends. Off by default.
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        unsafe { llama_cpp_sys_2::llama_set_fp32_gemm(self.context.as_ptr(), fp32) }
+    }
+
     /// Gets the max number of physical tokens (hardware level) to decode in batch. Must be less than or equal to [`Self::n_batch`].
     #[must_use]
     pub fn n_ubatch(&self) -> u32 {

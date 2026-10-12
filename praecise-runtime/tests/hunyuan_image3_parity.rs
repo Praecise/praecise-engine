@@ -16,7 +16,8 @@
 //! from `<name>.image.safetensors` beside it unless `PRAECISE_HY3_IMAGE` names it) and
 //! `PRAECISE_HY3_FIXTURES` (the script's output directory). `PRAECISE_HY3_GPU=1` runs everything
 //! on the GPU; `PRAECISE_HY3_TOLERANCE` bounds every difference relative to the reference peak
-//! (default 1e-3).
+//! (default 1e-3). The reference computes in float32, so F32 matrix products run in full FP32 on
+//! the GPU too rather than with TF32 tensor ops.
 #![cfg(feature = "image-gen")]
 
 use std::num::NonZeroU32;
@@ -114,7 +115,11 @@ fn hunyuan_image3_matches_the_reference_model() {
         .collect();
 
     let device = if gpu { Device::Auto } else { Device::Cpu };
-    let side_backend = || Backend::select_device(device, 8).expect("image backend");
+    let side_backend = || {
+        let mut backend = Backend::select_device(device, 8).expect("image backend");
+        backend.set_fp32_gemm(true);
+        backend
+    };
     let head = HunyuanImage3Head::load(&image, side_backend(), true).expect("image head");
     let vae = HunyuanImage3Vae::load(&image, side_backend(), true).expect("latent decoder");
 
@@ -173,6 +178,7 @@ fn hunyuan_image3_matches_the_reference_model() {
         .with_type_v(KvCacheType::F32)
         .with_flash_attention(false);
     let mut ctx = model.new_context(&backend, ctx_params).expect("context");
+    ctx.set_fp32_gemm(true);
     let seqs = hunyuan_image3_prefill(&mut ctx, &cond, Some(&uncond)).expect("prefill");
     let velocity = hunyuan_image3_velocity(&mut ctx, &head, cond.len(), seqs, &latent, (h, w), t)
         .expect("velocity");

@@ -178,6 +178,32 @@ impl Backend {
     pub fn is_gpu(&self) -> bool {
         self.gpu
     }
+
+    /// Whether F32 matrix products run in full FP32 on a backend that
+    /// otherwise rounds them to a narrower format (TF32 tensor ops on CUDA).
+    /// No effect on other backends. Off by default.
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        // SAFETY: `raw` is a live backend; the hook is looked up by name in
+        // the registry of the backend's own device and called with it.
+        unsafe {
+            let dev = sys::ggml_backend_get_device(self.raw);
+            if dev.is_null() {
+                return;
+            }
+            let reg = sys::ggml_backend_dev_backend_reg(dev);
+            let hook = sys::ggml_backend_reg_get_proc_address(
+                reg,
+                c"ggml_backend_set_fp32_gemm".as_ptr(),
+            );
+            if !hook.is_null() {
+                let set = std::mem::transmute::<
+                    *mut std::ffi::c_void,
+                    unsafe extern "C" fn(sys::ggml_backend_t, bool),
+                >(hook);
+                set(self.raw, fp32);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
