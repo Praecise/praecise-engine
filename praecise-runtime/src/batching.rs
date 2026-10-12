@@ -96,8 +96,9 @@ const MAX_SLOTS_DEFAULT: usize = 32;
 ///   keep paying at sixteen, so a block drafter drafts at every width.
 /// * Prompt lookup, 6 drafted, on replies that reuse their prompt (~65%
 ///   acceptance): 27.3, 27.0, 27.5 against 10.4, 22.1, 32.6 at 1, 4 and 8
-///   streams. Free drafts pay while a step is bound by reading the weights and
-///   stop paying past four streams, so lookup drafts for up to four.
+///   streams when drafting at every width. Free drafts pay while a step is
+///   bound by reading the weights and stop paying past four streams, so lookup
+///   drafts for up to four.
 pub fn spec_max_active(spec_type: i32) -> usize {
     std::env::var("BATCH_SPEC_MAX_ACTIVE")
         .ok()
@@ -111,7 +112,7 @@ pub fn spec_max_active(spec_type: i32) -> usize {
 
 /// Longest wait between prompt-lookup drafts of a sequence whose drafts keep
 /// missing: `1 << LOOKUP_MAX_BACKOFF_SHIFT` steps.
-const LOOKUP_MAX_BACKOFF_SHIFT: u8 = 5;
+const LOOKUP_MAX_BACKOFF_SHIFT: u8 = 3;
 
 /// Sequence slots, overridable with `BATCH_MAX_SLOTS`.
 ///
@@ -2080,9 +2081,10 @@ fn scheduler_loop(
                 }
                 // A sequence whose drafts keep missing is writing text that
                 // does not repeat; it waits longer before drafting again, so
-                // its verify rows stop costing the other sequences.
+                // its verify rows stop costing the other sequences. Alone, a
+                // verify row costs next to nothing, so it always drafts.
                 // Corrupted drafts always draft, to exercise every rejection.
-                if seq.lookup_wait > 0 && !corrupt_drafts {
+                if seq.lookup_wait > 0 && generating > 1 && !corrupt_drafts {
                     seq.lookup_wait -= 1;
                     continue;
                 }
@@ -2354,7 +2356,11 @@ fn scheduler_loop(
                 if let Some(seq) = slots[slot_idx].as_mut() {
                     if accepted == 0 {
                         seq.lookup_misses = seq.lookup_misses.saturating_add(1);
-                        seq.lookup_wait = 1u16 << seq.lookup_misses.min(LOOKUP_MAX_BACKOFF_SHIFT);
+                        // One miss is common inside text that does repeat; only a
+                        // run of them makes the sequence wait.
+                        if seq.lookup_misses >= 2 {
+                            seq.lookup_wait = 1u16 << (seq.lookup_misses - 1).min(LOOKUP_MAX_BACKOFF_SHIFT);
+                        }
                     } else {
                         seq.lookup_misses = 0;
                     }
