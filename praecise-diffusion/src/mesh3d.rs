@@ -404,6 +404,7 @@ pub fn simplify(mesh: &mut Mesh, max_faces: usize) -> usize {
         }
     }
     let mut stamp = vec![0u64; nv];
+    let mut epoch = 0u64;
     let target = |q: &Quadric, pa: [f64; 3], pb: [f64; 3]| -> ([f64; 3], f64) {
         let mid = [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5, (pa[2] + pb[2]) * 0.5];
         let mut best = (mid, q.eval(mid));
@@ -502,16 +503,30 @@ pub fn simplify(mesh: &mut Mesh, max_faces: usize) -> usize {
             }
         }
         vfaces[b as usize].clear();
-        let s = stamp[a as usize].max(stamp[b as usize]) + 1;
-        stamp[a as usize] = s;
+        vfaces[a as usize].retain(|&f| alive[f as usize]);
         collapses += 1;
-        let around: Vec<u32> = neigh(&faces, &vfaces[a as usize].iter().copied().filter(|&f| alive[f as usize]).collect::<Vec<_>>(), a);
-        for x in around {
-            let (lo, hi) = (a.min(x), a.max(x));
-            let mut qq = quad[lo as usize];
-            qq.add(&quad[hi as usize]);
-            let (_, cost) = target(&qq, pos[lo as usize], pos[hi as usize]);
-            heap.push(Cand { cost, a: lo, b: hi, stamp: stamp[lo as usize].max(stamp[hi as usize]) });
+        // The collapse changes the one-ring of every neighbour of `a`, so a
+        // collapse rejected earlier around them may now be legal: restamp
+        // the neighbourhood and requeue every edge touching it.
+        epoch += 1;
+        let around = neigh(&faces, &vfaces[a as usize], a);
+        stamp[a as usize] = epoch;
+        for &x in &around {
+            stamp[x as usize] = epoch;
+        }
+        for &x in std::iter::once(&a).chain(around.iter()) {
+            vfaces[x as usize].retain(|&f| alive[f as usize]);
+            for y in neigh(&faces, &vfaces[x as usize], x) {
+                let (lo, hi) = (x.min(y), x.max(y));
+                if x != lo && (y == a || around.binary_search(&y).is_ok()) {
+                    // Pushed already from the other end.
+                    continue;
+                }
+                let mut qq = quad[lo as usize];
+                qq.add(&quad[hi as usize]);
+                let (_, cost) = target(&qq, pos[lo as usize], pos[hi as usize]);
+                heap.push(Cand { cost, a: lo, b: hi, stamp: stamp[lo as usize].max(stamp[hi as usize]) });
+            }
         }
     }
     mesh.vertices = pos.iter().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
@@ -887,8 +902,10 @@ pub fn bake(u: &Unwrapped, vol: &AttrVolume<'_>, size: u32, dilate: u32) -> Atla
 mod tests {
     use super::*;
 
-    /// A solid `n^3` block of voxels with vertices at voxel centres and every
-    /// lower-corner edge flagged where the block's surface crosses it.
+    /// The closed surface of a solid block: grid points with every
+    /// coordinate in `1..=n` are inside, and each voxel's edge (the one its
+    /// quad's four voxels surround) is crossed where its two end points
+    /// disagree.
     fn cube(n: i32) -> Mesh {
         let mut coords = Vec::new();
         for x in -1..=n {
@@ -898,22 +915,19 @@ mod tests {
                 }
             }
         }
-        let inside = |c: [i32; 3]| (0..n).contains(&c[0]) && (0..n).contains(&c[1]) && (0..n).contains(&c[2]);
-        // The edge along axis a is shared by the voxel and its neighbours at
-        // +1 on the other two axes; it is crossed where they disagree.
+        let inside = |p: [i32; 3]| p.iter().all(|v| (1..=n).contains(v));
         let crossed: Vec<[bool; 3]> = coords
             .iter()
             .map(|&c| {
                 let mut f = [false; 3];
                 for a in 0..3 {
                     let (b, d) = ((a + 1) % 3, (a + 2) % 3);
-                    let mut q = [c; 4];
-                    q[1][d] += 1;
-                    q[2][b] += 1;
-                    q[2][d] += 1;
-                    q[3][b] += 1;
-                    let ins: Vec<bool> = q.iter().map(|x| inside(*x)).collect();
-                    f[a] = ins.iter().any(|&v| v) && !ins.iter().all(|&v| v);
+                    let mut p0 = c;
+                    p0[b] += 1;
+                    p0[d] += 1;
+                    let mut p1 = p0;
+                    p1[a] += 1;
+                    f[a] = inside(p0) != inside(p1);
                 }
                 f
             })
@@ -945,11 +959,44 @@ mod tests {
         let mut a = cube(6);
         a.clean();
         let before = a.faces.len();
+        assert_eq!(before, 6 * 6 * 6 * 2);
+        assert!(closed_manifold(&a));
+        let box_before = bounds(&a);
         let mut b = a.clone();
         simplify(&mut a, before / 4);
         simplify(&mut b, before / 4);
         assert!(a.faces.len() <= before / 4 + 2, "{} faces", a.faces.len());
         assert_eq!(a, b);
+        assert!(closed_manifold(&a));
+        let box_after = bounds(&a);
+        for k in 0..2 {
+            for i in 0..3 {
+                assert!((box_before[k][i] - box_after[k][i]).abs() < 1e-5, "{box_before:?} vs {box_after:?}");
+            }
+        }
+    }
+
+    /// Every edge is shared by exactly two faces.
+    fn closed_manifold(m: &Mesh) -> bool {
+        let mut count: HashMap<(u32, u32), u32> = HashMap::new();
+        for f in &m.faces {
+            for k in 0..3 {
+                let (a, b) = (f[k], f[(k + 1) % 3]);
+                *count.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        count.values().all(|&c| c == 2)
+    }
+
+    fn bounds(m: &Mesh) -> [V3; 2] {
+        let mut b = [[f32::MAX; 3], [f32::MIN; 3]];
+        for v in &m.vertices {
+            for i in 0..3 {
+                b[0][i] = b[0][i].min(v[i]);
+                b[1][i] = b[1][i].max(v[i]);
+            }
+        }
+        b
     }
 
     #[test]
