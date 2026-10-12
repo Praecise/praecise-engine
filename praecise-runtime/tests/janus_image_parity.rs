@@ -127,7 +127,7 @@ fn janus_image_matches_the_source_checkpoint() {
         eprintln!("step {step}: largest logit difference {diff:.3e} ({rel:.3e} of the peak {peak:.3})");
         worst = worst.max(rel);
     }
-    let agree = image.logits.iter().zip(&tokens).filter(|(l, &t)| argmax(l) == t as usize).count();
+    let agree = image.logits.iter().zip(&tokens).filter(|&(l, &t)| argmax(l) == t as usize).count();
     eprintln!("greedy choice agrees on {agree}/{} steps", tokens.len());
     let pix = ref_pixels.iter().zip(&image.pixels).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
     let mean = ref_pixels.iter().zip(&image.pixels).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
