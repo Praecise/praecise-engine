@@ -78,10 +78,12 @@ fn talker_waveform_matches_the_source_checkpoint() {
         LlamaModelParams::default()
     };
     let model = LlamaModel::load_from_file(&backend, &gguf, &model_params).expect("load");
+    // the reference attends in float32; flash attention on GPU would use half-precision keys
     let params = MtmdContextParams {
         use_gpu: gpu,
         ..MtmdContextParams::default()
-    };
+    }
+    .with_flash_attention(false);
     // SAFETY: the projector is dropped before the model, at the end of this function.
     let mtmd = unsafe { MtmdContext::init_from_file(&mmproj, &model, &params) }.expect("projector");
     // the reference computes in float32; so do the projector's products

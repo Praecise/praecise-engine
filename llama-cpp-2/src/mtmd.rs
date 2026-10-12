@@ -66,6 +66,7 @@ impl From<llama_cpp_sys_2::mtmd_input_chunk_type> for MtmdInputChunkType {
 ///     media_marker: CString::new(mtmd_default_marker()).unwrap(),
 ///     image_min_tokens: -1,
 ///     image_max_tokens: -1,
+///     ..MtmdContextParams::default()
 /// };
 /// ```
 #[derive(Debug, Clone)]
@@ -87,11 +88,28 @@ pub struct MtmdContextParams {
     /// Lower values reduce memory and compute at the cost of visual detail.
     /// Gemma 4 supported budgets: 70, 140, 280, 560, 1120.
     pub image_max_tokens: i32,
+    /// Flash attention policy of the projector graphs. `AUTO` enables it where the backend
+    /// supports it, which on GPU computes attention with half-precision keys and values;
+    /// `DISABLED` keeps attention in full precision.
+    pub flash_attn_type: llama_cpp_sys_2::llama_flash_attn_type,
 }
 
 impl Default for MtmdContextParams {
     fn default() -> Self {
         unsafe { llama_cpp_sys_2::mtmd_context_params_default() }.into()
+    }
+}
+
+impl MtmdContextParams {
+    /// Turn the projector's flash attention on or off (rather than leaving the choice to the backend).
+    #[must_use]
+    pub fn with_flash_attention(mut self, enabled: bool) -> Self {
+        self.flash_attn_type = if enabled {
+            llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED
+        } else {
+            llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED
+        };
+        self
     }
 }
 
@@ -105,6 +123,7 @@ impl From<&MtmdContextParams> for llama_cpp_sys_2::mtmd_context_params {
             media_marker,
             image_min_tokens,
             image_max_tokens,
+            flash_attn_type,
         } = params;
 
         context.use_gpu = *use_gpu;
@@ -113,6 +132,7 @@ impl From<&MtmdContextParams> for llama_cpp_sys_2::mtmd_context_params {
         context.media_marker = media_marker.as_ptr();
         context.image_min_tokens = *image_min_tokens;
         context.image_max_tokens = *image_max_tokens;
+        context.flash_attn_type = *flash_attn_type;
 
         context
     }
@@ -127,6 +147,7 @@ impl From<llama_cpp_sys_2::mtmd_context_params> for MtmdContextParams {
             media_marker: unsafe { CStr::from_ptr(params.media_marker) }.to_owned(),
             image_min_tokens: params.image_min_tokens,
             image_max_tokens: params.image_max_tokens,
+            flash_attn_type: params.flash_attn_type,
         }
     }
 }
