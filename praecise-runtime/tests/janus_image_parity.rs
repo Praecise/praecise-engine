@@ -25,13 +25,13 @@ use std::path::Path;
 
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::token::LlamaToken;
 use praecise_diffusion::ggml::{Backend, Device};
 use praecise_diffusion::janus::{JanusImageHead, JanusVqDecoder};
 use praecise_diffusion::pipeline::Precision;
-use praecise_runtime::image_gen::{generate_janus, JanusRequest, TokenSampling};
+use praecise_runtime::image_gen::{JanusRequest, TokenSampling, generate_janus};
 
 fn f32s(path: &Path) -> Vec<f32> {
     std::fs::read(path)
@@ -42,11 +42,17 @@ fn f32s(path: &Path) -> Vec<f32> {
 }
 
 fn ints(v: &serde_json::Value) -> Vec<i64> {
-    v.as_array().expect("list").iter().map(|t| t.as_i64().expect("integer")).collect()
+    v.as_array()
+        .expect("list")
+        .iter()
+        .map(|t| t.as_i64().expect("integer"))
+        .collect()
 }
 
 fn env_f32(name: &str, default: f32) -> f32 {
-    std::env::var(name).ok().map_or(default, |t| t.parse().unwrap_or_else(|_| panic!("{name} is a number")))
+    std::env::var(name).ok().map_or(default, |t| {
+        t.parse().unwrap_or_else(|_| panic!("{name} is a number"))
+    })
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -62,9 +68,14 @@ fn argmax(v: &[f32]) -> usize {
 #[test]
 #[ignore = "needs the Janus-Pro weights: PRAECISE_JANUS_GGUF and PRAECISE_JANUS_DIR"]
 fn janus_image_matches_the_source_checkpoint() {
-    let gguf = std::env::var("PRAECISE_JANUS_GGUF").expect("PRAECISE_JANUS_GGUF names the backbone GGUF");
-    let ckpt = std::env::var("PRAECISE_JANUS_DIR").expect("PRAECISE_JANUS_DIR names the checkpoint directory");
-    let default_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/parity/janus_image"));
+    let gguf =
+        std::env::var("PRAECISE_JANUS_GGUF").expect("PRAECISE_JANUS_GGUF names the backbone GGUF");
+    let ckpt = std::env::var("PRAECISE_JANUS_DIR")
+        .expect("PRAECISE_JANUS_DIR names the checkpoint directory");
+    let default_dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/parity/janus_image"
+    ));
     let fixtures = std::env::var("PRAECISE_JANUS_FIXTURES").ok();
     let dir = fixtures.as_deref().map_or(default_dir, Path::new);
     let gpu = std::env::var("PRAECISE_JANUS_GPU").as_deref() == Ok("1");
@@ -72,13 +83,23 @@ fn janus_image_matches_the_source_checkpoint() {
     let pixel_tolerance = env_f32("PRAECISE_JANUS_PIXEL_TOLERANCE", 2e-2);
     let expected = dir.join("expected.json");
     let exp: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&expected).unwrap_or_else(|e| panic!("{}: {e}", expected.display())),
+        &std::fs::read_to_string(&expected)
+            .unwrap_or_else(|e| panic!("{}: {e}", expected.display())),
     )
     .expect("json");
-    let cond: Vec<LlamaToken> = ints(&exp["cond"]).into_iter().map(|t| LlamaToken(t as i32)).collect();
-    let uncond: Vec<LlamaToken> = ints(&exp["uncond"]).into_iter().map(|t| LlamaToken(t as i32)).collect();
+    let cond: Vec<LlamaToken> = ints(&exp["cond"])
+        .into_iter()
+        .map(|t| LlamaToken(t as i32))
+        .collect();
+    let uncond: Vec<LlamaToken> = ints(&exp["uncond"])
+        .into_iter()
+        .map(|t| LlamaToken(t as i32))
+        .collect();
     let tokens: Vec<u32> = ints(&exp["tokens"]).into_iter().map(|t| t as u32).collect();
-    let kept: Vec<usize> = ints(&exp["kept_steps"]).into_iter().map(|t| t as usize).collect();
+    let kept: Vec<usize> = ints(&exp["kept_steps"])
+        .into_iter()
+        .map(|t| t as usize)
+        .collect();
     let codebook = exp["codebook"].as_u64().expect("codebook") as usize;
     let scale = exp["guidance_scale"].as_f64().expect("guidance_scale") as f32;
     let ref_logits = f32s(&dir.join("logits.f32"));
@@ -89,8 +110,8 @@ fn janus_image_matches_the_source_checkpoint() {
     if std::env::var("PRAECISE_TEST_LOGS").as_deref() != Ok("1") {
         backend.void_logs();
     }
-    let model_params =
-        if gpu { LlamaModelParams::default().with_n_gpu_layers(1000) } else { LlamaModelParams::default() };
+    // the default offloads every layer when a GPU is present
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(if gpu { 1000 } else { 0 });
     let model = LlamaModel::load_from_file(&backend, &gguf, &model_params).expect("load");
     let n_ctx = (cond.len() + tokens.len() + 16) as u32;
     // the reference keeps attention in float32; so does the backbone here
@@ -109,13 +130,20 @@ fn janus_image_matches_the_source_checkpoint() {
     let device = if gpu { Device::Auto } else { Device::Cpu };
     let side_backend = || Backend::select_device(device, 8).expect("image backend");
     let dir_ckpt = Path::new(&ckpt);
-    let mut head = JanusImageHead::load(dir_ckpt, side_backend(), Precision::F32, 2).expect("image head");
+    let mut head =
+        JanusImageHead::load(dir_ckpt, side_backend(), Precision::F32, 2).expect("image head");
     let decoder = JanusVqDecoder::load(dir_ckpt, side_backend(), true).expect("VQ decoder");
 
     let req = JanusRequest {
         cond: &cond,
         uncond: Some(&uncond),
-        sampling: TokenSampling { guidance_scale: scale, temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 },
+        sampling: TokenSampling {
+            guidance_scale: scale,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 0,
+        },
         forced: Some(&tokens),
         keep_logits: true,
     };
@@ -126,15 +154,32 @@ fn janus_image_matches_the_source_checkpoint() {
         let r = &ref_logits[k * codebook..(k + 1) * codebook];
         let e = &image.logits[step];
         let peak = r.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let diff = r.iter().zip(e).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        let diff = r
+            .iter()
+            .zip(e)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
         let rel = diff / peak.max(1e-6);
-        eprintln!("step {step}: largest logit difference {diff:.3e} ({rel:.3e} of the peak {peak:.3})");
+        eprintln!(
+            "step {step}: largest logit difference {diff:.3e} ({rel:.3e} of the peak {peak:.3})"
+        );
         worst = worst.max(rel);
     }
-    let agree = image.logits.iter().zip(&tokens).filter(|&(l, &t)| argmax(l) == t as usize).count();
+    let agree = image
+        .logits
+        .iter()
+        .zip(&tokens)
+        .filter(|&(l, &t)| argmax(l) == t as usize)
+        .count();
     eprintln!("greedy choice agrees on {agree}/{} steps", tokens.len());
-    let pix = ref_pixels.iter().zip(&image.pixels).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-    let mean = ref_pixels.iter().zip(&image.pixels).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
+    let pix = ref_pixels
+        .iter()
+        .zip(&image.pixels)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let mean = ref_pixels
+        .iter()
+        .zip(&image.pixels)
+        .map(|(a, b)| f64::from((a - b).abs()))
+        .sum::<f64>()
         / ref_pixels.len() as f64;
     eprintln!("pixels: largest difference {pix:.3e}, mean {mean:.3e}");
     if let Ok(dump) = std::env::var("PRAECISE_JANUS_DUMP") {
@@ -143,7 +188,17 @@ fn janus_image_matches_the_source_checkpoint() {
     }
 
     assert_eq!(image.pixels.len(), ref_pixels.len(), "pixel count");
-    assert!(worst <= tolerance, "guided logits differ by {worst:.3e} of the peak (bound {tolerance:.1e})");
-    assert!(agree * 100 >= tokens.len() * 99, "greedy choice agrees on only {agree}/{} steps", tokens.len());
-    assert!(pix <= pixel_tolerance, "pixels differ by {pix:.3e} (bound {pixel_tolerance:.1e})");
+    assert!(
+        worst <= tolerance,
+        "guided logits differ by {worst:.3e} of the peak (bound {tolerance:.1e})"
+    );
+    assert!(
+        agree * 100 >= tokens.len() * 99,
+        "greedy choice agrees on only {agree}/{} steps",
+        tokens.len()
+    );
+    assert!(
+        pix <= pixel_tolerance,
+        "pixels differ by {pix:.3e} (bound {pixel_tolerance:.1e})"
+    );
 }
