@@ -111,6 +111,29 @@ def shrink_pi05(dims):
     Pali.__init__ = init
 
 
+def float32_backbone():
+    """Build the SmolVLA backbone and action expert in float32. transformers
+    builds a model in the dtype its config names and the SmolVLM2 text config
+    names bfloat16, which rounds the release's float32 weights as they load (a
+    later `.to(float32)` keeps the rounded values)."""
+    import torch
+
+    import lerobot.policies.smolvla.smolvlm_with_expert as m
+
+    base = m.AutoConfig
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(*args, **kw):
+            config = base.from_pretrained(*args, **kw)
+            for c in (config, getattr(config, "text_config", None), getattr(config, "vision_config", None)):
+                if c is not None:
+                    c.dtype = torch.float32
+            return config
+
+    m.AutoConfig = AutoConfig
+
+
 def make_tiny_smolvla(a, dims):
     """Write a small backbone config next to the release and a random-weight
     SmolVLA release to a.policy; returns the backbone directory."""
@@ -241,6 +264,8 @@ def main():
     if a.tiny == "smolvla":
         a.backbone = make_tiny_smolvla(a, dims)
         dims = None
+    if json.loads((Path(a.policy) / "config.json").read_text())["type"] == "smolvla":
+        float32_backbone()
 
     import torch
     from safetensors.torch import save_file
