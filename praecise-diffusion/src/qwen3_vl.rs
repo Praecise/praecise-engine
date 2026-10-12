@@ -365,10 +365,31 @@ impl Qwen3VlEncoder {
     /// # Errors
     /// Sides that are not multiples of the merged patch.
     pub fn image(&self, pixels: &[f32], (h, w): (usize, usize)) -> Result<Vl3Image> {
+        if pixels.len() != 3 * h * w {
+            return Err(Error::Request(format!("{} pixel values for a {w}x{h} image", pixels.len())));
+        }
+        self.patchify((h, w), |i, ch| (pixels[i] - IMAGE_MEAN[ch]) / IMAGE_STD[ch])
+    }
+
+    /// As [`Self::image`] for 8-bit pixels, normalised as the backbone's
+    /// image processor does (`(v - 255 mean) / (255 std)` in float32).
+    ///
+    /// # Errors
+    /// Sides that are not multiples of the merged patch.
+    pub fn image_bytes(&self, pixels: &[u8], (h, w): (usize, usize)) -> Result<Vl3Image> {
+        if pixels.len() != 3 * h * w {
+            return Err(Error::Request(format!("{} pixel values for a {w}x{h} image", pixels.len())));
+        }
+        let mean = IMAGE_MEAN.map(|m| m * 255.0);
+        let std = IMAGE_STD.map(|s| s * 255.0);
+        self.patchify((h, w), |i, ch| (f32::from(pixels[i]) - mean[ch]) / std[ch])
+    }
+
+    fn patchify(&self, (h, w): (usize, usize), value: impl Fn(usize, usize) -> f32) -> Result<Vl3Image> {
         let v = &self.cfg.vision_config;
         let (p, m, tp) = (v.patch_size as usize, v.spatial_merge_size as usize, v.temporal_patch_size as usize);
         let unit = p * m;
-        if h % unit != 0 || w % unit != 0 || h == 0 || w == 0 || pixels.len() != 3 * h * w {
+        if h % unit != 0 || w % unit != 0 || h == 0 || w == 0 {
             return Err(Error::Request(format!("image {w}x{h} is not a multiple of {unit} pixels")));
         }
         let (gh, gw) = (h / p, w / p);
@@ -379,8 +400,7 @@ impl Qwen3VlEncoder {
                 for _ in 0..tp {
                     for y in 0..p {
                         for x in 0..p {
-                            let px = pixels[(ch * h + r0 + y) * w + c0 + x];
-                            out.push((px - IMAGE_MEAN[ch]) / IMAGE_STD[ch]);
+                            out.push(value((ch * h + r0 + y) * w + c0 + x, ch));
                         }
                     }
                 }

@@ -296,3 +296,126 @@ fn groot_matches_reference() {
     eprintln!("worst backbone {worst_f:.3e}, worst action {worst_a:.3e} (tolerance {tol:.1e}); wall {:.1}s", start.elapsed().as_secs_f32());
     assert!(worst_f <= tol && worst_a <= tol, "GR00T differs from the reference");
 }
+
+fn frame8(h: usize, w: usize, plane: &[u8]) -> resample::Frame8 {
+    resample::Frame8 { h, w, data: plane.repeat(3) }
+}
+
+const SMALL: [u8; 12] = [12, 200, 37, 90, 255, 0, 128, 64, 7, 180, 220, 33];
+const WIDE: [u8; 24] = [12, 200, 37, 90, 250, 3, 255, 0, 128, 64, 1, 99, 7, 180, 220, 33, 140, 60, 90, 91, 92, 250, 0, 17];
+
+#[test]
+fn area_resize_matches_opencv() {
+    // cv2.resize(.., INTER_AREA) of the same planes (identical on x86-64
+    // and aarch64 builds).
+    let up = resample::resize_area(&frame8(3, 4, &SMALL), 5, 7);
+    let want_up = [12, 59, 200, 119, 37, 77, 90, 93, 103, 133, 100, 67, 78, 81, 255, 191, 0, 64, 128, 80, 64, 90, 97, 120, 155, 189, 80, 43, 7, 50, 180, 200, 220, 80, 33];
+    assert_eq!(&up.data[..35], &want_up);
+    let down = resample::resize_area(&frame8(4, 6, &WIDE), 3, 4);
+    assert_eq!(&down.data[..12], &[98, 90, 118, 81, 117, 146, 56, 76, 84, 120, 142, 30]);
+    let half = resample::resize_area(&frame8(2, 2, &[1, 2, 3, 5]), 1, 1);
+    assert_eq!(half.data, vec![3; 3]);
+}
+
+#[test]
+fn bicubic_resize_matches_torch_on_bytes() {
+    // torchvision resize(.., BICUBIC, antialias=True) of uint8 planes.
+    let down = resample::resize_bicubic_aa(&frame8(4, 6, &WIDE), 3, 5);
+    assert_eq!(&down.data[..15], &[99, 113, 59, 157, 56, 125, 122, 115, 49, 83, 65, 123, 171, 95, 22]);
+    let up = resample::resize_bicubic_aa(&frame8(3, 4, &SMALL), 5, 7);
+    let want = [0, 68, 211, 133, 27, 66, 97, 101, 115, 123, 93, 64, 75, 84, 255, 173, 8, 52, 129, 88, 59, 101, 103, 105, 160, 188, 91, 31, 0, 49, 183, 236, 219, 91, 15];
+    assert_eq!(&up.data[..35], &want);
+}
+
+#[test]
+fn groot_image_sizes_and_instructions_follow_the_reference() {
+    use groot_processor::{format_instruction, smart_resize};
+    assert_eq!(smart_resize(256, 455, 32, 65_536, 16_777_216).unwrap(), (256, 448));
+    assert_eq!(smart_resize(256, 340, 32, 65_536, 16_777_216).unwrap(), (256, 352));
+    assert_eq!(smart_resize(100, 100, 32, 65_536, 16_777_216).unwrap(), (256, 256));
+    assert_eq!(format_instruction("Pick up the RED cube, then place it in the bowl!", true), "pick up the red cube then place it in the bowl");
+    assert_eq!(format_instruction("", true), "perform the task");
+    assert_eq!(format_instruction("Keep it.", false), "Keep it.");
+}
+
+#[test]
+fn relative_poses_compose_after_the_reference() {
+    // A quarter turn about z: a step along the relative x axis moves along
+    // the absolute y axis.
+    let reference = [1.0, 2.0, 3.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0];
+    let step = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    let got = groot_processor::compose_pose(&reference, &step);
+    let want = [1.0, 3.0, 3.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0];
+    assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-6), "{got:?}");
+}
+
+/// The GR00T N1.7 control loop through the release's processor against the
+/// reference preprocessor, policy and postprocessor.
+/// `PRAECISE_GROOT_ROLLOUT_PARITY` names a directory with `policy/` (weights
+/// and processor files), `backbone/`, `fixture.json` and
+/// `fixture.safetensors` (written by
+/// `tests/parity/make_groot_rollout_fixture.py`). For every chunk the
+/// prompt, the image patches, the state and the decoding of the reference
+/// prediction are checked; then every executed action (robot units, of
+/// order one in the fixture) is compared. Patches must match exactly, except
+/// by one level where the fixture comes from another architecture and the
+/// release uses OpenCV's area interpolation.
+#[test]
+#[ignore = "needs a released policy and a reference fixture"]
+fn groot_rollout_matches_reference() {
+    let dir = parity_dir("PRAECISE_GROOT_ROLLOUT_PARITY");
+    let fx = Fixture::open(&dir);
+    let (opts, tol) = parity_options();
+    let tag = fx.meta["embodiment_tag"].as_str().unwrap();
+    let mut p = groot_processor::GrootChunkPolicy::load(&dir.join("policy"), &dir.join("backbone"), tag, opts).unwrap();
+    p.set_n_action_steps(fx.usize("n_action_steps"));
+    let (ticks, cams) = (fx.usize("ticks"), fx.usize("cameras"));
+    let states = fx.f32s("states");
+    let sd = states.len() / ticks;
+    let instruction = fx.meta["instruction"].as_str().unwrap().to_owned();
+    let width = p.policy().head().config().max_action_dim;
+    // OpenCV's area decimation sums with fused multiply-adds on aarch64 and
+    // without on x86-64, so a fixture recorded on the other architecture may
+    // differ by one level in a few pixels there; otherwise the patches match.
+    let arch = |m: &str| match m.to_ascii_lowercase().as_str() {
+        "arm64" | "aarch64" => "aarch64".to_owned(),
+        "amd64" | "x86_64" => "x86_64".to_owned(),
+        other => other.to_owned(),
+    };
+    let foreign = fx.meta["machine"].as_str().is_some_and(|m| arch(m) != std::env::consts::ARCH);
+    let patch_tol = if foreign && p.processor().geometry().area { 1.0 / 127.5 + 1e-6 } else { 1e-6 };
+    for (k, c) in fx.meta["chunks"].as_array().unwrap().iter().enumerate() {
+        let t = c["tick"].as_u64().unwrap() as usize;
+        let frames: Vec<Frame> = (0..cams).map(|cam| fx.frame(t, cam)).collect();
+        let state = &states[t * sd..(t + 1) * sd];
+        let obs = VlaObservation { cameras: &frames, state, instruction: &instruction };
+        let inputs = p.inputs(&obs).unwrap();
+        let grids: Vec<(usize, usize)> = inputs.images.iter().map(|i| i.grid).collect();
+        let ids = p.policy().encoder().expand_placeholders(&inputs.tokens, &grids);
+        let want_ids: Vec<u32> = fx.st.get(&format!("chunk.{k}.input_ids")).unwrap().bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        assert_eq!(ids, want_ids, "chunk {k}: prompt");
+        let patches: Vec<f32> = inputs.images.iter().flat_map(|i| i.patches.iter().copied()).collect();
+        let want_px = fx.f32s(&format!("chunk.{k}.pixel_values"));
+        assert_eq!(patches.len(), want_px.len(), "chunk {k}: patch layout");
+        let dp = patches.iter().zip(&want_px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let ds = inputs.state.iter().zip(&fx.f32s(&format!("chunk.{k}.state"))).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let want_raw = fx.f32s(&format!("chunk.{k}.raw"));
+        let raw = p.policy().predict_images(&inputs.tokens, &inputs.images, &inputs.state, &fx.f32s("noise")).unwrap();
+        let dr = raw.iter().zip(&want_raw).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let steps = c["horizon"].as_u64().unwrap() as usize;
+        let decoded = p.processor().decode(&want_raw, width, steps, state).unwrap();
+        let want_dec = fx.f32s(&format!("chunk.{k}.decoded"));
+        assert_eq!(decoded.len(), want_dec.len(), "chunk {k}: decoded layout");
+        let dd = decoded.iter().zip(&want_dec).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let np = patches.iter().zip(&want_px).filter(|(a, b)| a != b).count();
+        eprintln!("chunk {k} (tick {t}): {} tokens, patches {dp:.1e} ({np} values differ), state {ds:.1e}, prediction {dr:.3e}, decoding {dd:.1e}", ids.len());
+        assert!(dp < patch_tol, "chunk {k}: patches differ by {dp}");
+        assert!(ds < 1e-6, "chunk {k}: state differs by {ds}");
+        assert!(dd < 1e-5, "chunk {k}: decoding differs by {dd}");
+        assert!(dr <= tol, "chunk {k}: prediction differs by {dr}");
+    }
+    let identity = FeatureNorm { mode: NormMode::Identity, lo: Vec::new(), hi: Vec::new(), eps: 0.0 };
+    let start = std::time::Instant::now();
+    rollout_matches(&p, &identity, &fx, tol);
+    eprintln!("wall {:.1}s", start.elapsed().as_secs_f32());
+}

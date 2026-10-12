@@ -16,7 +16,9 @@ use crate::flux3::packing::Frame;
 use crate::safetensors::SafeTensors;
 
 pub mod groot;
+pub mod groot_processor;
 pub mod pi05;
+pub mod resample;
 pub mod rollout;
 pub mod siglip;
 pub mod smolvla;

@@ -547,10 +547,18 @@ impl GrootPolicy {
     /// As [`crate::qwen3_vl::Qwen3VlEncoder::forward`].
     pub fn features(&self, tokens: &[u32], images: &[(&[f32], (usize, usize))]) -> Result<(Vec<f32>, Vec<bool>)> {
         let imgs = images.iter().map(|(px, hw)| self.encoder.image(px, *hw)).collect::<Result<Vec<_>>>()?;
-        let grids: Vec<(usize, usize)> = imgs.iter().map(|i| i.grid).collect();
+        self.features_of(tokens, &imgs)
+    }
+
+    /// As [`Self::features`] for images already laid out for the tower.
+    ///
+    /// # Errors
+    /// As [`crate::qwen3_vl::Qwen3VlEncoder::forward`].
+    pub fn features_of(&self, tokens: &[u32], images: &[crate::qwen3_vl::Vl3Image]) -> Result<(Vec<f32>, Vec<bool>)> {
+        let grids: Vec<(usize, usize)> = images.iter().map(|i| i.grid).collect();
         let ids = self.encoder.expand_placeholders(tokens, &grids);
         let image_id = self.encoder.config().image_token_id;
-        let feats = self.encoder.forward(&ids, &imgs)?;
+        let feats = self.encoder.forward(&ids, images)?;
         Ok((feats, ids.iter().map(|&t| t == image_id).collect()))
     }
 
@@ -559,7 +567,16 @@ impl GrootPolicy {
     /// # Errors
     /// As [`Self::features`] and [`GrootHead::sample`].
     pub fn predict(&self, tokens: &[u32], images: &[(&[f32], (usize, usize))], state: &[f32], noise: &[f32]) -> Result<Vec<f32>> {
-        let (feats, image) = self.features(tokens, images)?;
+        let imgs = images.iter().map(|(px, hw)| self.encoder.image(px, *hw)).collect::<Result<Vec<_>>>()?;
+        self.predict_images(tokens, &imgs, state, noise)
+    }
+
+    /// As [`Self::predict`] for images already laid out for the tower.
+    ///
+    /// # Errors
+    /// As [`Self::features_of`] and [`GrootHead::sample`].
+    pub fn predict_images(&self, tokens: &[u32], images: &[crate::qwen3_vl::Vl3Image], state: &[f32], noise: &[f32]) -> Result<Vec<f32>> {
+        let (feats, image) = self.features_of(tokens, images)?;
         let valid = vec![true; image.len()];
         self.head.sample(&feats, &image, &valid, state, noise)
     }
