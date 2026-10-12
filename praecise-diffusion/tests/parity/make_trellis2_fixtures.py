@@ -106,6 +106,11 @@ _stub("trellis2.modules.sparse.conv.conv_cpuref", sparse_conv3d_init=_conv_init,
 spconfig.CONV = "cpuref"
 
 def _sparse_sdpa(*args):
+    if len(args) == 1:
+        qkv = args[0]
+        qf, kf, vf = qkv.feats.unbind(dim=1)
+        o = F.scaled_dot_product_attention(qf.permute(1, 0, 2)[None], kf.permute(1, 0, 2)[None], vf.permute(1, 0, 2)[None])[0].permute(1, 0, 2)
+        return qkv.replace(o)
     if len(args) == 3:
         q, k, v = args
     else:

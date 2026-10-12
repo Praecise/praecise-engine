@@ -55,10 +55,12 @@ pub struct SamplerParams {
     /// unguided one's.
     #[serde(default)]
     pub guidance_rescale: f32,
-    /// Flow times `[lo, hi]` that are guided.
-    pub guidance_interval: [f32; 2],
+    /// Flow times `[lo, hi]` that are guided. Held in double precision as
+    /// the reference compares them with its double time grid; a float32
+    /// bound such as 0.6 would drop a step that lands exactly on it.
+    pub guidance_interval: [f64; 2],
     /// Time warp towards the noisy end.
-    pub rescale_t: f32,
+    pub rescale_t: f64,
 }
 
 /// Per-channel latent normalisation.
@@ -533,12 +535,12 @@ pub fn sample(
     cond: &[f32],
     neg: &[f32],
 ) -> Result<Vec<f32>> {
-    let ts = time_grid(p.steps, f64::from(p.rescale_t));
+    let ts = time_grid(p.steps, p.rescale_t);
     let sm = f64::from(sigma_min);
     for w in ts.windows(2) {
         let (t, tp) = (w[0], w[1]);
         let tm = (1000.0 * t) as f32;
-        let guided = f64::from(p.guidance_interval[0]) <= t && t <= f64::from(p.guidance_interval[1]);
+        let guided = p.guidance_interval[0] <= t && t <= p.guidance_interval[1];
         let s = if guided { p.guidance_strength } else { 1.0 };
         let pred = if s == 1.0 {
             model(&x, tm, cond)?
