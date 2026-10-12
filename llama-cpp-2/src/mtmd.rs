@@ -1089,6 +1089,13 @@ pub enum MtmdGenAudioType {
 }
 
 impl MtmdContext {
+    /// Compute float32 matrix products of every encoder and generator in full
+    /// float32 (no TF32 tensor ops), so a float32 projector reproduces a
+    /// float32 reference.
+    pub fn set_fp32_matmul(&self, fp32: bool) {
+        unsafe { llama_cpp_sys_2::mtmd_set_fp32_matmul(self.context.as_ptr(), fp32) }
+    }
+
     /// Decode `codes` (frame-major, `per_frame` codes each) to a waveform with
     /// the projector's waveform decoder, `window` frames per call with its
     /// state carried between calls, as a stream would be decoded. Returns the

@@ -182,6 +182,13 @@ impl<'model> LlamaContext<'model> {
         }
     }
 
+    /// Compute float32 matrix products in full float32 on backends that round
+    /// them to a narrower format by default (TF32 tensor ops), so a float32
+    /// model reproduces a float32 reference.
+    pub fn set_fp32_matmul(&mut self, fp32: bool) {
+        unsafe { llama_cpp_sys_2::llama_set_fp32_matmul(self.context.as_ptr(), fp32) }
+    }
+
     /// Keep (or stop keeping) the input of layer `layer` (the output of the
     /// layer before it) for every token of each following decode. Only some
     /// architectures expose it; reading it on others aborts in the backend.
