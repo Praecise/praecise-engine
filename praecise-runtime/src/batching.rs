@@ -94,12 +94,24 @@ const MAX_SLOTS_DEFAULT: usize = 32;
 ///   streams, so the head drafts up to two.
 /// * DFlash2 block drafter, 7 drafted: 32.8, 67.4, 102.5. Long accepted blocks
 ///   keep paying at sixteen, so a block drafter drafts at every width.
+/// * Prompt lookup, 6 drafted, on replies that reuse their prompt (~65%
+///   acceptance): 27.3, 27.0, 27.5 against 10.4, 22.1, 32.6 at 1, 4 and 8
+///   streams. Free drafts pay while a step is bound by reading the weights and
+///   stop paying past four streams, so lookup drafts for up to four.
 pub fn spec_max_active(spec_type: i32) -> usize {
     std::env::var("BATCH_SPEC_MAX_ACTIVE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(if spec_type == 0 { 2 } else { usize::MAX })
+        .unwrap_or(match spec_type {
+            BatchSpeculation::MTP_HEAD => 2,
+            BatchSpeculation::PROMPT_LOOKUP => 4,
+            _ => usize::MAX,
+        })
 }
+
+/// Longest wait between prompt-lookup drafts of a sequence whose drafts keep
+/// missing: `1 << LOOKUP_MAX_BACKOFF_SHIFT` steps.
+const LOOKUP_MAX_BACKOFF_SHIFT: u8 = 5;
 
 /// Sequence slots, overridable with `BATCH_MAX_SLOTS`.
 ///
@@ -1168,6 +1180,11 @@ struct Sequence {
     multimodal: bool,
     /// Whether the drafter has been started on this sequence, so it drafts.
     speculate: bool,
+    /// Prompt lookup: steps left before this sequence drafts again, after
+    /// blocks of which nothing was accepted.
+    lookup_wait: u16,
+    /// Prompt lookup: blocks in a row of which nothing was accepted.
+    lookup_misses: u8,
     /// Tokens spent inside the reasoning block so far.
     reasoning_tokens: u32,
     /// Reasoning tokens allowed before the block is closed for the model.
@@ -2061,6 +2078,14 @@ fn scheduler_loop(
                 if seq.multimodal || !seq.forced.is_empty() {
                     continue;
                 }
+                // A sequence whose drafts keep missing is writing text that
+                // does not repeat; it waits longer before drafting again, so
+                // its verify rows stop costing the other sequences.
+                // Corrupted drafts always draft, to exercise every rejection.
+                if seq.lookup_wait > 0 && !corrupt_drafts {
+                    seq.lookup_wait -= 1;
+                    continue;
+                }
                 let room = seq.max_pos - seq.n_past - 1;
                 let n = i32::from(spec_n_max).min(room);
                 if n <= 0 {
@@ -2327,6 +2352,12 @@ fn scheduler_loop(
                 spec_accepted += u64::from(accepted);
                 spec_steps += 1;
                 if let Some(seq) = slots[slot_idx].as_mut() {
+                    if accepted == 0 {
+                        seq.lookup_misses = seq.lookup_misses.saturating_add(1);
+                        seq.lookup_wait = 1u16 << seq.lookup_misses.min(LOOKUP_MAX_BACKOFF_SHIFT);
+                    } else {
+                        seq.lookup_misses = 0;
+                    }
                     // Rejected drafts were written into both caches; take them out.
                     let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), Some(seq.n_past as u32), None);
                     seq.rollback_pending = recurrent_state;
@@ -2897,6 +2928,8 @@ impl Sequence {
                 .with_reasoning(config.reasoning_tx),
             started: Instant::now(),
             speculate: false,
+            lookup_wait: 0,
+            lookup_misses: 0,
             reasoning_tokens: 0,
             forced: std::collections::VecDeque::new(),
             budget_closed: false,
@@ -3323,6 +3356,8 @@ mod prefix_tests {
             pending_token: None,
             multimodal: false,
             speculate: false,
+            lookup_wait: 0,
+            lookup_misses: 0,
             reasoning_tokens: 0,
             reasoning_budget: None,
             close_tokens: Vec::new(),
