@@ -116,6 +116,7 @@ impl<'a> MtmdCliContext<'a> {
             )?,
             image_min_tokens: params.image_min_tokens,
             image_max_tokens: params.image_max_tokens,
+            ..MtmdContextParams::default()
         };
 
         // SAFETY: `main` drops this context (inside `MtmdCliContext`) before
