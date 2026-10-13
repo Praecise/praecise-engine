@@ -599,10 +599,16 @@ pub fn export(surface: &decoder::Decoded, materials: &[f32], max_faces: usize, t
     if mesh.faces.is_empty() {
         return Err(Error::Request("the decoded surface has no faces".into()));
     }
-    mesh.clean();
+    // The reference's order: repair before closing holes (hole tracing needs
+    // consistent winding), simplify to three times the budget, repair and
+    // close again, simplify to the budget, repair.
+    mesh3d::repair(&mut mesh, 1e-5);
+    mesh3d::fill_small_holes(&mut mesh, 3e-2);
+    mesh3d::simplify(&mut mesh, max_faces.saturating_mul(3));
+    mesh3d::repair(&mut mesh, 1e-5);
     mesh3d::fill_small_holes(&mut mesh, 3e-2);
     mesh3d::simplify(&mut mesh, max_faces);
-    mesh.clean();
+    mesh3d::repair(&mut mesh, 1e-5);
     let normals = mesh.vertex_normals();
     let u = mesh3d::unwrap(&mesh, 60.0, texture_size, 2);
     let mats: Vec<f32> = materials.iter().map(|v| v.clamp(0.0, 1.0)).collect();

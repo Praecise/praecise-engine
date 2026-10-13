@@ -4,6 +4,8 @@
 //!   its voxel), one quad per crossed grid edge whose four surrounding voxels
 //!   are all occupied, each quad split along the diagonal with the larger
 //!   product of split weights.
+//! * [`repair`]: drops duplicate faces, splits non-manifold edges and
+//!   vertices, drops specks and winds every part consistently outward.
 //! * [`fill_small_holes`]: closes boundary loops shorter than a perimeter.
 //! * [`simplify`]: quadric-error edge collapse to a face budget.
 //! * [`unwrap`]: charts grown over faces within a normal cone, projected to
@@ -276,6 +278,225 @@ pub fn fill_small_holes(mesh: &mut Mesh, max_perimeter: f32) -> usize {
         closed += 1;
     }
     closed
+}
+
+/// Drop faces over the same three vertices as an earlier face. Returns the
+/// number dropped.
+pub fn remove_duplicate_faces(mesh: &mut Mesh) -> usize {
+    let before = mesh.faces.len();
+    let mut seen: HashMap<[u32; 3], ()> = HashMap::with_capacity(before);
+    mesh.faces.retain(|f| {
+        let mut k = *f;
+        k.sort_unstable();
+        seen.insert(k, ()).is_none()
+    });
+    before - mesh.faces.len()
+}
+
+/// Faces on each undirected edge, in face order.
+fn edge_faces(faces: &[[u32; 3]]) -> HashMap<(u32, u32), Vec<u32>> {
+    let mut e: HashMap<(u32, u32), Vec<u32>> = HashMap::with_capacity(faces.len() * 3 / 2);
+    for (fi, f) in faces.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (f[k], f[(k + 1) % 3]);
+            e.entry((a.min(b), a.max(b))).or_default().push(fi as u32);
+        }
+    }
+    e
+}
+
+fn find(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize];
+        x = parent[x as usize];
+    }
+    x
+}
+
+/// Make every edge border at most two faces and every vertex a single fan:
+/// faces meet only across edges they share with exactly one other face, and
+/// a vertex whose faces fall into several such fans is copied once per extra
+/// fan. Edges that still border more than two faces keep their first two.
+/// Returns the number of vertex copies plus faces dropped.
+pub fn split_non_manifold(mesh: &mut Mesh) -> usize {
+    let orig = mesh.faces.clone();
+    let e = edge_faces(&orig);
+    let nv = mesh.vertices.len();
+    let mut vfaces: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    for (fi, f) in mesh.faces.iter().enumerate() {
+        for &v in f {
+            vfaces[v as usize].push(fi as u32);
+        }
+    }
+    let mut changes = 0;
+    let mut parent: Vec<u32> = Vec::new();
+    let mut root_vertex: Vec<(u32, u32)> = Vec::new();
+    for v in 0..nv as u32 {
+        let fs = std::mem::take(&mut vfaces[v as usize]);
+        if fs.len() < 2 {
+            continue;
+        }
+        parent.clear();
+        parent.extend(0..fs.len() as u32);
+        for (i, &f) in fs.iter().enumerate() {
+            for &w in &orig[f as usize] {
+                if w == v {
+                    continue;
+                }
+                let on = &e[&(v.min(w), v.max(w))];
+                if on.len() == 2 {
+                    let g = if on[0] == f { on[1] } else { on[0] };
+                    if let Ok(j) = fs.binary_search(&g) {
+                        let (ri, rj) = (find(&mut parent, i as u32), find(&mut parent, j as u32));
+                        if ri != rj {
+                            parent[ri.max(rj) as usize] = ri.min(rj);
+                        }
+                    }
+                }
+            }
+        }
+        // The fan holding the lowest face keeps `v`; each other fan gets a copy.
+        root_vertex.clear();
+        for i in 0..fs.len() {
+            let r = find(&mut parent, i as u32);
+            let target = match root_vertex.iter().find(|(rr, _)| *rr == r) {
+                Some(&(_, t)) => t,
+                None => {
+                    let t = if root_vertex.is_empty() {
+                        v
+                    } else {
+                        mesh.vertices.push(mesh.vertices[v as usize]);
+                        changes += 1;
+                        (mesh.vertices.len() - 1) as u32
+                    };
+                    root_vertex.push((r, t));
+                    t
+                }
+            };
+            if target != v {
+                for x in &mut mesh.faces[fs[i] as usize] {
+                    if *x == v {
+                        *x = target;
+                    }
+                }
+            }
+        }
+    }
+    let mut keep = vec![true; mesh.faces.len()];
+    let mut over: Vec<_> = edge_faces(&mesh.faces).into_values().filter(|fs| fs.len() > 2).collect();
+    over.sort_unstable();
+    for fs in over {
+        for &f in &fs[2..] {
+            if std::mem::replace(&mut keep[f as usize], false) {
+                changes += 1;
+            }
+        }
+    }
+    let mut k = keep.into_iter();
+    mesh.faces.retain(|_| k.next().unwrap_or(true));
+    changes
+}
+
+/// Wind every face consistently with its neighbours across two-face edges,
+/// spreading from the lowest face of each connected part, then turn each
+/// part so its signed volume is positive (outward-facing when closed).
+/// Returns the number of faces flipped.
+pub fn orient_faces(mesh: &mut Mesh) -> usize {
+    let e = edge_faces(&mesh.faces);
+    let nf = mesh.faces.len();
+    let mut seen = vec![false; nf];
+    let mut flips = 0;
+    let mut part = Vec::new();
+    let mut stack = Vec::new();
+    for start in 0..nf {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        part.clear();
+        stack.push(start as u32);
+        while let Some(f) = stack.pop() {
+            part.push(f);
+            let tri = mesh.faces[f as usize];
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                let on = &e[&(a.min(b), a.max(b))];
+                if on.len() != 2 {
+                    continue;
+                }
+                let g = if on[0] == f { on[1] } else { on[0] } as usize;
+                if seen[g] {
+                    continue;
+                }
+                seen[g] = true;
+                let t = &mut mesh.faces[g];
+                // A consistent neighbour runs the shared edge as b -> a.
+                if (0..3).any(|j| t[j] == a && t[(j + 1) % 3] == b) {
+                    t.swap(1, 2);
+                    flips += 1;
+                }
+                stack.push(g as u32);
+            }
+        }
+        let vol: f64 = part
+            .iter()
+            .map(|&f| {
+                let t = mesh.faces[f as usize];
+                let (a, b, c) = (mesh.vertices[t[0] as usize], mesh.vertices[t[1] as usize], mesh.vertices[t[2] as usize]);
+                f64::from(dot(a, cross(b, c)))
+            })
+            .sum();
+        if vol < 0.0 {
+            for &f in &part {
+                mesh.faces[f as usize].swap(1, 2);
+            }
+            flips += part.len();
+        }
+    }
+    flips
+}
+
+/// Drop edge-connected parts whose total area is below `min_area`. Returns
+/// the number of faces dropped.
+pub fn remove_small_components(mesh: &mut Mesh, min_area: f64) -> usize {
+    let nf = mesh.faces.len();
+    let mut parent: Vec<u32> = (0..nf as u32).collect();
+    let mut on: Vec<_> = edge_faces(&mesh.faces).into_values().collect();
+    on.sort_unstable();
+    for fs in on {
+        for &g in &fs[1..] {
+            let (r0, r1) = (find(&mut parent, fs[0]), find(&mut parent, g));
+            if r0 != r1 {
+                parent[r0.max(r1) as usize] = r0.min(r1);
+            }
+        }
+    }
+    let mut area = vec![0f64; nf];
+    for (fi, t) in mesh.faces.iter().enumerate() {
+        let (a, b, c) = (mesh.vertices[t[0] as usize], mesh.vertices[t[1] as usize], mesh.vertices[t[2] as usize]);
+        let r = find(&mut parent, fi as u32);
+        area[r as usize] += 0.5 * f64::from(norm(cross(sub(b, a), sub(c, a))));
+    }
+    let before = nf;
+    let mut fi = 0u32;
+    mesh.faces.retain(|_| {
+        let r = find(&mut parent, fi);
+        fi += 1;
+        area[r as usize] >= min_area
+    });
+    before - mesh.faces.len()
+}
+
+/// The repairs before and after simplification: duplicate faces, then
+/// non-manifold edges and vertices, then specks, then winding; finally
+/// unused vertices.
+pub fn repair(mesh: &mut Mesh, min_area: f64) {
+    mesh.clean();
+    remove_duplicate_faces(mesh);
+    split_non_manifold(mesh);
+    remove_small_components(mesh, min_area);
+    orient_faces(mesh);
+    mesh.clean();
 }
 
 #[derive(Clone, Copy, Default)]
@@ -974,6 +1195,36 @@ mod tests {
                 assert!((box_before[k][i] - box_after[k][i]).abs() < 1e-5, "{box_before:?} vs {box_after:?}");
             }
         }
+    }
+
+    #[test]
+    fn repair_restores_a_closed_outward_surface() {
+        let mut m = cube(3);
+        m.clean();
+        let faces = m.faces.len();
+        let (a, b) = (m.faces[0][0], m.faces[0][1]);
+        m.faces[5].swap(1, 2);
+        m.faces.push(m.faces[7]);
+        // A sliver fin on an existing edge makes it non-manifold; a speck
+        // floats apart.
+        let mid = scale(add(m.vertices[a as usize], m.vertices[b as usize]), 0.5);
+        m.vertices.push(add(mid, [1e-4, 1e-4, 1e-4]));
+        m.faces.push([a, b, (m.vertices.len() - 1) as u32]);
+        let s = m.vertices.len() as u32;
+        m.vertices.extend([[5.0, 5.0, 5.0], [5.001, 5.0, 5.0], [5.0, 5.001, 5.0]]);
+        m.faces.push([s, s + 1, s + 2]);
+        repair(&mut m, 1e-3);
+        assert_eq!(m.faces.len(), faces);
+        assert!(closed_manifold(&m));
+        let mut directed: HashMap<(u32, u32), u32> = HashMap::new();
+        for f in &m.faces {
+            for k in 0..3 {
+                *directed.entry((f[k], f[(k + 1) % 3])).or_default() += 1;
+            }
+        }
+        assert!(directed.iter().all(|(&(x, y), &c)| c == 1 && directed.get(&(y, x)) == Some(&1)), "winding is inconsistent");
+        let vol: f32 = m.faces.iter().map(|t| dot(m.vertices[t[0] as usize], cross(m.vertices[t[1] as usize], m.vertices[t[2] as usize]))).sum();
+        assert!(vol > 0.0);
     }
 
     /// Every edge is shared by exactly two faces.
