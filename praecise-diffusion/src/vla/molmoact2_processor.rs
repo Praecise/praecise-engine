@@ -9,15 +9,25 @@
 //! image placeholder per camera; each placeholder becomes the image's layout
 //! tokens (a start, rows of patch tokens each closed by a row token, an end)
 //! and the tokenizer's output is prefixed with BOS.
+//!
+//! Around the model, an embodiment of the release's `norm_stats.json` gives
+//! the state and action statistics (1st and 99th percentiles, a mask of the
+//! values that pass through unnormalised), the chunk length, the actions
+//! executed per chunk and the prompt's setup and control texts. The state
+//! is normalised and clamped to `[-1, 1]` before it becomes state tokens;
+//! the predicted chunk is cut to the executed actions and the robot's action
+//! width, clamped to `[-1, 1]` and unnormalised.
 
 use std::path::Path;
 
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::read_json;
+use super::molmoact2::{MolmoAct2ActionExpert, MolmoAct2Lm, MolmoAct2Vision};
 use super::resample::{resize_bilinear_bytes, Frame8};
+use super::{read_json, ChunkPolicy, FeatureNorm, NormMode, VlaObservation};
 use crate::error::{Error, Result};
+use crate::pipeline::LoadOptions;
 
 const IMAGE_PROMPT: &str = "<|image|>";
 const QUESTION_PUNCTUATION: &[char] = &['.', ',', '!', '?', ';', ':', '\u{2026}'];
@@ -350,5 +360,330 @@ impl MolmoAct2Processor {
             pooling.extend(local.iter().map(|&j| if j < 0 { -1 } else { j + i as i32 * patches }));
         }
         Ok(MolmoAct2Inputs { prompt, ids, pixels, crops: frames.len(), pooling, pool: self.pool.0 * self.pool.1 })
+    }
+}
+
+/// One feature's normalisation in a MolmoAct2 embodiment: the 1st and 99th
+/// percentiles map to `[-1, 1]` for the values whose mask entry is set; the
+/// others (a gripper already in `[-1, 1]`) pass through.
+#[derive(Debug, Clone)]
+pub struct MolmoAct2FeatureNorm {
+    /// The percentile normalisation.
+    pub norm: FeatureNorm,
+    /// Per value, whether it is normalised.
+    pub mask: Vec<bool>,
+}
+
+fn floats(v: Option<&Value>) -> Option<Vec<f32>> {
+    v?.as_array()?.iter().map(|x| x.as_f64().map(|f| f as f32)).collect()
+}
+
+fn passthrough_in_range(x: &[f32], mask: &[bool], what: &str) -> Result<()> {
+    let d = mask.len().max(1);
+    if x.iter().enumerate().any(|(i, &v)| !mask[i % d] && !(-1.0..=1.0).contains(&v)) {
+        return Err(Error::Request(format!("MolmoAct2 {what} values that pass through unnormalised (the gripper) must lie in [-1, 1]")));
+    }
+    Ok(())
+}
+
+impl MolmoAct2FeatureNorm {
+    /// From an embodiment's `state_stats` or `action_stats`. The mask is
+    /// all set when `normalize_gripper`; otherwise the statistics' own
+    /// `mask`, or failing that every value not named a gripper.
+    ///
+    /// # Errors
+    /// For missing percentiles, a mask that cannot be resolved, or a
+    /// passed-through value whose range leaves `[-1, 1]`.
+    pub fn from_stats(stats: &Value, what: &str, normalize_gripper: bool) -> Result<Self> {
+        let get = |k: &str| floats(stats.get(k)).ok_or_else(|| Error::Config(format!("MolmoAct2 {what} statistics give no {k}")));
+        let (lo, hi) = (get("q01")?, get("q99")?);
+        let d = lo.len();
+        if d == 0 || hi.len() != d {
+            return Err(Error::Config(format!("MolmoAct2 {what} percentiles of different lengths")));
+        }
+        let given: Option<Vec<bool>> = stats.get("mask").and_then(Value::as_array).and_then(|m| m.iter().map(Value::as_bool).collect());
+        let mask = if normalize_gripper {
+            vec![true; d]
+        } else if let Some(m) = given.filter(|m| m.len() == d) {
+            m
+        } else {
+            let names: Option<Vec<String>> = stats.get("names").and_then(Value::as_array).and_then(|n| n.iter().map(|x| x.as_str().map(str::to_lowercase)).collect());
+            match names {
+                Some(n) if n.len() == d => n.iter().map(|n| !n.contains("gripper")).collect(),
+                _ => return Err(Error::Config(format!("MolmoAct2 {what} statistics neither mask nor name their {d} values; normalise the gripper instead"))),
+            }
+        };
+        if let (Some(min), Some(max)) = (floats(stats.get("min")), floats(stats.get("max"))) {
+            if min.len() == d && max.len() == d && (0..d).any(|i| !mask[i] && (min[i] < -1.0 || max[i] > 1.0)) {
+                return Err(Error::Config(format!("MolmoAct2 {what} gripper values are not in [-1, 1]; normalise the gripper instead")));
+            }
+        }
+        Ok(Self { norm: FeatureNorm { mode: NormMode::Quantiles, lo, hi, eps: 1e-8 }, mask })
+    }
+
+    /// Values per row.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.mask.len()
+    }
+
+    /// Robot units to the policy's: rows normalised and clamped to `[-1,
+    /// 1]` where the mask is set, passed through elsewhere.
+    ///
+    /// # Errors
+    /// When the values do not divide into rows, or a passed-through value
+    /// leaves `[-1, 1]`.
+    pub fn normalize(&self, x: &[f32], what: &str) -> Result<Vec<f32>> {
+        passthrough_in_range(x, &self.mask, what)?;
+        let n = self.norm.normalize(x)?;
+        let d = self.dim();
+        Ok(x.iter().zip(n).enumerate().map(|(i, (&v, t))| if self.mask[i % d] { t.clamp(-1.0, 1.0) } else { v }).collect())
+    }
+
+    /// The policy's units back to the robot's: rows clamped to `[-1, 1]`,
+    /// then unnormalised where the mask is set.
+    ///
+    /// # Errors
+    /// When the values do not divide into rows.
+    pub fn unnormalize(&self, x: &[f32]) -> Result<Vec<f32>> {
+        let c: Vec<f32> = x.iter().map(|v| v.clamp(-1.0, 1.0)).collect();
+        let n = self.norm.unnormalize(&c)?;
+        let d = self.dim();
+        Ok(c.into_iter().zip(n).enumerate().map(|(i, (v, t))| if self.mask[i % d] { t } else { v }).collect())
+    }
+}
+
+/// One embodiment of a MolmoAct2 release (`norm_stats.json`, by tag).
+#[derive(Debug, Clone)]
+pub struct MolmoAct2Embodiment {
+    /// Camera features in prompt order (empty: any cameras).
+    pub camera_keys: Vec<String>,
+    /// The robot setup named in the prompt.
+    pub setup_type: String,
+    /// The control mode named in the prompt.
+    pub control_mode: String,
+    /// Actions per predicted chunk.
+    pub action_horizon: usize,
+    /// Actions executed per chunk.
+    pub n_action_steps: usize,
+    /// State normalisation.
+    pub state: MolmoAct2FeatureNorm,
+    /// Action normalisation.
+    pub action: MolmoAct2FeatureNorm,
+    /// A joint-convention change between the robot and the model, `(signs,
+    /// offsets)` over the first values: the state enters the model as
+    /// `signs * state + offsets` and actions leave it as `signs * (action -
+    /// offsets)` (the policy config's `joint_signs` / `joint_offsets`).
+    pub joint_frame: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+impl MolmoAct2Embodiment {
+    /// The embodiment `tag` of the release in `dir` (statistics file named
+    /// by `config.json`'s `norm_stats_filename`, default
+    /// `norm_stats.json`); `normalize_gripper` as the policy config's.
+    ///
+    /// # Errors
+    /// On a missing or malformed file, an unknown tag, or statistics the
+    /// reference would refuse.
+    pub fn read(dir: &Path, tag: &str, normalize_gripper: bool) -> Result<Self> {
+        let c = read_json(&dir.join("config.json"))?;
+        let file = c.get("norm_stats_filename").and_then(Value::as_str).unwrap_or("norm_stats.json");
+        let ns = read_json(&dir.join(file))?;
+        let tags = ns.get("metadata_by_tag").and_then(Value::as_object).ok_or_else(|| Error::Config(format!("{file} has no metadata_by_tag")))?;
+        let m = tags.get(tag).ok_or_else(|| {
+            let mut known: Vec<&str> = tags.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            Error::Config(format!("unknown MolmoAct2 embodiment {tag:?}; the release has {known:?}"))
+        })?;
+        let text = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let count = |k: &str| m.get(k).and_then(Value::as_u64).map_or(30, |v| v as usize);
+        let stats = |k: &str| m.get(k).ok_or_else(|| Error::Config(format!("MolmoAct2 embodiment {tag:?} gives no {k}")));
+        let e = Self {
+            camera_keys: m.get("camera_keys").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
+            setup_type: text("setup_type"),
+            control_mode: text("control_mode"),
+            action_horizon: count("action_horizon"),
+            n_action_steps: count("n_action_steps"),
+            state: MolmoAct2FeatureNorm::from_stats(stats("state_stats")?, "state", normalize_gripper)?,
+            action: MolmoAct2FeatureNorm::from_stats(stats("action_stats")?, "action", normalize_gripper)?,
+            joint_frame: None,
+        };
+        if e.action_horizon == 0 || e.n_action_steps == 0 || e.n_action_steps > e.action_horizon {
+            return Err(Error::Config(format!("MolmoAct2 embodiment {tag:?} executes {} of {} actions per chunk", e.n_action_steps, e.action_horizon)));
+        }
+        Ok(e)
+    }
+
+    /// Set the joint-convention change (see [`Self::joint_frame`]).
+    ///
+    /// # Errors
+    /// When the signs and offsets differ in length or exceed the state or
+    /// action width.
+    pub fn set_joint_frame(&mut self, signs: Vec<f32>, offsets: Vec<f32>) -> Result<()> {
+        if signs.len() != offsets.len() || signs.len() > self.state.dim() || signs.len() > self.action.dim() {
+            return Err(Error::Config("joint signs and offsets must match and fit the state and action".into()));
+        }
+        self.joint_frame = Some((signs, offsets));
+        Ok(())
+    }
+
+    /// The measured state as the model reads it: in the model's joint
+    /// convention, normalised and clamped.
+    ///
+    /// # Errors
+    /// For a state of the wrong width or a passed-through value outside
+    /// `[-1, 1]`.
+    pub fn state_in(&self, state: &[f32]) -> Result<Vec<f32>> {
+        if state.len() != self.state.dim() {
+            return Err(Error::Request(format!("the embodiment reads {} state values, got {}", self.state.dim(), state.len())));
+        }
+        let mut s = state.to_vec();
+        if let Some((signs, offsets)) = &self.joint_frame {
+            for ((x, &k), &o) in s.iter_mut().zip(signs).zip(offsets) {
+                *x = k * *x + o;
+            }
+        }
+        self.state.normalize(&s, "state")
+    }
+
+    /// Rows of normalised actions in robot units: clamped, unnormalised and
+    /// back in the robot's joint convention.
+    ///
+    /// # Errors
+    /// When the values do not divide into rows.
+    pub fn actions_out(&self, actions: &[f32]) -> Result<Vec<f32>> {
+        let mut a = self.action.unnormalize(actions)?;
+        if let Some((signs, offsets)) = &self.joint_frame {
+            for row in a.chunks_mut(self.action.dim()) {
+                for ((x, &k), &o) in row.iter_mut().zip(signs).zip(offsets) {
+                    *x = k * (*x - o);
+                }
+            }
+        }
+        Ok(a)
+    }
+}
+
+/// A MolmoAct2 release for one embodiment, as a [`ChunkPolicy`] in robot
+/// units: the release's preprocessing, the vision backbone, the language
+/// model's prefill and the action expert's flow matching (from noise
+/// `[action_horizon][max_action_dim]`, robot action dimensions beyond the
+/// embodiment's held at zero), cut to the executed actions.
+pub struct MolmoAct2ChunkPolicy {
+    vision: MolmoAct2Vision,
+    lm: MolmoAct2Lm,
+    expert: MolmoAct2ActionExpert,
+    processor: MolmoAct2Processor,
+    embodiment: MolmoAct2Embodiment,
+    n_action_steps: usize,
+}
+
+impl std::fmt::Debug for MolmoAct2ChunkPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MolmoAct2ChunkPolicy").field("embodiment", &self.embodiment).field("n_action_steps", &self.n_action_steps).finish_non_exhaustive()
+    }
+}
+
+impl MolmoAct2ChunkPolicy {
+    /// Load the release in `dir` (weights, `config.json`, tokenizer and
+    /// processor files) for `embodiment` (see
+    /// [`MolmoAct2Embodiment::read`]).
+    ///
+    /// # Errors
+    /// As the model loaders, or when the embodiment's chunk or action width
+    /// exceeds the checkpoint's.
+    pub fn load(dir: &Path, embodiment: MolmoAct2Embodiment, opts: LoadOptions) -> Result<Self> {
+        let expert = MolmoAct2ActionExpert::load(dir, opts)?;
+        let c = expert.config();
+        if embodiment.action_horizon > c.max_horizon || embodiment.action.dim() > c.max_action_dim {
+            return Err(Error::Config(format!(
+                "the embodiment's chunk {}x{} exceeds the checkpoint's {}x{}",
+                embodiment.action_horizon,
+                embodiment.action.dim(),
+                c.max_horizon,
+                c.max_action_dim
+            )));
+        }
+        let processor = MolmoAct2Processor::load(dir, &embodiment.setup_type, &embodiment.control_mode)?;
+        let vision = MolmoAct2Vision::load(dir, opts)?;
+        let lm = MolmoAct2Lm::load(dir, opts)?;
+        let n_action_steps = embodiment.n_action_steps;
+        Ok(Self { vision, lm, expert, processor, embodiment, n_action_steps })
+    }
+
+    /// The embodiment.
+    #[must_use]
+    pub fn embodiment(&self) -> &MolmoAct2Embodiment {
+        &self.embodiment
+    }
+
+    /// The preprocessing.
+    #[must_use]
+    pub fn processor(&self) -> &MolmoAct2Processor {
+        &self.processor
+    }
+
+    /// Run F32 matrix products in full FP32 on a backend that would round
+    /// them (TF32 on CUDA).
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        self.vision.set_fp32_gemm(fp32);
+        self.lm.set_fp32_gemm(fp32);
+        self.expert.set_fp32_gemm(fp32);
+    }
+
+    /// Execute `n` actions of each chunk (at most the chunk).
+    pub fn set_n_action_steps(&mut self, n: usize) {
+        self.n_action_steps = n.clamp(1, self.embodiment.action_horizon);
+    }
+
+    /// The model inputs of an observation and the normalised state.
+    ///
+    /// # Errors
+    /// For the wrong number of cameras or state values, or a tokenizer
+    /// failure.
+    pub fn inputs(&self, obs: &VlaObservation<'_>) -> Result<(MolmoAct2Inputs, Vec<f32>)> {
+        let cams = self.embodiment.camera_keys.len();
+        if cams > 0 && obs.cameras.len() != cams {
+            return Err(Error::Request(format!("the embodiment reads {cams} cameras, got {}", obs.cameras.len())));
+        }
+        let state = self.embodiment.state_in(obs.state)?;
+        let frames: Vec<Frame8> = obs.cameras.iter().map(Frame8::from_unit).collect();
+        Ok((self.processor.prepare(&frames, &state, obs.instruction)?, state))
+    }
+
+    /// The executed actions of one chunk `[n_action_steps][action_dim]` in
+    /// the policy's normalised units, before clamping.
+    ///
+    /// # Errors
+    /// On a malformed observation, noise of the wrong length or a backend
+    /// failure.
+    pub fn predict_normalized(&self, obs: &VlaObservation<'_>, noise: &[f32]) -> Result<Vec<f32>> {
+        let (inputs, _) = self.inputs(obs)?;
+        let feats = self.vision.encode(&inputs.pixels, inputs.crops, &inputs.pooling, inputs.pool)?;
+        let pre = self.lm.prefill(&inputs.ids, &feats)?;
+        let c = self.expert.config();
+        let (a, d) = (c.max_action_dim, self.embodiment.action.dim());
+        let padding: Vec<bool> = (0..a).map(|i| i >= d).collect();
+        let mask = c.context_mask(&inputs.ids);
+        let chunk = self.expert.sample(&pre.keys, &pre.values, &mask, noise, self.embodiment.action_horizon, (d < a).then_some(padding.as_slice()))?;
+        Ok(chunk.chunks(a).take(self.chunk_size()).flat_map(|row| row[..d].iter().copied()).collect())
+    }
+}
+
+impl ChunkPolicy for MolmoAct2ChunkPolicy {
+    fn chunk_size(&self) -> usize {
+        self.n_action_steps
+    }
+    fn action_dim(&self) -> usize {
+        self.embodiment.action.dim()
+    }
+    fn n_action_steps(&self) -> usize {
+        self.n_action_steps
+    }
+    fn noise_len(&self) -> usize {
+        self.embodiment.action_horizon * self.expert.config().max_action_dim
+    }
+    fn predict(&self, obs: &VlaObservation<'_>, noise: &[f32]) -> Result<Vec<f32>> {
+        self.embodiment.actions_out(&self.predict_normalized(obs, noise)?)
     }
 }

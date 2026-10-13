@@ -573,6 +573,114 @@ fn molmoact2_action_config_reads_a_release() {
     assert!(molmoact2::MolmoAct2ActionConfig::from_json(&bad).is_err());
 }
 
+/// The MolmoAct2 control loop from frames, through an embodiment of the
+/// release's statistics, against the lerobot policy's pre-processor,
+/// `select_action` loop and post-processor
+/// (`PRAECISE_MOLMOACT2_ROLLOUT_PARITY`, made by
+/// `tests/parity/make_molmoact2_rollout_fixture.py`). For every chunk the
+/// prompt ids exactly, the normalised state, the crops to one 8-bit level
+/// and the executed part of the predicted chunk (normalised, before
+/// clamping, relative to how far the reference moved it from the noise);
+/// then every executed action, in normalised units.
+#[test]
+#[ignore = "needs a reference fixture"]
+fn molmoact2_rollout_matches_reference() {
+    let dir = parity_dir("PRAECISE_MOLMOACT2_ROLLOUT_PARITY");
+    let fx = Fixture::open(&dir);
+    let (opts, tol) = parity_options();
+    let policy = dir.join("policy");
+    let mut e = molmoact2_processor::MolmoAct2Embodiment::read(&policy, fx.meta["tag"].as_str().unwrap(), fx.meta["normalize_gripper"].as_bool().unwrap()).unwrap();
+    if let (Some(s), Some(o)) = (fx.meta["joint_signs"].as_array(), fx.meta["joint_offsets"].as_array()) {
+        let f = |v: &Vec<serde_json::Value>| v.iter().map(|x| x.as_f64().unwrap() as f32).collect();
+        e.set_joint_frame(f(s), f(o)).unwrap();
+    }
+    let mut p = molmoact2_processor::MolmoAct2ChunkPolicy::load(&policy, e, opts).unwrap();
+    p.set_fp32_gemm(true);
+    assert_eq!((p.embodiment().action_horizon, p.n_action_steps()), (fx.usize("horizon"), fx.usize("n_action_steps")));
+    let (ticks, cams) = (fx.usize("ticks"), fx.usize("cameras"));
+    let states = fx.f32s("states");
+    let sd = states.len() / ticks;
+    let instruction = fx.meta["instruction"].as_str().unwrap().to_owned();
+    let noise = fx.f32s("noise");
+    let (d, a) = (p.action_dim(), noise.len() / p.embodiment().action_horizon);
+    let mut worst = 0f32;
+    for (k, c) in fx.meta["chunks"].as_array().unwrap().iter().enumerate() {
+        let t = c["tick"].as_u64().unwrap() as usize;
+        let frames: Vec<Frame> = (0..cams).map(|cam| fx.frame(t, cam)).collect();
+        let obs = VlaObservation { cameras: &frames, state: &states[t * sd..(t + 1) * sd], instruction: &instruction };
+        let (inputs, state) = p.inputs(&obs).unwrap();
+        let want_ids: Vec<i32> = fx.f32s(&format!("chunk.{k}.ids")).iter().map(|&i| i as i32).collect();
+        assert_eq!(inputs.ids, want_ids, "chunk {k}: prompt ids");
+        let ds = state.iter().zip(&fx.f32s(&format!("chunk.{k}.state"))).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let want_px = fx.f32s(&format!("chunk.{k}.pixels"));
+        assert_eq!(inputs.pixels.len(), want_px.len(), "chunk {k}: crops");
+        let off = inputs.pixels.iter().zip(&want_px).filter(|(x, y)| (*x - *y).abs() > 1e-6).count();
+        let dp = inputs.pixels.iter().zip(&want_px).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let want = fx.f32s(&format!("chunk.{k}.raw"));
+        let got = p.predict_normalized(&obs, &noise).unwrap();
+        assert_eq!(got.len(), want.len(), "chunk {k}: chunk layout");
+        let moved = want.iter().enumerate().map(|(i, w)| (w - noise[i / d * a + i % d]).abs()).fold(0f32, f32::max);
+        let dr = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / moved;
+        eprintln!("chunk {k} (tick {t}): {} tokens, state {ds:.1e}, pixels off {off} (max {dp:.1e}), chunk {dr:.3e} (relative to {moved:.3})", inputs.ids.len());
+        assert!(ds < 1e-6, "chunk {k}: state differs by {ds}");
+        assert!(dp <= 2.0 / 255.0 + 1e-6, "chunk {k}: crops differ by more than one 8-bit level");
+        worst = worst.max(dr);
+    }
+    eprintln!("worst chunk {worst:.3e} (tolerance {tol:.1e})");
+    assert!(worst <= tol, "MolmoAct2 chunks differ from the reference");
+    let start = std::time::Instant::now();
+    rollout_matches(&p, &p.embodiment().action.norm, &fx, tol);
+    eprintln!("wall {:.1}s", start.elapsed().as_secs_f32());
+}
+
+#[test]
+fn molmoact2_embodiments_normalise_as_the_reference() {
+    use molmoact2_processor::{MolmoAct2Embodiment, MolmoAct2FeatureNorm};
+    let stats = serde_json::json!({"q01": [-1.0, 0.0, 2.0], "q99": [1.0, 4.0, 2.0], "min": [-2.0, -1.0, 0.0], "max": [2.0, 5.0, 1.0],
+        "names": ["a", "b", "Gripper"]});
+    // Without a mask the gripper (by name) passes through.
+    let n = MolmoAct2FeatureNorm::from_stats(&stats, "state", false).unwrap();
+    assert_eq!(n.mask, vec![true, true, false]);
+    // Normalised and clamped; equal percentiles divide by 1e-8.
+    assert_eq!(n.normalize(&[0.5, 5.0, 0.25], "state").unwrap(), vec![0.5, 1.0, 0.25]);
+    assert_eq!(n.normalize(&[0.5, 1.0, -1.0], "state").unwrap()[1], -0.5);
+    assert!(n.normalize(&[0.0, 0.0, 1.5], "state").is_err());
+    // Actions: clamped first, then unnormalised where masked.
+    assert_eq!(n.unnormalize(&[0.5, -3.0, 2.0, 0.0, 0.5, -0.5]).unwrap(), vec![0.5, 0.0, 1.0, 0.0, 3.0, -0.5]);
+    // A mask in the statistics wins over the names.
+    let mut masked = stats.clone();
+    masked["mask"] = serde_json::json!([true, true, true]);
+    assert_eq!(MolmoAct2FeatureNorm::from_stats(&masked, "state", false).unwrap().mask, vec![true; 3]);
+    // A passed-through value whose range leaves [-1, 1] is refused, unless
+    // every value is normalised.
+    masked["mask"] = serde_json::json!([false, true, true]);
+    assert!(MolmoAct2FeatureNorm::from_stats(&masked, "state", false).is_err());
+    let mut wide = stats.clone();
+    wide["max"] = serde_json::json!([2.0, 5.0, 3.0]);
+    assert!(MolmoAct2FeatureNorm::from_stats(&wide, "state", false).is_err());
+    assert_eq!(MolmoAct2FeatureNorm::from_stats(&wide, "state", true).unwrap().mask, vec![true; 3]);
+    let mut unnamed = stats.clone();
+    unnamed.as_object_mut().unwrap().remove("names");
+    assert!(MolmoAct2FeatureNorm::from_stats(&unnamed, "state", false).is_err());
+    // An embodiment with a joint convention change: state in as
+    // signs * state + offsets, actions out as signs * (action - offsets).
+    let mut e = MolmoAct2Embodiment {
+        camera_keys: Vec::new(),
+        setup_type: String::new(),
+        control_mode: String::new(),
+        action_horizon: 4,
+        n_action_steps: 2,
+        state: n.clone(),
+        action: n.clone(),
+        joint_frame: None,
+    };
+    e.set_joint_frame(vec![-1.0, 1.0], vec![0.5, 1.0]).unwrap();
+    assert_eq!(e.state_in(&[0.25, 1.0, 0.0]).unwrap(), vec![0.25, 0.0, 0.0]);
+    assert_eq!(e.actions_out(&[0.25, 0.0, 0.5]).unwrap(), vec![0.25, 1.0, 0.5]);
+    assert!(e.state_in(&[0.0, 0.0]).is_err());
+    assert!(e.set_joint_frame(vec![1.0; 4], vec![0.0; 4]).is_err());
+}
+
 #[test]
 fn molmoact2_prompts_follow_the_reference() {
     use molmoact2_processor::{normalize_task, pooling_indices, robot_prompt, state_bins};
