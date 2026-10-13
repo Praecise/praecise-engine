@@ -302,6 +302,64 @@ fn groot_matches_reference() {
     assert!(worst_f <= tol && worst_a <= tol, "GR00T differs from the reference");
 }
 
+/// The MolmoAct2 vision backbone against the reference.
+/// `PRAECISE_MOLMOACT2_VISION_PARITY` names a directory with `policy/`
+/// (`config.json`, `model.safetensors`), `fixture.json` and
+/// `fixture.safetensors` (written by
+/// `tests/parity/make_molmoact2_vision_fixture.py`): for every sample the
+/// pooled, projected image-token features are compared.
+#[test]
+#[ignore = "needs a released policy and a reference fixture"]
+fn molmoact2_vision_matches_reference() {
+    let dir = parity_dir("PRAECISE_MOLMOACT2_VISION_PARITY");
+    let fx = Fixture::open(&dir);
+    let (opts, tol) = parity_options();
+    let mut v = molmoact2::MolmoAct2Vision::load(&dir.join("policy"), opts).unwrap();
+    v.set_fp32_gemm(true);
+    let mut worst = 0f32;
+    for s in 0..fx.usize("samples") {
+        let px = fx.f32s(&format!("{s}.pixels"));
+        let pooling: Vec<i32> = fx.f32s(&format!("{s}.pooling")).iter().map(|&i| i as i32).collect();
+        let crops = fx.meta["crops"][s].as_u64().unwrap() as usize;
+        let pool = fx.usize("pool");
+        let got = v.encode(&px, crops, &pooling, pool).unwrap();
+        let want = fx.f32s(&format!("{s}.features"));
+        assert_eq!(got.len(), want.len(), "sample {s}: image tokens");
+        let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let d = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / scale;
+        eprintln!("sample {s}: {} tokens, features {d:.3e} (relative, scale {scale:.3})", want.len() / v.config().out as usize);
+        worst = worst.max(d);
+    }
+    eprintln!("worst {worst:.3e} (tolerance {tol:.1e})");
+    assert!(worst <= tol, "MolmoAct2 vision differs from the reference");
+}
+
+#[test]
+fn molmoact2_pixels_snap_to_bytes() {
+    // Values snap to the nearest of the 256 levels, clamped.
+    let x = molmoact2::snap_pixels(&[-1.0, 1.0, -2.0, 1.4 / 255.0 * 2.0 - 1.0, 1.6 / 255.0 * 2.0 - 1.0]);
+    assert_eq!(&x[..3], &[-1.0, 1.0, -1.0]);
+    assert!((x[3] - (1.0 / 255.0 * 2.0 - 1.0)).abs() < 1e-6);
+    assert!((x[4] - (2.0 / 255.0 * 2.0 - 1.0)).abs() < 1e-6);
+}
+
+#[test]
+fn molmoact2_vision_config_reads_a_release() {
+    let c = serde_json::json!({
+        "vit_config": {"hidden_size": 1152, "intermediate_size": 4304, "num_hidden_layers": 27, "num_attention_heads": 16,
+            "num_key_value_heads": 16, "head_dim": 72, "hidden_act": "gelu_pytorch_tanh", "layer_norm_eps": 1e-6,
+            "image_default_input_size": [378, 378], "image_patch_size": 14, "image_num_pos": 729},
+        "adapter_config": {"vit_layers": [-3, -9], "pooling_attention_mask": true, "hidden_size": 1152, "num_attention_heads": 16,
+            "num_key_value_heads": 16, "head_dim": 72, "hidden_act": "silu", "intermediate_size": 9728, "text_hidden_size": 2560}
+    });
+    let cfg = molmoact2::MolmoAct2VisionConfig::from_json(&c).unwrap();
+    assert_eq!(cfg.layers, vec![24, 18]);
+    assert_eq!(cfg.blocks(), 25);
+    assert_eq!(cfg.patches(), 729);
+    assert_eq!(cfg.patch_len(), 588);
+    assert!(cfg.pool_mask);
+}
+
 fn frame8(h: usize, w: usize, plane: &[u8]) -> resample::Frame8 {
     resample::Frame8 { h, w, data: plane.repeat(3) }
 }

@@ -17,6 +17,7 @@ use crate::safetensors::SafeTensors;
 
 pub mod groot;
 pub mod groot_processor;
+pub mod molmoact2;
 pub mod pi05;
 pub mod resample;
 pub mod rollout;
