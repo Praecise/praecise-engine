@@ -1089,6 +1089,14 @@ pub enum MtmdGenAudioType {
 }
 
 impl MtmdContext {
+    /// Whether F32 matrix products of every encoder and generator run in full
+    /// FP32 on a backend that otherwise rounds them to a narrower format (TF32
+    /// tensor ops on CUDA), as [`LlamaContext::set_fp32_gemm`] for a context.
+    /// No effect on other backends. Off by default.
+    pub fn set_fp32_gemm(&self, fp32: bool) {
+        unsafe { llama_cpp_sys_2::mtmd_set_fp32_gemm(self.context.as_ptr(), fp32) }
+    }
+
     /// Decode `codes` (frame-major, `per_frame` codes each) to a waveform with
     /// the projector's waveform decoder, `window` frames per call with its
     /// state carried between calls, as a stream would be decoded. Returns the

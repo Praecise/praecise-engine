@@ -84,6 +84,8 @@ fn talker_waveform_matches_the_source_checkpoint() {
     };
     // SAFETY: the projector is dropped before the model, at the end of this function.
     let mtmd = unsafe { MtmdContext::init_from_file(&mmproj, &model, &params) }.expect("projector");
+    // the reference computes in float32; so do the projector's products
+    mtmd.set_fp32_gemm(true);
 
     for case in exp["cases"].as_array().expect("cases") {
         let name = case["name"].as_str().expect("name");
@@ -122,6 +124,7 @@ fn talker_waveform_matches_the_source_checkpoint() {
             .with_type_v(KvCacheType::F32)
             .with_flash_attention(false);
         let mut ctx = model.new_context(&backend, ctx_params).expect("context");
+        ctx.set_fp32_gemm(true);
 
         // the thinker's reply arrives one token at a time
         let mut next = 0usize;
