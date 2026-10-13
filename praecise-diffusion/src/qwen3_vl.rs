@@ -352,6 +352,12 @@ impl Qwen3VlEncoder {
         self.backend.name()
     }
 
+    /// Run F32 matrix products in full FP32 on a backend that would round
+    /// them (TF32 on CUDA). See [`Backend::set_fp32_gemm`].
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        self.backend.set_fp32_gemm(fp32);
+    }
+
     /// Device bytes held.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {

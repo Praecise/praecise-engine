@@ -610,6 +610,11 @@ impl GrootChunkPolicy {
         &self.processor
     }
 
+    /// As [`GrootPolicy::set_fp32_gemm`].
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        self.policy.set_fp32_gemm(fp32);
+    }
+
     /// Execute `n` actions of each chunk (at most the embodiment's).
     pub fn set_n_action_steps(&mut self, n: usize) {
         self.n_action_steps = n.clamp(1, self.processor.execution_steps().max(1));

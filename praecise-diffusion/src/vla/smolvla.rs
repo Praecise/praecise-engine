@@ -354,6 +354,12 @@ impl SmolVla {
         self.backend.name()
     }
 
+    /// Run F32 matrix products in full FP32 on a backend that would round
+    /// them (TF32 on CUDA).
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        self.backend.set_fp32_gemm(fp32);
+    }
+
     /// Bytes of weights resident on the device.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {

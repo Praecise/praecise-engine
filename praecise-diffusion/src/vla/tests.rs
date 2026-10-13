@@ -186,6 +186,7 @@ fn smolvla_rollout_matches_reference() {
     let fx = Fixture::open(&dir);
     let (opts, tol) = parity_options();
     let mut p = smolvla::SmolVla::load(&dir.join("policy"), &dir.join("backbone"), opts).unwrap();
+    p.set_fp32_gemm(true);
     p.set_n_action_steps(fx.usize("n_action_steps"));
     eprintln!("smolvla on {}: {} MB resident", p.device(), p.resident_bytes() >> 20);
     if let Some(want) = fx.meta["tokens"].as_array() {
@@ -234,6 +235,7 @@ fn pi05_rollout_matches_reference() {
         }
     });
     let mut p = pi05::Pi05::load(&dir.join("policy"), &dir.join("backbone/tokenizer.json"), opts, dims).unwrap();
+    p.set_fp32_gemm(true);
     p.set_n_action_steps(fx.usize("n_action_steps"));
     eprintln!("pi05 on {}: {} MB resident", p.device(), p.resident_bytes() >> 20);
     let pc = read_json(&dir.join("policy/config.json")).unwrap();
@@ -268,7 +270,10 @@ fn groot_matches_reference() {
     let dir = parity_dir("PRAECISE_GROOT_PARITY");
     let fx = Fixture::open(&dir);
     let (opts, tol) = parity_options();
-    let p = groot::GrootPolicy::load(&dir.join("policy"), &dir.join("backbone/config.json"), fx.usize("embodiment"), opts).unwrap();
+    let mut p = groot::GrootPolicy::load(&dir.join("policy"), &dir.join("backbone/config.json"), fx.usize("embodiment"), opts).unwrap();
+    // The reference computes in FP32; CUDA would otherwise round the
+    // products to TF32.
+    p.set_fp32_gemm(true);
     let tokens: Vec<u32> = fx.meta["tokens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
     let start = std::time::Instant::now();
     let (mut worst_f, mut worst_a) = (0f32, 0f32);
@@ -368,6 +373,7 @@ fn groot_rollout_matches_reference() {
     let (opts, tol) = parity_options();
     let tag = fx.meta["embodiment_tag"].as_str().unwrap();
     let mut p = groot_processor::GrootChunkPolicy::load(&dir.join("policy"), &dir.join("backbone"), tag, opts).unwrap();
+    p.set_fp32_gemm(true);
     p.set_n_action_steps(fx.usize("n_action_steps"));
     let (ticks, cams) = (fx.usize("ticks"), fx.usize("cameras"));
     let states = fx.f32s("states");
