@@ -13,6 +13,14 @@
 //! SiLU MLP. Attention is causal except that image tokens see each other
 //! both ways. The keys and values of every block are kept for the action
 //! expert.
+//!
+//! The action expert turns noise into an action chunk by flow matching:
+//! forward-Euler steps from `t = 0` (noise) to `t = 1` (actions), each a
+//! velocity from a stack of blocks, one per language-model block. A block
+//! modulates (shift, scale, gate from the time embedding) a self-attention
+//! over the chunk with split-half rotary positions, a cross-attention to
+//! that language-model block's keys and values (projected to the expert's
+//! width), and a gated SiLU MLP.
 
 use std::path::Path;
 
@@ -27,6 +35,7 @@ use llama_cpp_sys_2 as sys;
 
 const P: &str = "model.vision_backbone.";
 const T: &str = "model.transformer.";
+const E: &str = "model.action_expert.";
 
 /// The backbone's settings, from the checkpoint's `vit_config` and
 /// `adapter_config`.
@@ -809,5 +818,505 @@ impl MolmoAct2Lm {
             values.push(g.read_f32(pair[1]));
         }
         Ok(MolmoAct2Prefix { tokens: n, hidden, keys, values })
+    }
+}
+
+/// The action expert's settings, from the checkpoint's
+/// `action_expert_config` and the top-level action fields.
+#[derive(Debug, Clone)]
+pub struct MolmoAct2ActionConfig {
+    /// Expert width.
+    pub hidden: u64,
+    /// Expert heads.
+    pub heads: u64,
+    /// Expert head width.
+    pub head_dim: u64,
+    /// Blocks, one per language-model block.
+    pub layers: usize,
+    /// MLP width.
+    pub intermediate: u64,
+    /// Sinusoidal time-embedding width.
+    pub time_dim: usize,
+    /// Width of one language-model block's keys or values.
+    pub kv_dim: u64,
+    /// Whether the projected context keys and values are RMS-normalised.
+    pub context_norm: bool,
+    /// Whether queries and keys are RMS-normalised per head.
+    pub qk_norm: bool,
+    /// Query/key norm epsilon.
+    pub qk_eps: f64,
+    /// Whether self-attention uses rotary positions.
+    pub rope: bool,
+    /// Action width (padded).
+    pub max_action_dim: usize,
+    /// Longest chunk.
+    pub max_horizon: usize,
+    /// Euler steps.
+    pub steps: usize,
+    /// Whether padded action dimensions are held at zero.
+    pub mask_padding: bool,
+    /// Whether the checkpoint was trained with discrete and continuous
+    /// actions, in which case the context hides end-of-turn tokens and
+    /// discrete action spans.
+    pub both: bool,
+    /// End-of-turn token.
+    pub eos: Option<i32>,
+    /// Discrete action span start and end tokens.
+    pub action_span: Option<(i32, i32)>,
+}
+
+impl MolmoAct2ActionConfig {
+    /// Read the action-expert settings from a checkpoint config.
+    ///
+    /// # Errors
+    /// [`Error::Config`] for a missing field, a checkpoint without an action
+    /// expert, or a variant this engine does not implement.
+    pub fn from_json(c: &Value) -> Result<Self> {
+        if !c.get("add_action_expert").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(Error::Config("this MolmoAct2 checkpoint has no action expert".into()));
+        }
+        let unsupported = |what: &str| Err(Error::Config(format!("MolmoAct2 action experts with {what} are not implemented")));
+        if c.get("action_expert_depth_gate").and_then(Value::as_bool).unwrap_or(false) {
+            return unsupported("depth gating");
+        }
+        // The reference cannot run a causal expert at inference either (it
+        // gives attention both an explicit mask and the causal flag).
+        if c.get("action_expert_config").and_then(|a| a.get("causal_attn")).and_then(Value::as_bool).unwrap_or(false) {
+            return unsupported("causal self-attention");
+        }
+        if c.get("state_format").and_then(Value::as_str).unwrap_or("discrete") != "discrete" {
+            return unsupported("continuous state embeddings");
+        }
+        let a = c.get("action_expert_config").ok_or_else(|| Error::Config("config gives no action_expert_config".into()))?;
+        let t = c.get("text_config").ok_or_else(|| Error::Config("config gives no text_config".into()))?;
+        let flag = |k: &str, d: bool| a.get(k).and_then(Value::as_bool).unwrap_or(d);
+        let num = |v: &Value, k: &str, d: u64| v.get(k).and_then(Value::as_u64).unwrap_or(d);
+        let hidden = num(a, "hidden_size", 1024);
+        let heads = num(a, "num_heads", 16);
+        let layers = num(a, "num_layers", 32) as usize;
+        let ratio = a.get("mlp_ratio").and_then(Value::as_f64).unwrap_or(8.0 / 3.0);
+        let multiple = a.get("ffn_multiple_of").and_then(Value::as_i64).unwrap_or(256);
+        let inner = (hidden as f64 * ratio) as u64;
+        let intermediate = if multiple > 0 { inner.div_ceil(multiple as u64) * multiple as u64 } else { inner };
+        let id = |k: &str| c.get(k).and_then(Value::as_i64).map(|v| v as i32);
+        let cfg = Self {
+            hidden,
+            heads,
+            head_dim: if heads > 0 { hidden / heads } else { 0 },
+            layers,
+            intermediate,
+            time_dim: num(a, "timestep_embed_dim", 256) as usize,
+            kv_dim: u(t, "num_key_value_heads")? * u(t, "head_dim")?,
+            context_norm: flag("context_layer_norm", true),
+            qk_norm: flag("qk_norm", true),
+            qk_eps: a.get("qk_norm_eps").and_then(Value::as_f64).unwrap_or(1e-6),
+            rope: flag("rope", true),
+            max_action_dim: num(c, "max_action_dim", 32) as usize,
+            max_horizon: num(c, "max_action_horizon", 30) as usize,
+            steps: num(c, "flow_matching_num_steps", 10) as usize,
+            mask_padding: c.get("mask_action_dim_padding").and_then(Value::as_bool).unwrap_or(true),
+            both: c.get("action_mode").and_then(Value::as_str) == Some("both"),
+            eos: id("eos_token_id"),
+            action_span: id("action_start_token_id").zip(id("action_end_token_id")),
+        };
+        if heads == 0 || hidden % heads != 0 || (cfg.rope && cfg.head_dim % 2 != 0) {
+            return Err(Error::Config("malformed MolmoAct2 action-expert heads".into()));
+        }
+        if cfg.layers != u(t, "num_hidden_layers")? as usize {
+            return unsupported("a block count other than the language model's");
+        }
+        if cfg.time_dim % 2 != 0 || cfg.time_dim < 4 {
+            return unsupported("an odd or tiny time embedding");
+        }
+        if cfg.steps == 0 || cfg.max_horizon == 0 || cfg.max_action_dim == 0 {
+            return Err(Error::Config("malformed MolmoAct2 action settings".into()));
+        }
+        Ok(cfg)
+    }
+
+    fn weight_specs(&self, linear: WType) -> Vec<WeightSpec> {
+        let f = WType::F32;
+        let (d, ff, a) = (self.hidden, self.intermediate, self.max_action_dim as u64);
+        // Rows of the 8-bit type are whole blocks of 32 values.
+        let fit = |cols: u64| if linear == WType::Q8_0 && cols % 32 != 0 { WType::Bf16 } else { linear };
+        let mut s = Vec::new();
+        let mut lin = |name: String, rows: u64, cols: u64, bias: bool| {
+            s.push(WeightSpec::new(format!("{name}.weight"), &[rows, cols], fit(cols)));
+            if bias {
+                s.push(WeightSpec::new(format!("{name}.bias"), &[rows], f));
+            }
+        };
+        lin(format!("{E}time_embed.1"), d, self.time_dim as u64, true);
+        lin(format!("{E}time_embed.3"), d, d, true);
+        lin(format!("{E}action_embed"), d, a, true);
+        lin(format!("{E}context_k_proj"), d, self.kv_dim, false);
+        lin(format!("{E}context_v_proj"), d, self.kv_dim, false);
+        for i in 0..self.layers {
+            let b = format!("{E}blocks.{i}");
+            lin(format!("{b}.self_attn.qkv"), 3 * d, d, true);
+            lin(format!("{b}.self_attn.out_proj"), d, d, true);
+            lin(format!("{b}.cross_attn.q_proj"), d, d, true);
+            lin(format!("{b}.cross_attn.out_proj"), d, d, true);
+            lin(format!("{b}.mlp.gate_proj"), ff, d, true);
+            lin(format!("{b}.mlp.up_proj"), ff, d, true);
+            lin(format!("{b}.mlp.down_proj"), d, ff, true);
+            lin(format!("{b}.modulation.linear"), 9 * d, d, true);
+        }
+        lin(format!("{E}final_layer.modulation.linear"), 2 * d, d, true);
+        lin(format!("{E}final_layer.linear"), a, d, true);
+        s
+    }
+
+    /// The flow times `i / steps` and the Euler step `1 / steps`, in
+    /// `float32` as the reference has them.
+    #[must_use]
+    pub fn flow_times(&self) -> (Vec<f32>, f32) {
+        let n = self.steps;
+        ((0..n).map(|i| (i as f64 / n as f64) as f32).collect(), (1.0 / n as f64) as f32)
+    }
+
+    /// The sinusoidal embedding of a flow time (sines then cosines),
+    /// following the reference's `float32` arithmetic: frequencies
+    /// `exp(-i ln(10000) / (half - 1))`.
+    #[must_use]
+    pub fn time_embedding(&self, t: f32) -> Vec<f32> {
+        let half = self.time_dim / 2;
+        let step = (-(10000f64.ln()) / (half - 1).max(1) as f64) as f32;
+        let mut out = vec![0f32; 2 * half];
+        for i in 0..half {
+            let freq = f64::from(i as f32 * step).exp() as f32;
+            let x = f64::from(t * freq);
+            out[i] = x.sin() as f32;
+            out[half + i] = x.cos() as f32;
+        }
+        out
+    }
+
+    /// Rotary tables `[horizon][head_dim]` (cosines, sines) of the chunk
+    /// positions, base 10000, both halves of a head sharing the angles
+    /// (`float32` as the reference builds them).
+    #[must_use]
+    pub fn rotary_tables(&self, horizon: usize) -> (Vec<f32>, Vec<f32>) {
+        let half = self.head_dim as usize / 2;
+        let inv: Vec<f32> = (0..half).map(|i| 1.0 / 10000f64.powf(f64::from(i as f32 / half as f32)) as f32).collect();
+        let (mut cos, mut sin) = (Vec::with_capacity(horizon * 2 * half), Vec::with_capacity(horizon * 2 * half));
+        for p in 0..horizon {
+            for _ in 0..2 {
+                for &f in &inv {
+                    let a = f64::from(p as f32 * f);
+                    cos.push(a.cos() as f32);
+                    sin.push(a.sin() as f32);
+                }
+            }
+        }
+        (cos, sin)
+    }
+
+    /// Which prompt tokens the expert reads: all of them, except, for a
+    /// checkpoint trained with both action kinds, end-of-turn tokens and
+    /// every discrete action span (start to end inclusive; an unclosed
+    /// span runs to the end). A fine-tuned checkpoint trained on
+    /// continuous actions alone reads every token instead.
+    #[must_use]
+    pub fn context_mask(&self, ids: &[i32]) -> Vec<bool> {
+        let mut m: Vec<bool> = ids.iter().map(|&i| !(self.both && Some(i) == self.eos)).collect();
+        if let (true, Some((start, end))) = (self.both, self.action_span) {
+            let ends: Vec<usize> = ids.iter().enumerate().filter(|&(_, &i)| i == end).map(|(p, _)| p).collect();
+            let mut e = 0;
+            for s in ids.iter().enumerate().filter(|&(_, &i)| i == start).map(|(p, _)| p) {
+                while e < ends.len() && ends[e] < s {
+                    e += 1;
+                }
+                if e == ends.len() {
+                    m[s..].fill(false);
+                    break;
+                }
+                m[s..=ends[e]].fill(false);
+                e += 1;
+            }
+        }
+        m
+    }
+}
+
+/// The MolmoAct2 action expert on one device.
+pub struct MolmoAct2ActionExpert {
+    cfg: MolmoAct2ActionConfig,
+    backend: Backend,
+    weights: Weights,
+    exact: bool,
+}
+
+impl std::fmt::Debug for MolmoAct2ActionExpert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MolmoAct2ActionExpert").field("device", &self.backend.name()).finish_non_exhaustive()
+    }
+}
+
+/// `norm(x) * (1 + scale) + shift`, the modulated RMS norm.
+fn modulate(g: &mut Graph, x: Tn, shift: Tn, scale: Tn) -> Tn {
+    let h = g.rms_norm(x, 1e-6);
+    let s = g.scale_bias(scale, 1.0, 1.0);
+    let h = g.mul(h, s);
+    g.add(h, shift)
+}
+
+impl MolmoAct2ActionExpert {
+    /// Load the action expert from a checkpoint directory (`config.json`
+    /// and its safetensors files).
+    ///
+    /// # Errors
+    /// On a missing or malformed file, a checkpoint without an action
+    /// expert, an unsupported variant, or a backend failure.
+    pub fn load(dir: &Path, opts: LoadOptions) -> Result<Self> {
+        let cfg = MolmoAct2ActionConfig::from_json(&read_json(&dir.join("config.json"))?)?;
+        let st = SafeTensors::open(&checkpoint_files(dir))?;
+        let backend = opts.backend()?;
+        let exact = opts.precision == Precision::F32;
+        let linear = match opts.precision {
+            Precision::F32 => WType::F32,
+            Precision::Bf16 => WType::Bf16,
+            Precision::Q8_0 => WType::Q8_0,
+        };
+        let weights = Weights::load(&backend, &st, &cfg.weight_specs(linear))?;
+        Ok(Self { cfg, backend, weights, exact })
+    }
+
+    /// The expert's settings.
+    #[must_use]
+    pub fn config(&self) -> &MolmoAct2ActionConfig {
+        &self.cfg
+    }
+
+    /// Name of the compute device.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        self.backend.name()
+    }
+
+    /// Run F32 matrix products in full FP32 on a backend that would round
+    /// them (TF32 on CUDA).
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        self.backend.set_fp32_gemm(fp32);
+    }
+
+    /// Bytes of weights resident on the device.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.weights.bytes()
+    }
+
+    /// The per-block modulations of every flow step `[steps][layers][9 *
+    /// hidden]`, the final layer's `[steps][2 * hidden]`, and every block's
+    /// context keys `[tokens][heads][head_dim]` (normalised) and values
+    /// `[tokens][hidden]`.
+    #[allow(clippy::type_complexity)]
+    fn context(&self, keys: &[Vec<f32>], values: &[Vec<f32>], n: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        let c = &self.cfg;
+        let w = &self.weights;
+        let (hd, nh) = (c.head_dim as i64, c.heads as i64);
+        let (steps, n_i) = (c.steps as i64, n as i64);
+        let mut g = Graph::new(&self.backend)?;
+        let temb = g.input(sys::GGML_TYPE_F32, &[c.time_dim as i64, steps]);
+        let cond = lin_b(&mut g, w, &format!("{E}time_embed.1"), temb);
+        let cond = g.silu(cond);
+        let cond = lin_b(&mut g, w, &format!("{E}time_embed.3"), cond);
+        let act = g.silu(cond);
+        let mut mods = Vec::with_capacity(c.layers);
+        for i in 0..c.layers {
+            let m = lin_b(&mut g, w, &format!("{E}blocks.{i}.modulation.linear"), act);
+            mods.push(m);
+        }
+        let fin = lin_b(&mut g, w, &format!("{E}final_layer.modulation.linear"), act);
+        let mut ins = Vec::with_capacity(2 * c.layers);
+        let mut outs = Vec::with_capacity(2 * c.layers);
+        for _ in 0..c.layers {
+            let kin = g.input(sys::GGML_TYPE_F32, &[c.kv_dim as i64, n_i]);
+            let vin = g.input(sys::GGML_TYPE_F32, &[c.kv_dim as i64, n_i]);
+            let mut k = g.linear(w.get(&format!("{E}context_k_proj.weight")), kin);
+            let mut v = g.linear(w.get(&format!("{E}context_v_proj.weight")), vin);
+            if c.context_norm {
+                k = g.rms_norm(k, 1e-6);
+                v = g.rms_norm(v, 1e-6);
+            }
+            if c.qk_norm {
+                let kh = g.reshape(k, &[hd, nh, n_i]);
+                k = g.rms_norm(kh, c.qk_eps as f32);
+            }
+            ins.push((kin, vin));
+            outs.push((k, v));
+        }
+        let mut all = mods.clone();
+        all.push(fin);
+        all.extend(outs.iter().flat_map(|&(k, v)| [k, v]));
+        g.finish(&all)?;
+        let temb_host: Vec<f32> = c.flow_times().0.iter().flat_map(|&t| c.time_embedding(t)).collect();
+        g.set_f32(temb, &temb_host);
+        for (l, &(kin, vin)) in ins.iter().enumerate() {
+            g.set_f32(kin, &keys[l]);
+            g.set_f32(vin, &values[l]);
+        }
+        g.compute()?;
+        // Regroup the modulations step-major: [steps][layers][9 * hidden].
+        let per = 9 * c.hidden as usize;
+        let read: Vec<Vec<f32>> = mods.iter().map(|&m| g.read_f32(m)).collect();
+        let mut block = Vec::with_capacity(c.steps * c.layers * per);
+        for s in 0..c.steps {
+            for r in &read {
+                block.extend_from_slice(&r[s * per..(s + 1) * per]);
+            }
+        }
+        let fin = g.read_f32(fin);
+        let ks = outs.iter().map(|&(k, _)| g.read_f32(k)).collect();
+        let vs = outs.iter().map(|&(_, v)| g.read_f32(v)).collect();
+        Ok((block, fin, ks, vs))
+    }
+
+    /// One action chunk `[horizon][max_action_dim]` by flow matching from
+    /// `noise` (same shape), reading per language-model block the `keys`
+    /// (after the rotary embedding) and `values` `[tokens][kv_dim]` (as
+    /// [`MolmoAct2Lm::prefill`] gives them) at the tokens `mask` keeps
+    /// ([`MolmoAct2ActionConfig::context_mask`]). `padding` marks action
+    /// dimensions held at zero when the checkpoint masks them.
+    ///
+    /// # Errors
+    /// On inputs of the wrong size, a horizon outside the checkpoint's, an
+    /// empty context, or a backend failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn sample(&self, keys: &[Vec<f32>], values: &[Vec<f32>], mask: &[bool], noise: &[f32], horizon: usize, padding: Option<&[bool]>) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let n = mask.len();
+        let kv = c.kv_dim as usize;
+        let a = c.max_action_dim;
+        if keys.len() != c.layers || values.len() != c.layers || keys.iter().chain(values).any(|x| x.len() != n * kv) {
+            return Err(Error::Request(format!("the expert reads {} blocks of {n} tokens x {kv} keys and values", c.layers)));
+        }
+        if !mask.iter().any(|&m| m) {
+            return Err(Error::Request("the expert's context hides every token".into()));
+        }
+        if horizon == 0 || horizon > c.max_horizon || noise.len() != horizon * a {
+            return Err(Error::Request(format!("noise must be [1..={}][{a}]", c.max_horizon)));
+        }
+        if padding.is_some_and(|p| p.len() != a) {
+            return Err(Error::Request(format!("the padding mask covers {a} action dimensions")));
+        }
+        let keep: Option<Vec<f32>> = match padding {
+            Some(p) if c.mask_padding => Some(p.iter().map(|&pad| if pad { 0.0 } else { 1.0 }).collect()),
+            _ => None,
+        };
+        let (mods, fin, ck, cv) = self.context(keys, values, n)?;
+
+        let w = &self.weights;
+        let exact = self.exact;
+        let (d, hd, nh) = (c.hidden as i64, c.head_dim as i64, c.heads as i64);
+        let (h_i, n_i, a_i) = (horizon as i64, n as i64, a as i64);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut g = Graph::new(&self.backend)?;
+        let traj = g.input(sys::GGML_TYPE_F32, &[a_i, h_i]);
+        let step_mods = g.input(sys::GGML_TYPE_F32, &[9 * d, c.layers as i64]);
+        let step_fin = g.input(sys::GGML_TYPE_F32, &[2 * d]);
+        let keep_t = keep.as_ref().map(|_| g.input(sys::GGML_TYPE_F32, &[a_i]));
+        let cross_mask = g.input(sys::GGML_TYPE_F16, &[n_i, h_i]);
+        let rope = if c.rope { Some((g.input(sys::GGML_TYPE_F32, &[hd, 1, h_i]), g.input(sys::GGML_TYPE_F32, &[hd, 1, h_i]))) } else { None };
+        let ctx: Vec<(Tn, Tn)> = (0..c.layers).map(|_| (g.input(sys::GGML_TYPE_F32, &[hd, nh, n_i]), g.input(sys::GGML_TYPE_F32, &[hd, nh, n_i]))).collect();
+
+        let chunk = |g: &mut Graph, l: usize, j: usize| g.view_1d(step_mods, d, (l * 9 + j) * d as usize);
+        let mut x = lin_b(&mut g, w, &format!("{E}action_embed"), traj);
+        for (l, &(k_ctx, v_ctx)) in ctx.iter().enumerate() {
+            let b = format!("{E}blocks.{l}");
+            let m: Vec<Tn> = (0..9).map(|j| chunk(&mut g, l, j)).collect();
+            // Self-attention over the chunk.
+            let h = modulate(&mut g, x, m[0], m[1]);
+            let qkv = lin_b(&mut g, w, &format!("{b}.self_attn.qkv"), h);
+            let q = g.view_heads(qkv, 0, hd, nh);
+            let mut q = g.cont(q);
+            let k = g.view_heads(qkv, d, hd, nh);
+            let mut k = g.cont(k);
+            let v = g.view_heads(qkv, 2 * d, hd, nh);
+            let v = g.cont(v);
+            if c.qk_norm {
+                q = g.rms_norm(q, c.qk_eps as f32);
+                k = g.rms_norm(k, c.qk_eps as f32);
+            }
+            if let Some((cos, sin)) = rope {
+                q = g.rotate_half_rope(q, cos, sin);
+                k = g.rotate_half_rope(k, cos, sin);
+            }
+            let o = attend(&mut g, q, k, v, None, scale, exact);
+            let o = g.reshape(o, &[d, h_i]);
+            let o = lin_b(&mut g, w, &format!("{b}.self_attn.out_proj"), o);
+            let o = g.mul(o, m[2]);
+            x = g.add(x, o);
+            // Cross-attention to the language model's block.
+            let h = modulate(&mut g, x, m[3], m[4]);
+            let q = lin_b(&mut g, w, &format!("{b}.cross_attn.q_proj"), h);
+            let mut q = g.reshape(q, &[hd, nh, h_i]);
+            if c.qk_norm {
+                q = g.rms_norm(q, c.qk_eps as f32);
+            }
+            let o = attend(&mut g, q, k_ctx, v_ctx, Some(cross_mask), scale, exact);
+            let o = g.reshape(o, &[d, h_i]);
+            let o = lin_b(&mut g, w, &format!("{b}.cross_attn.out_proj"), o);
+            let o = g.mul(o, m[5]);
+            x = g.add(x, o);
+            // Gated MLP.
+            let h = modulate(&mut g, x, m[6], m[7]);
+            let gate = lin_b(&mut g, w, &format!("{b}.mlp.gate_proj"), h);
+            let up = lin_b(&mut g, w, &format!("{b}.mlp.up_proj"), h);
+            let h = g.swiglu_split(gate, up);
+            let h = lin_b(&mut g, w, &format!("{b}.mlp.down_proj"), h);
+            let h = g.mul(h, m[8]);
+            x = g.add(x, h);
+        }
+        let shift = g.view_1d(step_fin, d, 0);
+        let fscale = g.view_1d(step_fin, d, d as usize);
+        let h = modulate(&mut g, x, shift, fscale);
+        let mut vel = lin_b(&mut g, w, &format!("{E}final_layer.linear"), h);
+        if let Some(kt) = keep_t {
+            vel = g.mul(vel, kt);
+        }
+        let (_, dt) = c.flow_times();
+        let vel = g.scale_bias(vel, dt, 0.0);
+        let mut next = g.add(traj, vel);
+        if let Some(kt) = keep_t {
+            next = g.mul(next, kt);
+        }
+        // The graph runs once per step. Inputs that stay the same are marked
+        // as outputs too, so the allocator never reuses their memory.
+        let mut outs = vec![next, cross_mask];
+        outs.extend(keep_t);
+        outs.extend(rope.iter().flat_map(|&(cs, sn)| [cs, sn]));
+        outs.extend(ctx.iter().flat_map(|&(k, v)| [k, v]));
+        g.finish(&outs)?;
+
+        for (l, &(k, v)) in ctx.iter().enumerate() {
+            g.set_f32(k, &ck[l]);
+            g.set_f32(v, &cv[l]);
+        }
+        g.set_f16(cross_mask, &(0..horizon).flat_map(|_| mask.iter().map(|&m| if m { 0.0 } else { f32::NEG_INFINITY })).collect::<Vec<_>>());
+        if let Some((cs, sn)) = rope {
+            let (tc, ts) = c.rotary_tables(horizon);
+            g.set_f32(cs, &tc);
+            g.set_f32(sn, &ts);
+        }
+        let mut x: Vec<f32> = noise.to_vec();
+        if let (Some(kt), Some(kv)) = (keep_t, keep.as_ref()) {
+            g.set_f32(kt, kv);
+            for row in x.chunks_mut(a) {
+                for (v, k) in row.iter_mut().zip(kv) {
+                    *v *= k;
+                }
+            }
+        }
+        let per = 9 * c.hidden as usize * c.layers;
+        let fd = 2 * c.hidden as usize;
+        for s in 0..c.steps {
+            g.set_f32(traj, &x);
+            g.set_f32(step_mods, &mods[s * per..(s + 1) * per]);
+            g.set_f32(step_fin, &fin[s * fd..(s + 1) * fd]);
+            g.compute()?;
+            x = g.read_f32(next);
+        }
+        Ok(x)
     }
 }

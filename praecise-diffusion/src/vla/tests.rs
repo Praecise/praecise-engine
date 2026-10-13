@@ -455,6 +455,124 @@ fn molmoact2_language_config_reads_a_release() {
     assert!((sin[128] - 1f32.sin()).abs() < 1e-7);
 }
 
+/// The MolmoAct2 action expert against the reference's flow-matching
+/// loop (`PRAECISE_MOLMOACT2_ACTION_PARITY`, made by
+/// `tests/parity/make_molmoact2_action_fixture.py`): the context masks
+/// exactly, then each sample's action chunk from the same noise, once from
+/// the reference's keys and values (the expert alone) and once from the
+/// engine's own prefill of the reference's crops, both relative to how far
+/// the reference moved the chunk from the noise.
+#[test]
+#[ignore = "needs a reference fixture"]
+fn molmoact2_actions_match_reference() {
+    let dir = parity_dir("PRAECISE_MOLMOACT2_ACTION_PARITY");
+    let fx = Fixture::open(&dir);
+    let (opts, tol) = parity_options();
+    let policy = dir.join("policy");
+    let mut vision = molmoact2::MolmoAct2Vision::load(&policy, opts).unwrap();
+    vision.set_fp32_gemm(true);
+    let mut lm = molmoact2::MolmoAct2Lm::load(&policy, opts).unwrap();
+    lm.set_fp32_gemm(true);
+    let mut expert = molmoact2::MolmoAct2ActionExpert::load(&policy, opts).unwrap();
+    expert.set_fp32_gemm(true);
+    let c = expert.config().clone();
+    let ints = |name: &str| fx.f32s(name).iter().map(|&i| i as i32).collect::<Vec<i32>>();
+    let flags = |name: &str| fx.f32s(name).iter().map(|&m| m != 0.0).collect::<Vec<bool>>();
+    assert_eq!(c.context_mask(&ints("span.ids")), flags("span.mask"), "discrete action span mask");
+    let a = c.max_action_dim;
+    let mut worst = 0f32;
+    for (s, smp) in fx.meta["samples"].as_array().unwrap().iter().enumerate() {
+        let ids = ints(&format!("{s}.ids"));
+        let mask = c.context_mask(&ids);
+        assert_eq!(mask, flags(&format!("{s}.mask")), "sample {s}: context mask");
+        let horizon = smp["horizon"].as_u64().unwrap() as usize;
+        let padding = fx.st.get(&format!("{s}.padding")).map(|t| t.to_f32().iter().map(|&p| p != 0.0).collect::<Vec<bool>>());
+        let noise = fx.f32s(&format!("{s}.noise"));
+        let want = fx.f32s(&format!("{s}.actions"));
+        // Scale: how far the reference moved the (masked) noise.
+        let moved = want
+            .iter()
+            .zip(&noise)
+            .enumerate()
+            .map(|(i, (w, z))| (w - if padding.as_ref().is_some_and(|p| p[i % a]) { 0.0 } else { *z }).abs())
+            .fold(0f32, f32::max);
+        let rel = |got: &[f32]| {
+            assert_eq!(got.len(), want.len());
+            got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max) / moved
+        };
+        let keys: Vec<Vec<f32>> = (0..c.layers).map(|l| fx.f32s(&format!("{s}.k{l}"))).collect();
+        let values: Vec<Vec<f32>> = (0..c.layers).map(|l| fx.f32s(&format!("{s}.v{l}"))).collect();
+        let alone = expert.sample(&keys, &values, &mask, &noise, horizon, padding.as_deref()).unwrap();
+        let da = rel(&alone);
+        if let Some(p) = &padding {
+            assert!(alone.chunks(a).all(|row| row.iter().zip(p).all(|(&x, &pad)| !pad || x == 0.0)), "sample {s}: padded dimensions");
+        }
+        let px = fx.f32s(&format!("{s}.pixels"));
+        let pooling = ints(&format!("{s}.pooling"));
+        let crops = smp["crops"].as_u64().unwrap() as usize;
+        let feats = vision.encode(&px, crops, &pooling, fx.usize("pool")).unwrap();
+        let pre = lm.prefill(&ids, &feats).unwrap();
+        let chained = expert.sample(&pre.keys, &pre.values, &mask, &noise, horizon, padding.as_deref()).unwrap();
+        let dc = rel(&chained);
+        eprintln!(
+            "sample {s}: {} tokens ({} hidden), horizon {horizon}, moved {moved:.3}; actions from the reference keys/values {da:.3e}, from the engine prefill {dc:.3e} (relative)",
+            ids.len(),
+            mask.iter().filter(|&&m| !m).count()
+        );
+        worst = worst.max(da).max(dc);
+    }
+    eprintln!("worst {worst:.3e} (tolerance {tol:.1e})");
+    assert!(worst <= tol, "MolmoAct2 actions differ from the reference");
+}
+
+#[test]
+fn molmoact2_action_config_reads_a_release() {
+    let mut c = serde_json::json!({
+        "add_action_expert": true, "action_expert_depth_gate": false, "state_format": "discrete", "action_mode": "both",
+        "max_action_dim": 32, "max_action_horizon": 30, "flow_matching_num_steps": 10, "mask_action_dim_padding": true,
+        "eos_token_id": 151645, "action_start_token_id": 151932, "action_end_token_id": 151933,
+        "action_expert_config": {"causal_attn": false, "context_layer_norm": true, "ffn_multiple_of": 256, "hidden_size": 768,
+            "mlp_ratio": 4.0, "num_heads": 8, "num_layers": 36, "qk_norm": true, "qk_norm_eps": 1e-6, "rope": true, "timestep_embed_dim": 256},
+        "text_config": {"num_hidden_layers": 36, "num_key_value_heads": 8, "head_dim": 128}
+    });
+    let cfg = molmoact2::MolmoAct2ActionConfig::from_json(&c).unwrap();
+    assert_eq!((cfg.hidden, cfg.heads, cfg.head_dim, cfg.layers, cfg.intermediate, cfg.kv_dim), (768, 8, 96, 36, 3072, 1024));
+    assert_eq!((cfg.max_action_dim, cfg.max_horizon, cfg.steps), (32, 30, 10));
+    assert!(cfg.both && cfg.mask_padding && cfg.context_norm && cfg.qk_norm && cfg.rope);
+    // Flow times run from noise at 0 in equal steps.
+    let (t, dt) = cfg.flow_times();
+    assert_eq!(t.len(), 10);
+    assert_eq!(t[0], 0.0);
+    assert!((t[9] - 0.9).abs() < 1e-7 && (dt - 0.1).abs() < 1e-8);
+    // Time embedding at 0: sines 0, cosines 1.
+    let e = cfg.time_embedding(0.0);
+    assert!(e[..128].iter().all(|&x| x == 0.0) && e[128..].iter().all(|&x| x == 1.0));
+    let e = cfg.time_embedding(0.5);
+    assert!((e[0] - 0.5f32.sin()).abs() < 1e-7 && (e[128] - 0.5f32.cos()).abs() < 1e-7);
+    let (cos, sin) = cfg.rotary_tables(2);
+    assert!(cos[..96].iter().all(|&x| x == 1.0) && sin[..96].iter().all(|&x| x == 0.0));
+    assert_eq!(cos[96..144], cos[144..192]);
+    // End-of-turn tokens and discrete action spans are hidden (an unclosed
+    // span runs to the end); a stray end token is not.
+    let ids = [5, 151_932, 6, 151_933, 7, 151_645, 151_933, 8, 151_932, 9];
+    let m: Vec<u8> = cfg.context_mask(&ids).iter().map(|&k| u8::from(k)).collect();
+    assert_eq!(m, [1, 0, 0, 0, 1, 0, 1, 1, 0, 0]);
+    c["action_mode"] = serde_json::json!("continuous");
+    let plain = molmoact2::MolmoAct2ActionConfig::from_json(&c).unwrap();
+    assert!(plain.context_mask(&ids).iter().all(|&k| k));
+    for (path, v) in [("action_expert_depth_gate", serde_json::json!(true)), ("add_action_expert", serde_json::json!(false))] {
+        let mut bad = c.clone();
+        bad[path] = v;
+        assert!(molmoact2::MolmoAct2ActionConfig::from_json(&bad).is_err(), "{path}");
+    }
+    let mut bad = c.clone();
+    bad["action_expert_config"]["causal_attn"] = serde_json::json!(true);
+    assert!(molmoact2::MolmoAct2ActionConfig::from_json(&bad).is_err());
+    let mut bad = c;
+    bad["text_config"]["num_hidden_layers"] = serde_json::json!(35);
+    assert!(molmoact2::MolmoAct2ActionConfig::from_json(&bad).is_err());
+}
+
 #[test]
 fn molmoact2_prompts_follow_the_reference() {
     use molmoact2_processor::{normalize_task, pooling_indices, robot_prompt, state_bins};
