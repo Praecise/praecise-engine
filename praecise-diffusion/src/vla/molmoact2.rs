@@ -5,6 +5,14 @@
 //! Each image token pools a few of those patch features: their masked mean
 //! queries an attention over them, and a SwiGLU projector maps the result
 //! to the language model's width.
+//!
+//! The language model reads the prompt with those features added to the
+//! embeddings of its image-patch tokens: pre-norm decoder blocks of RMS
+//! norm, one fused query/key/value projection, per-head query and key RMS
+//! norms, split-half rotary positions, grouped-query attention and a gated
+//! SiLU MLP. Attention is causal except that image tokens see each other
+//! both ways. The keys and values of every block are kept for the action
+//! expert.
 
 use std::path::Path;
 
@@ -18,6 +26,7 @@ use crate::safetensors::SafeTensors;
 use llama_cpp_sys_2 as sys;
 
 const P: &str = "model.vision_backbone.";
+const T: &str = "model.transformer.";
 
 /// The backbone's settings, from the checkpoint's `vit_config` and
 /// `adapter_config`.
@@ -425,5 +434,380 @@ impl MolmoAct2Vision {
         let got = g.read_f32(out);
         let o = c.out as usize;
         Ok(got.chunks(o).zip(&keep).filter(|&(_, &k)| k).flat_map(|(r, _)| r.iter().copied()).collect())
+    }
+}
+
+/// The language model's settings, from the checkpoint's `text_config`.
+#[derive(Debug, Clone)]
+pub struct MolmoAct2TextConfig {
+    /// Model width.
+    pub hidden: u64,
+    /// MLP width.
+    pub intermediate: u64,
+    /// Query heads.
+    pub heads: u64,
+    /// Key/value heads.
+    pub kv_heads: u64,
+    /// Head width.
+    pub head_dim: u64,
+    /// Decoder blocks.
+    pub layers: usize,
+    /// RMS norm epsilon.
+    pub eps: f64,
+    /// Rotary base.
+    pub theta: f64,
+    /// Tokens in the base embedding table.
+    pub vocab: u64,
+    /// Tokens in the added embedding table, numbered after the base ones.
+    pub new_vocab: u64,
+}
+
+impl MolmoAct2TextConfig {
+    /// Read the language-model settings from a checkpoint config.
+    ///
+    /// # Errors
+    /// [`Error::Config`] for a missing field or a variant this engine does
+    /// not implement.
+    pub fn from_json(c: &Value) -> Result<Self> {
+        let t = c.get("text_config").ok_or_else(|| Error::Config("config gives no text_config".into()))?;
+        let unsupported = |what: &str| Err(Error::Config(format!("MolmoAct2 language models with {what} are not implemented")));
+        if t.get("hidden_act").and_then(Value::as_str).unwrap_or("silu") != "silu" {
+            return unsupported("activations other than silu");
+        }
+        if t.get("norm_after").and_then(Value::as_bool).unwrap_or(false) {
+            return unsupported("post-norm blocks");
+        }
+        if t.get("qkv_bias").and_then(Value::as_bool).unwrap_or(false) {
+            return unsupported("attention biases");
+        }
+        if !t.get("use_qk_norm").and_then(Value::as_bool).unwrap_or(false) || t.get("qk_norm_type").and_then(Value::as_str) != Some("qwen3") {
+            return unsupported("query/key norms other than per-head ones");
+        }
+        if t.get("rope_scaling_layers").is_some_and(|v| !v.is_null()) {
+            return unsupported("per-layer rotary scaling");
+        }
+        let rope = t.get("rope_parameters");
+        if rope.and_then(|r| r.get("rope_type")).and_then(Value::as_str).is_some_and(|r| r != "default") {
+            return unsupported("scaled rotary positions");
+        }
+        let theta = rope
+            .and_then(|r| r.get("rope_theta"))
+            .or_else(|| t.get("rope_theta"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| Error::Config("text_config gives no rotary base".into()))?;
+        let cfg = Self {
+            hidden: u(t, "hidden_size")?,
+            intermediate: u(t, "intermediate_size")?,
+            heads: u(t, "num_attention_heads")?,
+            kv_heads: u(t, "num_key_value_heads")?,
+            head_dim: u(t, "head_dim")?,
+            layers: u(t, "num_hidden_layers")? as usize,
+            eps: t.get("layer_norm_eps").and_then(Value::as_f64).unwrap_or(1e-6),
+            theta,
+            vocab: u(t, "vocab_size")?,
+            new_vocab: t.get("additional_vocab_size").and_then(Value::as_u64).unwrap_or(0),
+        };
+        if cfg.kv_heads == 0 || cfg.heads % cfg.kv_heads != 0 || cfg.head_dim % 2 != 0 {
+            return Err(Error::Config("malformed MolmoAct2 attention heads".into()));
+        }
+        Ok(cfg)
+    }
+
+    fn weight_specs(&self, linear: WType, table: WType) -> Vec<WeightSpec> {
+        let f = WType::F32;
+        let (d, ff, hd) = (self.hidden, self.intermediate, self.head_dim);
+        let (q, kv) = (self.heads * hd, self.kv_heads * hd);
+        let mut s = vec![
+            WeightSpec::new(format!("{T}wte.embedding"), &[self.vocab, d], table),
+            WeightSpec::new(format!("{T}ln_f.weight"), &[d], f),
+        ];
+        if self.new_vocab > 0 {
+            s.push(WeightSpec::new(format!("{T}wte.new_embedding"), &[self.new_vocab, d], table));
+        }
+        // The MLP projection holds [x | gate]; the gate half goes first on
+        // the device so one fused SwiGLU computes silu(gate) * x.
+        let ff = ff as usize;
+        let gate_first: Vec<usize> = (ff..2 * ff).chain(0..ff).collect();
+        for i in 0..self.layers {
+            let l = format!("{T}blocks.{i}");
+            s.push(WeightSpec::new(format!("{l}.attn_norm.weight"), &[d], f));
+            s.push(WeightSpec::new(format!("{l}.ff_norm.weight"), &[d], f));
+            s.push(WeightSpec::new(format!("{l}.self_attn.att_proj.weight"), &[q + 2 * kv, d], linear));
+            s.push(WeightSpec::new(format!("{l}.self_attn.q_norm.weight"), &[hd], f));
+            s.push(WeightSpec::new(format!("{l}.self_attn.k_norm.weight"), &[hd], f));
+            s.push(WeightSpec::new(format!("{l}.self_attn.attn_out.weight"), &[d, q], linear));
+            s.push(WeightSpec::new(format!("{l}.mlp.ff_proj.weight"), &[2 * ff as u64, d], linear).with_rows(gate_first.clone()));
+            s.push(WeightSpec::new(format!("{l}.mlp.ff_out.weight"), &[d, ff as u64], linear));
+        }
+        s
+    }
+
+    /// Rotary tables `[tokens][head_dim]` (cosines, sines) for positions
+    /// `0..n`, in `float32` as the reference builds them: inverse
+    /// frequencies `1 / theta^(2i / head_dim)`, angles `position * inverse
+    /// frequency`, each half of a head sharing the same angles.
+    #[must_use]
+    pub fn rotary_tables(&self, n: usize) -> (Vec<f32>, Vec<f32>) {
+        let hd = self.head_dim as usize;
+        let theta = self.theta as f32;
+        let inv: Vec<f32> = (0..hd / 2).map(|i| 1.0 / theta.powf((2 * i) as f32 / hd as f32)).collect();
+        let (mut cos, mut sin) = (Vec::with_capacity(n * hd), Vec::with_capacity(n * hd));
+        for p in 0..n {
+            for _ in 0..2 {
+                for &f in &inv {
+                    let a = f64::from(p as f32 * f);
+                    cos.push(a.cos() as f32);
+                    sin.push(a.sin() as f32);
+                }
+            }
+        }
+        (cos, sin)
+    }
+}
+
+/// The token ids the language model treats specially, from the checkpoint
+/// config.
+#[derive(Debug, Clone)]
+pub struct MolmoAct2ImageTokens {
+    /// The token whose embedding receives an image feature.
+    pub patch: i32,
+    /// Every image-layout token (patches, row ends, image and frame
+    /// starts and ends): these attend to each other both ways.
+    pub all: Vec<i32>,
+}
+
+impl MolmoAct2ImageTokens {
+    /// Read the image token ids from a checkpoint config.
+    ///
+    /// # Errors
+    /// [`Error::Config`] when the config gives no image-patch token.
+    pub fn from_json(c: &Value) -> Result<Self> {
+        let id = |k: &str| c.get(k).and_then(Value::as_i64).map(|v| v as i32);
+        let patch = id("image_patch_id").ok_or_else(|| Error::Config("config gives no image_patch_id".into()))?;
+        let mut all: Vec<i32> = [
+            "image_patch_id",
+            "image_col_id",
+            "image_start_token_id",
+            "low_res_image_start_token_id",
+            "frame_start_token_id",
+            "image_end_token_id",
+            "frame_end_token_id",
+            "image_low_res_id",
+        ]
+        .iter()
+        .filter_map(|k| id(k))
+        .collect();
+        all.sort_unstable();
+        all.dedup();
+        Ok(Self { patch, all })
+    }
+}
+
+/// The language model's pass over a prompt.
+#[derive(Debug, Clone)]
+pub struct MolmoAct2Prefix {
+    /// Prompt tokens.
+    pub tokens: usize,
+    /// Final normalised hidden states `[tokens][hidden]`.
+    pub hidden: Vec<f32>,
+    /// Per block, the keys after the rotary embedding `[tokens][kv_heads *
+    /// head_dim]`.
+    pub keys: Vec<Vec<f32>>,
+    /// Per block, the values `[tokens][kv_heads * head_dim]`.
+    pub values: Vec<Vec<f32>>,
+}
+
+/// The MolmoAct2 language model on one device.
+pub struct MolmoAct2Lm {
+    cfg: MolmoAct2TextConfig,
+    image: MolmoAct2ImageTokens,
+    backend: Backend,
+    weights: Weights,
+    exact: bool,
+}
+
+impl std::fmt::Debug for MolmoAct2Lm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MolmoAct2Lm").field("device", &self.backend.name()).finish_non_exhaustive()
+    }
+}
+
+impl MolmoAct2Lm {
+    /// Load the language model from a checkpoint directory (`config.json`
+    /// and its safetensors files).
+    ///
+    /// # Errors
+    /// On a missing or malformed file, an unsupported variant, or a backend
+    /// failure.
+    pub fn load(dir: &Path, opts: LoadOptions) -> Result<Self> {
+        let c = read_json(&dir.join("config.json"))?;
+        let cfg = MolmoAct2TextConfig::from_json(&c)?;
+        let image = MolmoAct2ImageTokens::from_json(&c)?;
+        let st = SafeTensors::open(&checkpoint_files(dir))?;
+        let backend = opts.backend()?;
+        let exact = opts.precision == Precision::F32;
+        let (linear, table) = match opts.precision {
+            Precision::F32 => (WType::F32, WType::F32),
+            Precision::Bf16 => (WType::Bf16, WType::F16),
+            Precision::Q8_0 => (WType::Q8_0, WType::F16),
+        };
+        let weights = Weights::load(&backend, &st, &cfg.weight_specs(linear, table))?;
+        Ok(Self { cfg, image, backend, weights, exact })
+    }
+
+    /// The language model's settings.
+    #[must_use]
+    pub fn config(&self) -> &MolmoAct2TextConfig {
+        &self.cfg
+    }
+
+    /// The image token ids.
+    #[must_use]
+    pub fn image_tokens(&self) -> &MolmoAct2ImageTokens {
+        &self.image
+    }
+
+    /// Name of the compute device.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        self.backend.name()
+    }
+
+    /// Run F32 matrix products in full FP32 on a backend that would round
+    /// them (TF32 on CUDA).
+    pub fn set_fp32_gemm(&mut self, fp32: bool) {
+        self.backend.set_fp32_gemm(fp32);
+    }
+
+    /// Bytes of weights resident on the device.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.weights.bytes()
+    }
+
+    /// The attention mask over `ids`: causal, and image tokens attend to
+    /// each other both ways.
+    #[must_use]
+    pub fn mask(&self, ids: &[i32]) -> Vec<f32> {
+        let n = ids.len();
+        let img: Vec<bool> = ids.iter().map(|i| self.image.all.binary_search(i).is_ok()).collect();
+        let mut m = vec![0f32; n * n];
+        for q in 0..n {
+            for k in 0..n {
+                if k > q && !(img[q] && img[k]) {
+                    m[q * n + k] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        m
+    }
+
+    /// Run the prompt `ids` (no padding; positions `0..n`) with `features`
+    /// `[image tokens][hidden]` (as [`MolmoAct2Vision::encode`] gives them)
+    /// added to the embeddings of the image-patch tokens, in order.
+    ///
+    /// # Errors
+    /// On a token outside the vocabulary, a feature count that does not
+    /// match the image-patch tokens, or a backend failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn prefill(&self, ids: &[i32], features: &[f32]) -> Result<MolmoAct2Prefix> {
+        let c = &self.cfg;
+        let d = c.hidden as usize;
+        let n = ids.len();
+        let total = (c.vocab + c.new_vocab) as i32;
+        if n == 0 || ids.iter().any(|&i| i < 0 || i >= total) {
+            return Err(Error::Request("an empty prompt or a token outside the vocabulary".into()));
+        }
+        let patches = ids.iter().filter(|&&i| i == self.image.patch).count();
+        if features.len() != patches * d {
+            return Err(Error::Request(format!("{patches} image-patch tokens but {} features", features.len() / d.max(1))));
+        }
+
+        let w = &self.weights;
+        let exact = self.exact;
+        let eps = c.eps as f32;
+        let (hd, nh, nkv) = (c.head_dim as i64, c.heads as i64, c.kv_heads as i64);
+        let (n_i, d_i) = (n as i64, d as i64);
+        let mut g = Graph::new(&self.backend)?;
+        let base = g.input(sys::GGML_TYPE_I32, &[n_i]);
+        let pick_base = g.input(sys::GGML_TYPE_F32, &[1, n_i]);
+        let added = if c.new_vocab > 0 { Some((g.input(sys::GGML_TYPE_I32, &[n_i]), g.input(sys::GGML_TYPE_F32, &[1, n_i]))) } else { None };
+        let img = g.input(sys::GGML_TYPE_F32, &[d_i, n_i]);
+        let mask = g.input(sys::GGML_TYPE_F16, &[n_i, n_i]);
+        let cos = g.input(sys::GGML_TYPE_F32, &[hd, 1, n_i]);
+        let sin = g.input(sys::GGML_TYPE_F32, &[hd, 1, n_i]);
+
+        // Each token reads one of the two tables (the other is weighted 0).
+        let x = g.get_rows(w.get(&format!("{T}wte.embedding")), base);
+        let mut x = g.mul(x, pick_base);
+        if let Some((ids_new, pick_new)) = added {
+            let y = g.get_rows(w.get(&format!("{T}wte.new_embedding")), ids_new);
+            let y = g.mul(y, pick_new);
+            x = g.add(x, y);
+        }
+        let mut x = g.add(x, img);
+        let (qw, kvw) = (nh * hd, nkv * hd);
+        let mut kv_out = Vec::with_capacity(2 * c.layers);
+        for i in 0..c.layers {
+            let l = format!("{T}blocks.{i}");
+            let wn = |s: &str| w.get(&format!("{l}.{s}"));
+            let h = g.rms_norm(x, eps);
+            let h = g.mul(h, wn("attn_norm.weight"));
+            let qkv = g.linear(wn("self_attn.att_proj.weight"), h);
+            let q = g.view_heads(qkv, 0, hd, nh);
+            let q = g.cont(q);
+            let k = g.view_heads(qkv, qw, hd, nkv);
+            let k = g.cont(k);
+            let v = g.view_heads(qkv, qw + kvw, hd, nkv);
+            let v = g.cont(v);
+            let q = g.rms_norm(q, eps);
+            let q = g.mul(q, wn("self_attn.q_norm.weight"));
+            let k = g.rms_norm(k, eps);
+            let k = g.mul(k, wn("self_attn.k_norm.weight"));
+            let q = g.rotate_half_rope(q, cos, sin);
+            let k = g.rotate_half_rope(k, cos, sin);
+            kv_out.push(k);
+            kv_out.push(v);
+            let o = attend(&mut g, q, k, v, Some(mask), 1.0 / (hd as f32).sqrt(), exact);
+            let o = g.reshape(o, &[qw, n_i]);
+            let o = g.linear(wn("self_attn.attn_out.weight"), o);
+            x = g.add(x, o);
+            let h = g.rms_norm(x, eps);
+            let h = g.mul(h, wn("ff_norm.weight"));
+            let h = g.linear(wn("mlp.ff_proj.weight"), h);
+            let h = g.swiglu(h);
+            let h = g.linear(wn("mlp.ff_out.weight"), h);
+            x = g.add(x, h);
+        }
+        let h = g.rms_norm(x, eps);
+        let out = g.mul(h, w.get(&format!("{T}ln_f.weight")));
+        let mut outputs = vec![out];
+        outputs.extend_from_slice(&kv_out);
+        g.finish(&outputs)?;
+
+        let vocab = c.vocab as i32;
+        g.set_i32(base, &ids.iter().map(|&i| i.min(vocab - 1)).collect::<Vec<_>>());
+        g.set_f32(pick_base, &ids.iter().map(|&i| if i < vocab { 1.0 } else { 0.0 }).collect::<Vec<_>>());
+        if let Some((ids_new, pick_new)) = added {
+            g.set_i32(ids_new, &ids.iter().map(|&i| (i - vocab).max(0)).collect::<Vec<_>>());
+            g.set_f32(pick_new, &ids.iter().map(|&i| if i >= vocab { 1.0 } else { 0.0 }).collect::<Vec<_>>());
+        }
+        let mut add = vec![0f32; n * d];
+        for (row, feat) in ids.iter().enumerate().filter(|&(_, &i)| i == self.image.patch).map(|(r, _)| r).zip(features.chunks(d)) {
+            add[row * d..(row + 1) * d].copy_from_slice(feat);
+        }
+        g.set_f32(img, &add);
+        g.set_f16(mask, &self.mask(ids));
+        let (tc, ts) = c.rotary_tables(n);
+        g.set_f32(cos, &tc);
+        g.set_f32(sin, &ts);
+        g.compute()?;
+        let hidden = g.read_f32(out);
+        let (mut keys, mut values) = (Vec::with_capacity(c.layers), Vec::with_capacity(c.layers));
+        for pair in kv_out.chunks(2) {
+            keys.push(g.read_f32(pair[0]));
+            values.push(g.read_f32(pair[1]));
+        }
+        Ok(MolmoAct2Prefix { tokens: n, hidden, keys, values })
     }
 }

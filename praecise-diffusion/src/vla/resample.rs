@@ -1,11 +1,13 @@
 //! 8-bit image resampling as the policies' reference image pipelines
-//! compute it, to the bit: OpenCV's `INTER_AREA` and torch's antialiased
-//! bicubic resize of `uint8` images (the torchvision path on CPU).
+//! compute it, to the bit: OpenCV's `INTER_AREA`, torch's antialiased
+//! bicubic resize of `uint8` images (the torchvision path on CPU) and
+//! torchvision's plain bilinear resize of `uint8` images.
 //!
-//! Both work in integers or `float32` exactly as the libraries do, so the
-//! pixels a policy sees match the reference. OpenCV's area decimation sums
-//! in `float32` with fused multiply-adds on aarch64 builds and separate
-//! ones elsewhere; the build target picks the same here.
+//! They work in integers or `float32` exactly as the libraries do, so the
+//! pixels a policy sees match the reference. OpenCV's area decimation and
+//! torch's bilinear kernel sum in `float32` with fused multiply-adds on
+//! aarch64 builds and separate ones elsewhere; the build target picks the
+//! same here.
 
 use crate::flux3::packing::Frame;
 
@@ -322,4 +324,47 @@ pub fn resize_bicubic_aa(f: &Frame8, h: usize, w: usize) -> Frame8 {
         r = aa_pass(&r, h, false);
     }
     r
+}
+
+/// Source indices and weights of each destination index of torch's linear
+/// interpolation without antialiasing (half-pixel centres, the source
+/// position clamped at 0, `float32`).
+fn linear_taps(insize: usize, outsize: usize) -> Vec<(usize, usize, f32, f32)> {
+    if insize == outsize {
+        return (0..outsize).map(|i| (i, i, 1.0, 0.0)).collect();
+    }
+    let scale = insize as f32 / outsize as f32;
+    (0..outsize)
+        .map(|i| {
+            let src = mul_add(scale, i as f32 + 0.5, -0.5).max(0.0);
+            let i0 = (src.floor() as usize).min(insize - 1);
+            let l1 = (src - i0 as f32).clamp(0.0, 1.0);
+            let i1 = if i0 < insize - 1 { i0 + 1 } else { i0 };
+            (i0, i1, 1.0 - l1, l1)
+        })
+        .collect()
+}
+
+/// torchvision's `Resize(.., BILINEAR, antialias=False)` of a `uint8`
+/// image: the bytes as `float32`, torch's bilinear interpolation (rows then
+/// columns of each 2x2 neighbourhood weighted in one pass) and rounding half
+/// to even back to bytes.
+#[must_use]
+pub fn resize_bilinear_bytes(f: &Frame8, h: usize, w: usize) -> Frame8 {
+    let ty = linear_taps(f.h, h);
+    let tx = linear_taps(f.w, w);
+    let mut data = Vec::with_capacity(3 * h * w);
+    for c in 0..3 {
+        let p = f.plane(c);
+        for &(y0, y1, wy0, wy1) in &ty {
+            for &(x0, x1, wx0, wx1) in &tx {
+                let px = |y: usize, x: usize| f32::from(p[y * f.w + x]);
+                let t0 = mul_add(px(y0, x0), wx0, px(y0, x1) * wx1);
+                let t1 = mul_add(px(y1, x0), wx0, px(y1, x1) * wx1);
+                let v = mul_add(t0, wy0, t1 * wy1);
+                data.push(v.round_ties_even().clamp(0.0, 255.0) as u8);
+            }
+        }
+    }
+    Frame8 { h, w, data }
 }

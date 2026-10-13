@@ -360,6 +360,134 @@ fn molmoact2_vision_config_reads_a_release() {
     assert!(cfg.pool_mask);
 }
 
+/// The MolmoAct2 prompt prefix through the release's preprocessing
+/// against the reference policy (`PRAECISE_MOLMOACT2_PREFIX_PARITY`, made by
+/// `tests/parity/make_molmoact2_prefix_fixture.py`): the prompt text, ids and
+/// pooling indices exactly, the crops to the 8-bit level, then the image
+/// features, the language model's final hidden states and every block's
+/// keys and values, each relative to its scale.
+#[test]
+#[ignore = "needs a reference fixture"]
+fn molmoact2_prefix_matches_reference() {
+    let dir = parity_dir("PRAECISE_MOLMOACT2_PREFIX_PARITY");
+    let fx = Fixture::open(&dir);
+    let (opts, tol) = parity_options();
+    let policy = dir.join("policy");
+    let text = |k: &str| fx.meta[k].as_str().unwrap().to_owned();
+    let proc = molmoact2_processor::MolmoAct2Processor::load(&policy, &text("setup_type"), &text("control_mode")).unwrap();
+    let mut vision = molmoact2::MolmoAct2Vision::load(&policy, opts).unwrap();
+    vision.set_fp32_gemm(true);
+    let mut lm = molmoact2::MolmoAct2Lm::load(&policy, opts).unwrap();
+    lm.set_fp32_gemm(true);
+    let rel = |got: &[f32], want: &[f32]| {
+        assert_eq!(got.len(), want.len());
+        let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+        got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / scale
+    };
+    let mut worst = 0f32;
+    for (s, smp) in fx.meta["samples"].as_array().unwrap().iter().enumerate() {
+        let frames: Vec<resample::Frame8> = (0..smp["frames"].as_array().unwrap().len())
+            .map(|j| {
+                let name = format!("{s}.frame{j}");
+                let shape = fx.st.get(&name).unwrap().shape.to_vec();
+                let (h, w) = (shape[0] as usize, shape[1] as usize);
+                let hwc = fx.f32s(&name);
+                let data = (0..3).flat_map(|c| (0..h * w).map(move |i| (c, i))).map(|(c, i)| hwc[i * 3 + c]).collect();
+                resample::Frame8::from_unit(&Frame { h, w, data })
+            })
+            .collect();
+        let inputs = proc.prepare(&frames, &fx.f32s(&format!("{s}.state")), smp["task"].as_str().unwrap()).unwrap();
+        assert_eq!(inputs.prompt, smp["prompt"].as_str().unwrap(), "sample {s}: prompt");
+        let ints = |name: &str| fx.f32s(&format!("{s}.{name}")).iter().map(|&i| i as i32).collect::<Vec<i32>>();
+        assert_eq!(inputs.ids, ints("ids"), "sample {s}: prompt ids");
+        assert_eq!(inputs.pooling, ints("pooling"), "sample {s}: pooling indices");
+        let want_px = fx.f32s(&format!("{s}.pixels"));
+        assert_eq!(inputs.pixels.len(), want_px.len(), "sample {s}: crops");
+        let off = inputs.pixels.iter().zip(&want_px).filter(|(a, b)| (*a - *b).abs() > 1e-6).count();
+        let px = inputs.pixels.iter().zip(&want_px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let feats = vision.encode(&inputs.pixels, inputs.crops, &inputs.pooling, inputs.pool).unwrap();
+        let fd = rel(&feats, &fx.f32s(&format!("{s}.features")));
+        // The model alone, from the reference's crops.
+        let from_ref = vision.encode(&want_px, inputs.crops, &inputs.pooling, inputs.pool).unwrap();
+        let fr = rel(&from_ref, &fx.f32s(&format!("{s}.features")));
+        let pre = lm.prefill(&inputs.ids, &feats).unwrap();
+        let hd = rel(&pre.hidden, &fx.f32s(&format!("{s}.hidden")));
+        let (mut kd, mut vd) = (0f32, 0f32);
+        for l in 0..lm.config().layers {
+            kd = kd.max(rel(&pre.keys[l], &fx.f32s(&format!("{s}.k{l}"))));
+            vd = vd.max(rel(&pre.values[l], &fx.f32s(&format!("{s}.v{l}"))));
+        }
+        eprintln!(
+            "sample {s}: {} tokens, {} crops; pixels off {off} (max {px:.3e}); features {fd:.3e} ({fr:.3e} from the reference crops), hidden {hd:.3e}, keys {kd:.3e}, values {vd:.3e} (relative)",
+            inputs.ids.len(),
+            inputs.crops
+        );
+        assert!(px <= 2.0 / 255.0 + 1e-6, "sample {s}: crops differ by more than one 8-bit level");
+        worst = worst.max(fd).max(hd).max(kd).max(vd);
+    }
+    eprintln!("worst {worst:.3e} (tolerance {tol:.1e})");
+    assert!(worst <= tol, "MolmoAct2 prompt prefix differs from the reference");
+}
+
+#[test]
+fn molmoact2_language_config_reads_a_release() {
+    let c = serde_json::json!({
+        "image_patch_id": 154626, "image_col_id": 154627, "image_start_token_id": 154624, "low_res_image_start_token_id": 154628,
+        "frame_start_token_id": 154631, "image_end_token_id": 154625, "frame_end_token_id": 154632, "image_low_res_id": 154630,
+        "text_config": {"additional_vocab_size": 128, "head_dim": 128, "hidden_act": "silu", "hidden_size": 2560, "intermediate_size": 9728,
+            "layer_norm_eps": 1e-6, "norm_after": false, "num_attention_heads": 32, "num_hidden_layers": 36, "num_key_value_heads": 8,
+            "qk_norm_type": "qwen3", "qkv_bias": false, "rope_parameters": {"rope_theta": 5000000.0, "rope_type": "default"},
+            "rope_scaling_layers": null, "use_qk_norm": true, "vocab_size": 154624}
+    });
+    let cfg = molmoact2::MolmoAct2TextConfig::from_json(&c).unwrap();
+    assert_eq!((cfg.layers, cfg.heads, cfg.kv_heads, cfg.vocab, cfg.new_vocab), (36, 32, 8, 154_624, 128));
+    assert!((cfg.theta - 5e6).abs() < 1e-6);
+    let t = molmoact2::MolmoAct2ImageTokens::from_json(&c).unwrap();
+    assert_eq!(t.patch, 154_626);
+    assert_eq!(t.all.len(), 8);
+    let mut post = c.clone();
+    post["text_config"]["norm_after"] = serde_json::json!(true);
+    assert!(molmoact2::MolmoAct2TextConfig::from_json(&post).is_err());
+    // Rotary tables: position 0 is the identity, both halves share angles.
+    let (cos, sin) = cfg.rotary_tables(2);
+    assert!(cos[..128].iter().all(|&x| x == 1.0) && sin[..128].iter().all(|&x| x == 0.0));
+    assert_eq!(cos[128..192], cos[192..256]);
+    assert!((sin[128] - 1f32.sin()).abs() < 1e-7);
+}
+
+#[test]
+fn molmoact2_prompts_follow_the_reference() {
+    use molmoact2_processor::{normalize_task, pooling_indices, robot_prompt, state_bins};
+    // Outputs of the reference's `_normalize_question_text`.
+    assert_eq!(normalize_task("Task: Pick up the red cube.  Then put it in the bowl!"), "pick up the red cube; then put it in the bowl");
+    assert_eq!(normalize_task("  \"The task is to OPEN the drawer...\" "), "open the drawer");
+    assert_eq!(normalize_task("goal - wipe (the table)!?"), "wipe (the table");
+    assert_eq!(normalize_task("Your task is to fold. the towel. now"), "fold; the towel; now");
+    assert_eq!(normalize_task("tasks: x."), "tasks: x");
+    // `_build_discrete_state_string` gives 128, 0, 255, 191, 128.
+    assert_eq!(state_bins(&[0.0, -1.5, 1.0, 0.5, f32::NAN], 256), vec![128, 0, 255, 191, 128]);
+    // `arange_for_pooling` of a 3x3 grid in 2x2 blocks.
+    let (th, tw, idx) = pooling_indices(3, 3, 2, 2);
+    assert_eq!((th, tw), (2, 2));
+    assert_eq!(idx, vec![0, 1, 3, 4, 2, -1, 5, -1, 6, 7, -1, -1, 8, -1, -1, -1]);
+    let p = robot_prompt("stack", &[3], "", "joint", (true, true), 2);
+    assert_eq!(
+        p,
+        "Image 1<|image|>Image 2<|image|><|im_start|>user\nThe task is to stack. The setup is . The current state of the robot is <state_start><state_3><state_end>. The expected control mode is <control_start>joint<control_end>. Given these, what action should the robot take to complete the task?<|im_end|>\n<|im_start|>assistant\n<action_output>"
+    );
+}
+
+#[test]
+fn bilinear_resize_matches_torchvision_on_bytes() {
+    // torchvision resize(.., BILINEAR, antialias=False) of uint8 planes.
+    let up = resample::resize_bilinear_bytes(&frame8(3, 4, &SMALL), 5, 7);
+    let want = [12, 79, 187, 118, 41, 71, 90, 109, 113, 119, 97, 74, 77, 80, 255, 164, 18, 64, 123, 87, 64, 106, 107, 108, 146, 173, 95, 45, 7, 69, 168, 200, 207, 100, 33];
+    assert_eq!(&up.data[..35], &want);
+    let down = resample::resize_bilinear_bytes(&frame8(4, 6, &WIDE), 3, 5);
+    assert_eq!(&down.data[..15], &[64, 132, 69, 172, 38, 127, 115, 111, 64, 79, 79, 108, 164, 80, 24]);
+    assert_eq!(resample::resize_bilinear_bytes(&frame8(4, 6, &WIDE), 4, 6).data[..24], WIDE);
+}
+
 fn frame8(h: usize, w: usize, plane: &[u8]) -> resample::Frame8 {
     resample::Frame8 { h, w, data: plane.repeat(3) }
 }
