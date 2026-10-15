@@ -234,7 +234,7 @@ dependencies = [
  "num-traits",
  "pastey 0.1.1",
  "rayon",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "v_frame",
  "y4m",
 ]
@@ -1670,7 +1670,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "tokio",
  "ureq",
  "windows-sys 0.61.2",
@@ -2206,7 +2206,7 @@ dependencies = [
  "enumflags2",
  "llama-cpp-sys-2",
  "llguidance",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "toktrie",
  "tracing",
  "tracing-core",
@@ -2968,7 +2968,7 @@ dependencies = [
  "re_mp4",
  "rust_h264",
  "rust_h265",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2984,7 +2984,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "tokenizers 0.23.2",
  "tracing",
 ]
@@ -3005,7 +3005,7 @@ dependencies = [
  "praecise-runtime",
  "serde_json",
  "sha2",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -3026,7 +3026,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sysinfo",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "tracing",
  "wgpu",
 ]
@@ -3048,7 +3048,7 @@ dependencies = [
  "serde_json",
  "symphonia",
  "tempfile",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "tokenizers 0.20.4",
  "tracing",
 ]
@@ -3059,7 +3059,7 @@ version = "0.1.0"
 dependencies = [
  "p256",
  "sha2",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3077,7 +3077,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "x25519-dalek",
@@ -3092,7 +3092,7 @@ dependencies = [
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "sha2",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3337,7 +3337,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "simd_helpers",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "v_frame",
 ]
 
@@ -3415,7 +3415,7 @@ dependencies = [
  "num-rational",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3444,7 +3444,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4335,11 +4335,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.19"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.19",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -4355,9 +4355,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.19"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4478,7 +4478,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spm_precompiled",
- "thiserror 2.0.19",
+ "thiserror 2.0.21",
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
