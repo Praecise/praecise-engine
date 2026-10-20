@@ -157,8 +157,12 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 
 /// The released checkpoints against the reference implementation's outputs,
 /// case by case (`meta.json`): the prompt's text context, the latent after
-/// every step from the same starting noise, and the decoded image. Prints
-/// every measure; asserts the bounds each case names.
+/// every step from the same starting noise, each step alone from the
+/// reference's own latent before it, and the decoded image. Prints every
+/// measure; asserts the bounds each case names. Whole runs drift further
+/// apart than single steps: a few-step sampler carries each step's rounding
+/// into the next, and text-to-image runs (no reference image to hold the
+/// layout) amplify it most.
 #[test]
 #[ignore = "needs PRAECISE_FLUX3_IMAGE_REFERENCE fixtures and the released weights"]
 fn flux3_image_reference() {
@@ -184,6 +188,9 @@ fn flux3_image_reference() {
             loaded = Some((key, p));
         }
         let p = &mut loaded.as_mut().unwrap().1;
+        if let Some(shift) = case["shift"].as_f64() {
+            p.set_shift(shift as f32).unwrap();
+        }
         let (width, height) = (case["width"].as_u64().unwrap() as u32, case["height"].as_u64().unwrap() as u32);
         let mut references = Vec::new();
         for r in case["references"].as_array().unwrap() {
@@ -219,6 +226,30 @@ fn flux3_image_reference() {
             println!("{name}: step {i} latent cosine {cos:.6}, max relative error {rel:.3e}");
             last = cos;
         }
+        // Each step alone, from the reference's own latent before it: the
+        // error one step adds, apart from what earlier steps carried in.
+        let times = sampling_times(req.steps as usize, p.shift);
+        let uncond = (!p.is_flow_map() && req.guidance_scale > 1.0).then(|| p.context("").unwrap());
+        let (ref_tokens, ref_ids) = p.references(&req.references).unwrap();
+        let mut worst = 1.0f64;
+        for i in 0..steps.len() {
+            let start = if i == 0 { f32s(&dir, "noise") } else { f32s(&dir, &format!("step{}", i - 1)) };
+            let (x, _) = sample(
+                &p.dit,
+                (&ctx, uncond.as_ref()),
+                Conditioning { tokens: &ref_tokens, ids: &ref_ids },
+                start,
+                ((height / CELL) as usize, (width / CELL) as usize),
+                &times[i..=i + 1],
+                req.guidance_scale,
+                &mut |_, _| {},
+            )
+            .unwrap();
+            let (cos, rel) = agreement(&x, &f32s(&dir, &format!("step{i}")));
+            println!("{name}: step {i} alone, from the reference latent: cosine {cos:.6}, max relative error {rel:.3e}");
+            worst = worst.min(cos);
+        }
+        println!("{name}: worst single-step cosine {worst:.6}");
         let want = std::fs::read(dir.join("image.rgb")).unwrap();
         let db = psnr(&image.rgb, &want);
         let mean_abs = image.rgb.iter().zip(&want).map(|(&a, &b)| f64::from(a.abs_diff(b))).sum::<f64>() / want.len() as f64;
@@ -232,6 +263,7 @@ fn flux3_image_reference() {
             bytes.extend_from_slice(&image.rgb);
             std::fs::write(path, bytes).unwrap();
         }
+        assert!(worst >= case["min_step_cosine"].as_f64().unwrap_or(0.999), "{name}: single-step cosine {worst}");
         assert!(last >= case["min_latent_cosine"].as_f64().unwrap_or(0.99), "{name}: final latent cosine {last}");
         assert!(db >= case["min_psnr"].as_f64().unwrap_or(25.0), "{name}: image PSNR {db}");
     }

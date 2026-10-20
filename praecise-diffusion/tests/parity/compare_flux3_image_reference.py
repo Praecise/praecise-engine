@@ -14,6 +14,7 @@ references before and after preparation, as the reference pipeline computes
 them on the GPU in bfloat16, and the meta.json the test reads.
 """
 import json
+import os
 import pathlib
 import sys
 
@@ -28,6 +29,37 @@ from flux3.dit import DiT, IN_CHANNELS  # noqa: E402
 from flux3.pipeline import pack, prepare_multi_reference, prepare_reference, scaled_ids, to_pil, to_tensor  # noqa: E402
 from flux3.sampling import timesteps  # noqa: E402
 from flux3.text_encoder import TextEncoder  # noqa: E402
+from flux3 import text_encoder as ref_text_encoder  # noqa: E402
+
+
+class TextOnlyProcessor:
+    """The released processor without its image and video halves (text prompts only)."""
+
+    @classmethod
+    def from_pretrained(cls, path, **_):
+        from transformers import AutoTokenizer
+        p = cls()
+        p.tokenizer = AutoTokenizer.from_pretrained(path)
+        p.tokenizer.chat_template = json.loads((pathlib.Path(path) / "chat_template.json").read_text())["chat_template"]
+        return p
+
+    def apply_chat_template(self, messages, **kw):
+        return self.tokenizer.apply_chat_template(messages, **kw)
+
+
+ref_text_encoder.AutoProcessor = TextOnlyProcessor
+
+if os.environ.get("FLUX3_REFERENCE_ATTENTION") == "efficient":
+    # A control run: the same pipeline with another attention kernel, to
+    # measure how far the reference drifts from itself.
+    from flux3 import dit as ref_dit
+    from torch.nn.attention import SDPBackend
+
+    class _Backends:
+        CUDNN_ATTENTION = SDPBackend.EFFICIENT_ATTENTION
+        MATH = SDPBackend.MATH
+
+    ref_dit.SDPBackend = _Backends
 
 cases = json.loads(pathlib.Path(sys.argv[2]).read_text())
 out = pathlib.Path(sys.argv[3])
