@@ -45,6 +45,7 @@ pub struct TextEncoder {
     tokenizer: Tokenizer,
     pad: u32,
     layers: Vec<usize>,
+    pad_position: Option<i32>,
     exact: bool,
 }
 
@@ -89,10 +90,19 @@ impl TextEncoder {
             .collect();
         shards.sort();
         let st = SafeTensors::open(&shards)?;
-        let backend = Backend::select(opts.cpu_threads)?;
+        let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "text encoder backend selected");
         let w = Weights::load(&backend, &st, &cfg.weight_specs(LAYOUT, last, opts.precision.wtype())?)?;
-        Ok(Self { backend, cfg, w, theta, tokenizer, pad, layers: layers.to_vec(), exact: opts.precision == Precision::F32 })
+        Ok(Self { backend, cfg, w, theta, tokenizer, pad, layers: layers.to_vec(), pad_position: None, exact: opts.precision == Precision::F32 })
+    }
+
+    /// Give every padding token the rotary position `position` instead of
+    /// continuing the prompt's positions through the padding (the image
+    /// models' encoders place all padding at one position).
+    #[must_use]
+    pub fn with_pad_position(mut self, position: i32) -> Self {
+        self.pad_position = Some(position);
+        self
     }
 
     /// Width of one context token.
@@ -131,8 +141,12 @@ impl TextEncoder {
         let io = qwen3::build(&mut g, &self.cfg, &self.w, LAYOUT, n as i64, &self.layers, self.theta, self.exact);
         g.finish(&[io.out])?;
         g.set_i32(io.tokens, &t.ids);
-        // Text-only prompts take plain sequential positions, padding included.
-        let pos: Vec<i32> = (0..n as i32).collect();
+        // Text-only prompts take plain sequential positions, padding included
+        // unless a padding position is set.
+        let pos: Vec<i32> = (0..n as i32).map(|i| match self.pad_position {
+            Some(p) if i as usize >= t.real => p,
+            _ => i,
+        }).collect();
         g.set_i32(io.positions, &pos);
         g.set_f16(io.mask, &qwen3::mask(n, t.real));
         g.compute()?;
