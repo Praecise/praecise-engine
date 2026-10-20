@@ -712,6 +712,12 @@ impl Weights {
         Tn(*self.tensors.get(name).unwrap_or_else(|| panic!("weight {name} was not loaded")))
     }
 
+    /// A resident tensor by name, when it was part of the load.
+    #[must_use]
+    pub fn find(&self, name: &str) -> Option<Tn> {
+        self.tensors.get(name).map(|&t| Tn(t))
+    }
+
     /// Device bytes held.
     #[must_use]
     pub fn bytes(&self) -> usize {
