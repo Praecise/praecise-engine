@@ -17,6 +17,7 @@ members = [
   "examples/reranker",
   "examples/mtmd",
   "examples/flux2",
+  "examples/flux3-image",
   "examples/ace-step",
   "examples/cosmos3",
   "examples/wan-world",

@@ -70,6 +70,7 @@ pub use video::{action_resolution_tier, frames_from_video, ActionMode, ActionOut
 pub use praecise_codec as codec;
 pub use world::{SessionConfig, WorldChunk, WorldModel, WorldSession};
 pub use zimage::ZImage;
+pub use flux3::image::{Flux3Image, TransformerSource as Flux3TransformerSource};
 pub use trellis2::{Asset3d, Request3d, Trellis2, Trellis2Files, Trellis2Path};
 pub use qwen_image::pipeline::QwenImageEdit;
 pub use qwen_image21::pipeline::QwenImage21;
