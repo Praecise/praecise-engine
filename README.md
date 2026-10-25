@@ -210,7 +210,8 @@ is only as right as its assumptions, and the only test of those is measurement.
 
 ## Crates
 
-- `llama-cpp-sys-2` — low-level FFI; pulls the llama.cpp backend.
+- `llama-cpp-sys-2` — low-level FFI; pulls the llama.cpp backend (the Praecise
+  fork, synced with upstream llama.cpp 7790a9231 of 2026-10-25).
 - `llama-cpp-2` — safe Rust bindings, including the speculative-decode primitives.
 - `praecise-runtime` — the backend-agnostic acceleration runtime and inference API.
 - `praecise-host` — runtime hosts and the engine set: confined, supervised
@@ -226,7 +227,9 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `praecise-moe` — expert-parallel mixture-of-experts execution: expert FFNs
   and gating from safetensors blobs, GGUF block-quantized expert weights, a
   memory and disk residency cache, and the combine step, on the CPU, CUDA or
-  any other GPU through wgpu.
+  any other GPU through wgpu. The `cuda` feature builds for the CUDA toolkit
+  that nvcc reports (12 or 13); `cuda-12` and `cuda-13` pin the version on a
+  build host without a toolkit.
 
 ## Consuming Praecise Engine
 

@@ -162,14 +162,14 @@ mod onnx_backend {
             let session = crate::session::build_onnx_session(path.as_ref(), "model")?;
 
             let input_name = session
-                .inputs
+                .inputs()
                 .first()
-                .map(|i| i.name.clone())
+                .map(|i| i.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("ONNX model has no inputs".to_string()))?;
             let output_name = session
-                .outputs
+                .outputs()
                 .first()
-                .map(|o| o.name.clone())
+                .map(|o| o.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("ONNX model has no outputs".to_string()))?;
 
             Ok(Self {

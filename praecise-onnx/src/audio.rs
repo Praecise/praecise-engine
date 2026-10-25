@@ -115,16 +115,18 @@ mod preprocessing {
     use std::io::Cursor;
 
     use realfft::RealFftPlanner;
+    use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
     use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+        Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+        WindowFunction,
     };
-    use symphonia::core::audio::{AudioBufferRef, Signal};
-    use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+    use symphonia::core::audio::GenericAudioBufferRef;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     use crate::error::{Error, Result};
 
@@ -200,36 +202,39 @@ mod preprocessing {
     fn decode_symphonia(bytes: &[u8]) -> Result<Vec<f32>> {
         let cursor = Cursor::new(bytes.to_vec());
         let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
-        let probed = symphonia::default::get_probe()
-            .format(
+        let mut format = symphonia::default::get_probe()
+            .probe(
                 &Hint::new(),
                 mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             )
             .map_err(|e| Error::InferenceError(format!("audio probe: {}", e)))?;
 
-        let mut format = probed.format;
-        let track = format
+        let (track_id, codec_params) = format
             .tracks()
             .iter()
-            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+            .find_map(|t| {
+                t.codec_params
+                    .as_ref()
+                    .and_then(|p| p.audio())
+                    .map(|p| (t.id, p.clone()))
+            })
             .ok_or_else(|| Error::InferenceError("no decodable audio track".to_string()))?;
-        let track_id = track.id;
-        let codec_params = track.codec_params.clone();
         let in_rate = codec_params
             .sample_rate
             .ok_or_else(|| Error::InferenceError("missing sample_rate".to_string()))?;
-        let channels = codec_params.channels.map(|c| c.count()).unwrap_or(1).max(1);
+        let channels = codec_params.channels.as_ref().map(|c| c.count()).unwrap_or(1).max(1);
 
         let mut decoder = symphonia::default::get_codecs()
-            .make(&codec_params, &DecoderOptions::default())
+            .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
             .map_err(|e| Error::InferenceError(format!("codec init: {}", e)))?;
 
         let mut samples: Vec<f32> = Vec::new();
         loop {
             let packet = match format.next_packet() {
-                Ok(p) => p,
+                Ok(Some(p)) => p,
+                Ok(None) => break,
                 Err(SymphoniaError::IoError(ref e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -239,7 +244,7 @@ mod preprocessing {
                     return Err(Error::InferenceError(format!("packet read: {}", e)));
                 }
             };
-            if packet.track_id() != track_id {
+            if packet.track_id != track_id {
                 continue;
             }
             match decoder.decode(&packet) {
@@ -255,59 +260,33 @@ mod preprocessing {
         resample_to_16k(mono, in_rate)
     }
 
-    fn append_audio_buffer(buf: &AudioBufferRef<'_>, out: &mut Vec<f32>) {
+    fn append_audio_buffer(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>) {
         match buf {
-            AudioBufferRef::F32(b) => {
-                let chans = b.spec().channels.count();
-                let frames = b.frames();
-                for f in 0..frames {
-                    for c in 0..chans {
-                        out.push(b.chan(c)[f]);
-                    }
-                }
+            GenericAudioBufferRef::F32(_) => {
+                let mut v: Vec<f32> = Vec::new();
+                buf.copy_to_vec_interleaved(&mut v);
+                out.extend_from_slice(&v);
             }
-            AudioBufferRef::S16(b) => {
-                let chans = b.spec().channels.count();
-                let frames = b.frames();
-                for f in 0..frames {
-                    for c in 0..chans {
-                        out.push(b.chan(c)[f] as f32 / i16::MAX as f32);
-                    }
-                }
+            GenericAudioBufferRef::S16(_) => {
+                let mut v: Vec<i16> = Vec::new();
+                buf.copy_to_vec_interleaved(&mut v);
+                out.extend(v.iter().map(|&x| x as f32 / i16::MAX as f32));
             }
-            AudioBufferRef::S32(b) => {
-                let chans = b.spec().channels.count();
-                let frames = b.frames();
-                for f in 0..frames {
-                    for c in 0..chans {
-                        out.push(b.chan(c)[f] as f32 / i32::MAX as f32);
-                    }
-                }
+            GenericAudioBufferRef::S32(_) => {
+                let mut v: Vec<i32> = Vec::new();
+                buf.copy_to_vec_interleaved(&mut v);
+                out.extend(v.iter().map(|&x| x as f32 / i32::MAX as f32));
             }
-            AudioBufferRef::U8(b) => {
-                let chans = b.spec().channels.count();
-                let frames = b.frames();
-                for f in 0..frames {
-                    for c in 0..chans {
-                        let v = b.chan(c)[f] as f32;
-                        out.push((v - 128.0) / 128.0);
-                    }
-                }
+            GenericAudioBufferRef::U8(_) => {
+                let mut v: Vec<u8> = Vec::new();
+                buf.copy_to_vec_interleaved(&mut v);
+                out.extend(v.iter().map(|&x| (x as f32 - 128.0) / 128.0));
             }
             _ => {
-                // Fallback: convert via f32 buffer copy.
-                let mut fbuf = symphonia::core::audio::AudioBuffer::<f32>::new(
-                    buf.capacity() as u64,
-                    *buf.spec(),
-                );
-                buf.convert(&mut fbuf);
-                let chans = fbuf.spec().channels.count();
-                let frames = fbuf.frames();
-                for f in 0..frames {
-                    for c in 0..chans {
-                        out.push(fbuf.chan(c)[f]);
-                    }
-                }
+                // Other sample formats: symphonia's own conversion to f32.
+                let mut v: Vec<f32> = Vec::new();
+                buf.copy_to_vec_interleaved(&mut v);
+                out.extend_from_slice(&v);
             }
         }
     }
@@ -341,24 +320,28 @@ mod preprocessing {
         }
         let params = SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256,
             window: WindowFunction::BlackmanHarris2,
         };
-        let mut resampler = SincFixedIn::<f32>::new(
+        let n_in = samples.len();
+        let mut resampler = Async::<f32>::new_sinc(
             SAMPLE_RATE as f64 / in_rate as f64,
             2.0,
-            params,
-            samples.len(),
+            &params,
+            n_in,
             1,
+            FixedAsync::Input,
         )
         .map_err(|e| Error::InferenceError(format!("resampler init: {}", e)))?;
         let waves_in = vec![samples];
+        let input = SequentialSliceOfVecs::new(&waves_in, 1, n_in)
+            .map_err(|e| Error::InferenceError(format!("resample input: {}", e)))?;
         let waves_out = resampler
-            .process(&waves_in, None)
+            .process(&input, None)
             .map_err(|e| Error::InferenceError(format!("resample: {}", e)))?;
-        Ok(waves_out.into_iter().next().unwrap_or_default())
+        Ok(waves_out.take_data())
     }
 
     /// Pad or truncate to exactly N_SAMPLES (30s @ 16 kHz). Whisper's
@@ -575,8 +558,8 @@ mod onnx_backend {
 
     fn discover_kv_bindings(session: &Session) -> Vec<KvCacheBinding> {
         let mut out = Vec::new();
-        let input_names: Vec<&str> = session.inputs.iter().map(|i| i.name.as_str()).collect();
-        let output_names: Vec<&str> = session.outputs.iter().map(|o| o.name.as_str()).collect();
+        let input_names: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
+        let output_names: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
         for inp in &input_names {
             if let Some(suffix) = inp.strip_prefix("past_key_values.") {
                 let present_name = format!("present.{}", suffix);
@@ -633,14 +616,14 @@ mod onnx_backend {
             let decoder = load_session(decoder_path)?;
             let kv_bindings = discover_kv_bindings(&decoder);
             let encoder_input_name = encoder
-                .inputs
+                .inputs()
                 .first()
-                .map(|i| i.name.clone())
+                .map(|i| i.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("encoder has no inputs".to_string()))?;
             let encoder_output_name = encoder
-                .outputs
+                .outputs()
                 .first()
-                .map(|o| o.name.clone())
+                .map(|o| o.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("encoder has no outputs".to_string()))?;
             let (
                 decoder_input_ids_name,
@@ -802,14 +785,14 @@ mod onnx_backend {
             let decoder = load_session(decoder_path)?;
             let kv_bindings = discover_kv_bindings(&decoder);
             let encoder_input_name = encoder
-                .inputs
+                .inputs()
                 .first()
-                .map(|i| i.name.clone())
+                .map(|i| i.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("encoder has no inputs".to_string()))?;
             let encoder_output_name = encoder
-                .outputs
+                .outputs()
                 .first()
-                .map(|o| o.name.clone())
+                .map(|o| o.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("encoder has no outputs".to_string()))?;
             let (
                 decoder_input_ids_name,
@@ -1131,11 +1114,11 @@ mod onnx_backend {
     /// istupakov export and are rejected.
     fn discover_state_shape(session: &Session, name: &str) -> Result<(usize, usize, usize)> {
         let input = session
-            .inputs
+            .inputs()
             .iter()
-            .find(|i| i.name == name)
+            .find(|i| i.name() == name)
             .ok_or_else(|| Error::InvalidModel(format!("decoder_joint missing {} input", name)))?;
-        let dims: Vec<i64> = match &input.input_type {
+        let dims: Vec<i64> = match &input.dtype() {
             ort::value::ValueType::Tensor { shape, .. } => shape.iter().copied().collect(),
             _ => {
                 return Err(Error::InvalidModel(format!(
@@ -1655,11 +1638,11 @@ mod onnx_backend {
     /// input shape `[L, B, T, H]`. `L_kv` (dim 2) is dynamic.
     fn discover_canary_mems_shape(session: &Session) -> Result<(usize, usize)> {
         let input = session
-            .inputs
+            .inputs()
             .iter()
-            .find(|i| i.name == "decoder_mems")
+            .find(|i| i.name() == "decoder_mems")
             .ok_or_else(|| Error::InvalidModel("decoder missing 'decoder_mems' input".into()))?;
-        let dims: Vec<i64> = match &input.input_type {
+        let dims: Vec<i64> = match &input.dtype() {
             ort::value::ValueType::Tensor { shape, .. } => shape.iter().copied().collect(),
             _ => {
                 return Err(Error::InvalidModel(
@@ -1998,7 +1981,7 @@ mod onnx_backend {
     /// substring match for unconventional exports. `use_cache_branch` is
     /// optional — non-merged decoder exports omit it.
     fn resolve_decoder_io(session: &Session) -> Result<(String, String, Option<String>)> {
-        let names: Vec<&str> = session.inputs.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
         let exact = |needle: &str| -> Option<String> {
             names
                 .iter()

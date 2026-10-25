@@ -310,7 +310,7 @@ mod onnx_backend {
             let enc_outputs: Vec<(String, Vec<i64>, Vec<f32>)> = {
                 let mut session = self.image_encoder.lock();
                 let output_names: Vec<String> =
-                    session.outputs.iter().map(|o| o.name.clone()).collect();
+                    session.outputs().iter().map(|o| o.name().to_string()).collect();
                 let outputs = session
                     .run(ort::inputs!["image" => image_tensor])
                     .map_err(|e| Error::InferenceError(format!("image encoder run: {}", e)))?;

@@ -167,9 +167,9 @@ mod onnx_backend {
             let decoder = crate::session::build_onnx_session(decoder_path.as_ref(), "decoder")?;
 
             let encoder_input_name = encoder
-                .inputs
+                .inputs()
                 .first()
-                .map(|i| i.name.clone())
+                .map(|i| i.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("encoder has no inputs".to_string()))?;
 
             Ok(Self {
@@ -388,11 +388,11 @@ mod onnx_backend {
             let enc_outputs: Vec<(String, Vec<i64>, Vec<f32>)> = {
                 let mut session = self.encoder.lock();
                 // Snapshot output names before run() takes a mutable borrow on
-                // session — session.outputs is borrowed immutably, and the
+                // session — session.outputs() is borrowed immutably, and the
                 // SessionOutputs returned by run() holds the &mut for the rest
                 // of this scope.
                 let output_names: Vec<String> =
-                    session.outputs.iter().map(|o| o.name.clone()).collect();
+                    session.outputs().iter().map(|o| o.name().to_string()).collect();
                 let outputs = session
                     .run(ort::inputs![self.encoder_input_name.as_str() => image_tensor])
                     .map_err(|e| Error::InferenceError(format!("encoder run: {}", e)))?;

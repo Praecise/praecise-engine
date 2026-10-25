@@ -734,8 +734,7 @@ fn main() {
         // Extract include paths by checking compiler's environment
         // cc crate sets up MSVC environment internally
         let env_include = compiler
-            .env()
-            .iter()
+            .get_envs()
             .find(|(k, _)| k.eq_ignore_ascii_case("INCLUDE"))
             .map(|(_, v)| v);
 

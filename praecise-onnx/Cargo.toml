@@ -10,27 +10,28 @@ thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-parking_lot = "0.12"
-base64 = "0.22"
+parking_lot = "0.13"
+base64 = "0.23"
 # ONNX Runtime. `download-binaries` fetches a prebuilt runtime where one
 # exists; a target with no prebuilt CUDA download links a CUDA ONNX Runtime
 # through ORT_LIB_LOCATION. `copy-dylibs` places the execution-provider
 # libraries (libonnxruntime_providers_*.so) next to the built binary.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
   "std",
   "ndarray",
   "download-binaries",
+  "tls-rustls",
   "copy-dylibs",
 ] }
-ndarray = "0.16"
+ndarray = "0.17"
 # Image decode and resize for vision, detection and segmentation inputs.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Tokenizers for text encoders and speech decoders. `onig` enables the
 # SentencePiece pre-tokenizer used by XLM-R-family models.
-tokenizers = { version = "0.20", default-features = false, features = ["onig", "esaxx_fast"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig", "esaxx_fast"] }
 # Audio decode, resample and FFT for speech-to-text.
 hound = "3.5"
-symphonia = { version = "0.5", default-features = false, features = [
+symphonia = { version = "0.6", default-features = false, features = [
   "mp3",
   "flac",
   "wav",
@@ -38,11 +39,11 @@ symphonia = { version = "0.5", default-features = false, features = [
   "ogg",
   "vorbis",
 ] }
-rubato = "0.16"
+rubato = "5"
 realfft = "3.4"
 # Probes whether the TensorRT runtime library is installed, so a CUDA build
 # puts the TensorRT execution provider ahead of CUDA only where it can load.
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

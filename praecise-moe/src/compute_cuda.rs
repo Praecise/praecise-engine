@@ -22,13 +22,13 @@ use parking_lot::Mutex;
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::CudaDevice;
+use cudarc::driver::{CudaContext, CudaStream};
 
 use crate::compute::{ExpertCompute, Weight};
 
 /// A CUDA device + cuBLAS handle.
 pub struct CudaCompute {
-    dev: std::sync::Arc<CudaDevice>,
+    stream: std::sync::Arc<CudaStream>,
     blas: CudaBlas,
     /// cuBLAS handle is not `Sync` for concurrent submission; serialize.
     lock: Mutex<()>,
@@ -43,10 +43,11 @@ impl CudaCompute {
     /// Try to initialize CUDA device 0 and a cuBLAS handle. Returns `None`
     /// when no device is present or driver init fails.
     pub fn try_new() -> Option<Self> {
-        let dev = CudaDevice::new(0).ok()?;
-        let blas = CudaBlas::new(dev.clone()).ok()?;
+        let ctx = CudaContext::new(0).ok()?;
+        let stream = ctx.default_stream();
+        let blas = CudaBlas::new(stream.clone()).ok()?;
         Some(Self {
-            dev,
+            stream,
             blas,
             lock: Mutex::new(()),
         })
@@ -59,9 +60,9 @@ impl CudaCompute {
 
         let x_contig: Vec<f32> = x.iter().copied().collect();
 
-        let x_dev = self.dev.htod_sync_copy(&x_contig).expect("htod x");
-        let w_dev = self.dev.htod_sync_copy(w_rowmajor).expect("htod w");
-        let mut y_dev = self.dev.alloc_zeros::<f32>(n * m).expect("alloc y");
+        let x_dev = self.stream.clone_htod(&x_contig).expect("htod x");
+        let w_dev = self.stream.clone_htod(w_rowmajor).expect("htod w");
+        let mut y_dev = self.stream.alloc_zeros::<f32>(n * m).expect("alloc y");
 
         // Column-major view: X row-major [n,k] == col-major [k,n];
         // W row-major [m,k] == col-major [k,m]. We compute
@@ -88,7 +89,7 @@ impl CudaCompute {
                 .expect("cublas sgemm");
         }
 
-        let out = self.dev.dtoh_sync_copy(&y_dev).expect("dtoh y");
+        let out = self.stream.clone_dtoh(&y_dev).expect("dtoh y");
         Array2::from_shape_vec((n, m), out).expect("shape matches n*m")
     }
 }

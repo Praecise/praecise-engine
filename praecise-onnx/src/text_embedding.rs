@@ -437,7 +437,7 @@ mod onnx_backend {
             let session = crate::session::build_onnx_session(onnx_path.as_ref(), "model")?;
 
             // Introspect inputs.
-            let input_names: Vec<String> = session.inputs.iter().map(|i| i.name.clone()).collect();
+            let input_names: Vec<String> = session.inputs().iter().map(|i| i.name().to_string()).collect();
             let input_ids_name = pick_input(&input_names, &["input_ids"]).ok_or_else(|| {
                 Error::InvalidModel("ONNX model is missing 'input_ids' input".to_string())
             })?;
@@ -462,11 +462,11 @@ mod onnx_backend {
                 }
                 if kv_shape.is_none() {
                     let key_input = session
-                        .inputs
+                        .inputs()
                         .iter()
-                        .find(|i| i.name == key_name)
+                        .find(|i| i.name() == key_name)
                         .expect("just matched by name");
-                    if let ValueType::Tensor { shape, .. } = &key_input.input_type
+                    if let ValueType::Tensor { shape, .. } = &key_input.dtype()
                         && shape.len() == 4
                         && shape[1] > 0
                         && shape[3] > 0
@@ -489,7 +489,7 @@ mod onnx_backend {
             // family asks for it; otherwise read `last_hidden_state` and
             // pool here.
             let output_names: Vec<String> =
-                session.outputs.iter().map(|o| o.name.clone()).collect();
+                session.outputs().iter().map(|o| o.name().to_string()).collect();
             let (output_name, output_is_pooled) = match family {
                 TextEncoderFamily::SentenceEmbedding => {
                     let n =

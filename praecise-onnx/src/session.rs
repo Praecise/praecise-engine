@@ -34,10 +34,14 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use ort::execution_providers::{
-    CPUExecutionProvider, CUDAExecutionProvider, CoreMLExecutionProvider, ExecutionProvider,
-    MIGraphXExecutionProvider, ROCmExecutionProvider, TensorRTExecutionProvider,
-};
+#[cfg(feature = "coreml")]
+use ort::ep::CoreML;
+#[cfg(feature = "cuda")]
+use ort::ep::{CUDA, TensorRT};
+use ort::ep::{CPU, ExecutionProvider};
+#[cfg(feature = "rocm")]
+use ort::ep::{MIGraphX, ROCm};
+use ort::environment::Environment;
 use ort::session::Session;
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use serde::{Deserialize, Serialize};
@@ -261,10 +265,10 @@ pub fn plan_providers(facts: &ProviderFacts) -> std::result::Result<Vec<Accelera
     Ok(Vec::new())
 }
 
-/// Whether the linked ONNX Runtime lists `provider`.
-fn provider_listed<P: ExecutionProvider>(provider: &P) -> std::result::Result<bool, String> {
-    provider
-        .is_available()
+/// Whether the linked ONNX Runtime lists the provider `P`.
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm", feature = "coreml")), allow(dead_code))]
+fn provider_listed<P: ExecutionProvider>() -> std::result::Result<bool, String> {
+    P::is_available()
         .map_err(|e| format!("could not list ONNX Runtime execution providers: {e}"))
 }
 
@@ -296,12 +300,20 @@ fn gather_facts() -> std::result::Result<ProviderFacts, String> {
     let rocm_build = cfg!(feature = "rocm");
     let vulkan_build = cfg!(feature = "vulkan");
     let coreml_build = cfg!(feature = "coreml");
-    let cuda_provider = cuda_build && provider_listed(&CUDAExecutionProvider::default())?;
-    let tensorrt_provider = cuda_build && provider_listed(&TensorRTExecutionProvider::default())?;
+    // the provider types exist only in a build with their feature
+    #[cfg(feature = "cuda")]
+    let (cuda_provider, tensorrt_provider) = (provider_listed::<CUDA>()?, provider_listed::<TensorRT>()?);
+    #[cfg(not(feature = "cuda"))]
+    let (cuda_provider, tensorrt_provider) = (false, false);
     let tensorrt_runtime = tensorrt_provider && tensorrt_runtime_loadable();
-    let rocm_provider = rocm_build && provider_listed(&ROCmExecutionProvider::default())?;
-    let migraphx_provider = rocm_build && provider_listed(&MIGraphXExecutionProvider::default())?;
-    let coreml_provider = coreml_build && provider_listed(&CoreMLExecutionProvider::default())?;
+    #[cfg(feature = "rocm")]
+    let (rocm_provider, migraphx_provider) = (provider_listed::<ROCm>()?, provider_listed::<MIGraphX>()?);
+    #[cfg(not(feature = "rocm"))]
+    let (rocm_provider, migraphx_provider) = (false, false);
+    #[cfg(feature = "coreml")]
+    let coreml_provider = provider_listed::<CoreML>()?;
+    #[cfg(not(feature = "coreml"))]
+    let coreml_provider = false;
     Ok(ProviderFacts {
         cuda_gpu,
         cuda_build,
@@ -316,6 +328,21 @@ fn gather_facts() -> std::result::Result<ProviderFacts, String> {
         coreml_build,
         coreml_provider,
     })
+}
+
+static ORT_ENV: OnceLock<std::result::Result<Environment, String>> = OnceLock::new();
+
+/// The process's ONNX Runtime environment, created on first use.
+fn ort_environment() -> Result<&'static Environment> {
+    ORT_ENV
+        .get_or_init(|| {
+            ort::init()
+                .with_name("praecise")
+                .build()
+                .map_err(|e| format!("ONNX Runtime environment: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| Error::InvalidModel(e.clone()))
 }
 
 static PLAN: OnceLock<std::result::Result<Vec<Accelerator>, String>> = OnceLock::new();
@@ -352,16 +379,31 @@ pub fn verify_accelerators() -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "coreml")),
+    allow(unused_variables)
+)]
 fn register(
     accelerator: Accelerator,
     builder: &mut SessionBuilder,
 ) -> std::result::Result<(), ort::Error> {
     match accelerator {
-        Accelerator::TensorRt => TensorRTExecutionProvider::default().register(builder),
-        Accelerator::Cuda => CUDAExecutionProvider::default().register(builder),
-        Accelerator::MiGraphX => MIGraphXExecutionProvider::default().register(builder),
-        Accelerator::Rocm => ROCmExecutionProvider::default().register(builder),
-        Accelerator::CoreMl => CoreMLExecutionProvider::default().register(builder),
+        #[cfg(feature = "cuda")]
+        Accelerator::TensorRt => TensorRT::default().register(builder),
+        #[cfg(feature = "cuda")]
+        Accelerator::Cuda => CUDA::default().register(builder),
+        #[cfg(feature = "rocm")]
+        Accelerator::MiGraphX => MIGraphX::default().register(builder),
+        #[cfg(feature = "rocm")]
+        Accelerator::Rocm => ROCm::default().register(builder),
+        #[cfg(feature = "coreml")]
+        Accelerator::CoreMl => CoreML::default().register(builder),
+        // the plan only names providers of this build
+        #[allow(unreachable_patterns)]
+        other => Err(ort::Error::new(format!(
+            "the {} execution provider is not built into this binary",
+            other.name()
+        ))),
     }
     .map_err(ort::Error::from)
 }
@@ -374,12 +416,16 @@ fn register(
 /// session, so one long input (a video of several thousand tokens) would
 /// hold its peak for as long as the model stays loaded.
 fn session_builder(settings: &OnnxSettings) -> Result<SessionBuilder> {
-    let mut builder = Session::builder()
-        .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-        .and_then(|b| b.with_intra_threads(settings.threads))
-        .and_then(|b| b.with_inter_threads(settings.threads))
-        .map_err(|e| Error::InvalidModel(format!("ORT session builder: {e}")))?;
-    CPUExecutionProvider::default()
+    let builder_error = |e: &dyn std::fmt::Display| Error::InvalidModel(format!("ORT session builder: {e}"));
+    let mut builder = Session::builder(ort_environment()?)
+        .map_err(|e| builder_error(&e))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| builder_error(&e))?
+        .with_intra_threads(settings.threads)
+        .map_err(|e| builder_error(&e))?
+        .with_inter_threads(settings.threads)
+        .map_err(|e| builder_error(&e))?;
+    CPU::default()
         .with_arena_allocator(false)
         .register(&mut builder)
         .map_err(|e| Error::InvalidModel(format!("ORT session builder: {e}")))?;

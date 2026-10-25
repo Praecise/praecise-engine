@@ -136,7 +136,7 @@ pub(crate) fn new_call_id() -> String {
     let mut bytes = [0u8; 12];
     // An id only has to be unique within a conversation; on the rare
     // platform without an entropy source the zero id is still well formed.
-    let _ = getrandom::getrandom(&mut bytes);
+    let _ = getrandom::fill(&mut bytes);
     format!("call_{}", hex::encode(bytes))
 }
 

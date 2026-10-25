@@ -157,15 +157,15 @@ mod onnx_backend {
             let session = crate::session::build_onnx_session(path.as_ref(), "model")?;
 
             let input_name = session
-                .inputs
+                .inputs()
                 .first()
-                .map(|i| i.name.clone())
+                .map(|i| i.name().to_string())
                 .ok_or_else(|| Error::InvalidModel("ONNX model has no inputs".to_string()))?;
             let resolved_output_name = match output_name {
                 Some(name) => {
-                    if !session.outputs.iter().any(|o| o.name == name) {
+                    if !session.outputs().iter().any(|o| o.name() == name) {
                         let available: Vec<&str> =
-                            session.outputs.iter().map(|o| o.name.as_str()).collect();
+                            session.outputs().iter().map(|o| o.name()).collect();
                         return Err(Error::InvalidModel(format!(
                             "ONNX output '{}' not found; available outputs: {:?}",
                             name, available
@@ -174,9 +174,9 @@ mod onnx_backend {
                     name
                 }
                 None => session
-                    .outputs
+                    .outputs()
                     .first()
-                    .map(|o| o.name.clone())
+                    .map(|o| o.name().to_string())
                     .ok_or_else(|| Error::InvalidModel("ONNX model has no outputs".to_string()))?,
             };
 
@@ -282,15 +282,15 @@ mod onnx_backend {
                 "future_covariates",
                 "future_covariates_mask",
             ] {
-                if !session.inputs.iter().any(|i| i.name == required) {
-                    let found: Vec<&str> = session.inputs.iter().map(|i| i.name.as_str()).collect();
+                if !session.inputs().iter().any(|i| i.name() == required) {
+                    let found: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
                     return Err(Error::InvalidModel(format!(
                         "not a Chronos-2 graph: missing input '{required}'; found {found:?}"
                     )));
                 }
             }
-            if !session.outputs.iter().any(|o| o.name == "quantile_preds") {
-                let found: Vec<&str> = session.outputs.iter().map(|o| o.name.as_str()).collect();
+            if !session.outputs().iter().any(|o| o.name() == "quantile_preds") {
+                let found: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
                 return Err(Error::InvalidModel(format!(
                     "not a Chronos-2 graph: missing output 'quantile_preds'; found {found:?}"
                 )));
@@ -538,15 +538,15 @@ mod onnx_backend {
         ) -> Result<Self> {
             let session = crate::session::build_onnx_session(path.as_ref(), "model")?;
             for required in T0_INPUTS {
-                if !session.inputs.iter().any(|i| i.name == required) {
-                    let found: Vec<&str> = session.inputs.iter().map(|i| i.name.as_str()).collect();
+                if !session.inputs().iter().any(|i| i.name() == required) {
+                    let found: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
                     return Err(Error::InvalidModel(format!(
                         "not a grouped t0 graph: missing input '{required}'; found {found:?}"
                     )));
                 }
             }
-            if !session.outputs.iter().any(|o| o.name == "quantiles") {
-                let found: Vec<&str> = session.outputs.iter().map(|o| o.name.as_str()).collect();
+            if !session.outputs().iter().any(|o| o.name() == "quantiles") {
+                let found: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
                 return Err(Error::InvalidModel(format!(
                     "not a grouped t0 graph: missing output 'quantiles'; found {found:?}"
                 )));

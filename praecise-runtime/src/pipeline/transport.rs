@@ -79,10 +79,14 @@ impl std::fmt::Debug for SecureWriter {
     }
 }
 
+fn key_from(bytes: &[u8]) -> std::io::Result<Key> {
+    Key::try_from(bytes).map_err(|_| std::io::Error::other("derived key has the wrong length"))
+}
+
 fn nonce(counter: u64) -> Nonce {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&counter.to_le_bytes());
-    *Nonce::from_slice(&n)
+    Nonce::from(n)
 }
 
 impl SecureWriter {
@@ -261,8 +265,8 @@ pub fn handshake(
 
     let mut secret_bytes = [0u8; 32];
     let mut nonce_bytes = [0u8; 32];
-    getrandom::getrandom(&mut secret_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
-    getrandom::getrandom(&mut nonce_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut secret_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut nonce_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
     let secret = StaticSecret::from(secret_bytes);
     secret_bytes.zeroize();
     let ours = PublicKey::from(&secret);
@@ -337,10 +341,10 @@ pub fn handshake(
     stream.set_write_timeout(None)?;
     let reader = SecureReader {
         stream: stream.try_clone()?,
-        cipher: ChaCha20Poly1305::new(Key::from_slice(&k_recv[..])),
+        cipher: ChaCha20Poly1305::new(&key_from(&k_recv[..])?),
         counter: 0,
     };
-    let writer = SecureWriter { stream, cipher: ChaCha20Poly1305::new(Key::from_slice(&k_send[..])), counter: 0 };
+    let writer = SecureWriter { stream, cipher: ChaCha20Poly1305::new(&key_from(&k_send[..])?), counter: 0 };
     Ok((reader, writer))
 }
 

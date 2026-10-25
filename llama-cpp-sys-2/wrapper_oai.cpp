@@ -331,7 +331,7 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
         }
 
         auto params = common_chat_templates_apply(tmpls.get(), inputs);
-        out_result->prompt = llama_rs_dup_string(params.prompt);
+        out_result->prompt = llama_rs_dup_string(params.prompt.str());
         if (!params.grammar.empty()) {
             out_result->grammar = llama_rs_dup_string(params.grammar);
         }
@@ -471,7 +471,7 @@ static llama_rs_status apply_chat_template_oaicompat(
         }
 
         auto params_out = common_chat_templates_apply(tmpls.get(), inputs);
-        out_result->prompt = llama_rs_dup_string(params_out.prompt);
+        out_result->prompt = llama_rs_dup_string(params_out.prompt.str());
         if (!params_out.grammar.empty()) {
             out_result->grammar = llama_rs_dup_string(params_out.grammar);
         }

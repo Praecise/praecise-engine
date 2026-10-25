@@ -131,12 +131,12 @@ mod onnx_backend {
             let mut image_input_name = None;
             let mut orig_size_input_name = None;
 
-            for inp in &session.inputs {
-                let n = inp.name.as_str();
+            for inp in session.inputs() {
+                let n = inp.name();
                 if n == "orig_target_sizes" {
-                    orig_size_input_name = Some(inp.name.clone());
+                    orig_size_input_name = Some(inp.name().to_string());
                 } else if image_input_name.is_none() {
-                    image_input_name = Some(inp.name.clone());
+                    image_input_name = Some(inp.name().to_string());
                 }
             }
 

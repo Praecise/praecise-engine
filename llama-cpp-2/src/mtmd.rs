@@ -1138,7 +1138,23 @@ impl MtmdContext {
         }
         let info = unsafe { llama_cpp_sys_2::mtmd_gen_audio_get_info(self.context.as_ptr()) };
         let rate = u32::try_from(info.sample_rate).map_err(|_| MtmdGenAudioError::Step(info.sample_rate))?;
-        let mut state: Vec<u8> = Vec::new();
+        // one decoder state for the whole stream; a fresh state is the cold start
+        let state = unsafe {
+            llama_cpp_sys_2::mtmd_gen_state_init(
+                self.context.as_ptr(),
+                llama_cpp_sys_2::mtmd_gen_state_params_default(),
+            )
+        };
+        if state.is_null() {
+            return Err(MtmdGenAudioError::Step(-1));
+        }
+        struct StateGuard(*mut llama_cpp_sys_2::mtmd_gen_state);
+        impl Drop for StateGuard {
+            fn drop(&mut self) {
+                unsafe { llama_cpp_sys_2::mtmd_gen_state_free(self.0) };
+            }
+        }
+        let state = StateGuard(state);
         let mut pcm = Vec::new();
         for chunk in codes.chunks(per_frame * window) {
             let mut frames = chunk.to_vec();
@@ -1146,21 +1162,14 @@ impl MtmdContext {
             inp.type_ = llama_cpp_sys_2::MTMD_GEN_PROCESS_TYPE_GEN_WAV;
             inp.codes = frames.as_mut_ptr();
             inp.n_codes = frames.len();
-            inp.state_data = if state.is_empty() { std::ptr::null() } else { state.as_ptr().cast() };
-            inp.state_size = state.len();
             let mut out: llama_cpp_sys_2::mtmd_gen_out = unsafe { std::mem::zeroed() };
-            let code = unsafe { llama_cpp_sys_2::mtmd_gen_audio_process(self.context.as_ptr(), &raw const inp, &raw mut out) };
+            let code = unsafe { llama_cpp_sys_2::mtmd_gen_audio_process(self.context.as_ptr(), state.0, &raw const inp, &raw mut out) };
             if code != 0 {
                 return Err(MtmdGenAudioError::Step(code));
             }
             if !out.audio.is_null() && out.n_samples > 0 {
                 pcm.extend_from_slice(unsafe { slice::from_raw_parts(out.audio, out.n_samples) });
             }
-            state = if out.state_data.is_null() {
-                Vec::new()
-            } else {
-                unsafe { slice::from_raw_parts(out.state_data.cast::<u8>(), out.state_size) }.to_vec()
-            };
         }
         Ok((rate, pcm))
     }
@@ -1287,6 +1296,7 @@ impl MtmdGenAudio {
             top_p: input.top_p,
             seed: input.seed,
             out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
+            stream: false,
         };
         match unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_set_input(self.ptr.as_ptr(), &raw const inp) } {
             0 => Ok(()),
@@ -1322,6 +1332,7 @@ impl MtmdGenAudio {
             top_p: cond.top_p,
             seed: cond.seed,
             out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
+            stream: false,
         };
         let c = llama_cpp_sys_2::mtmd_helper_gen_audio_cond {
             tokens: tokens.as_ptr(),

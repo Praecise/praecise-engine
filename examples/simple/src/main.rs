@@ -8,7 +8,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::HFClientSync;
+use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -126,18 +127,39 @@ enum Model {
     },
 }
 
+/// Prints the download progress of each file to stderr.
+struct DownloadProgress;
+
+impl ProgressHandler for DownloadProgress {
+    fn on_progress(&self, event: &ProgressEvent) {
+        match event {
+            ProgressEvent::Download(DownloadEvent::Progress { files }) => {
+                for file in files.iter().filter(|f| f.total_bytes > 0) {
+                    eprint!("\r{} {:>3}%", file.filename, file.bytes_completed * 100 / file.total_bytes);
+                }
+            }
+            ProgressEvent::Download(DownloadEvent::Complete) => eprintln!(),
+            _ => {}
+        }
+    }
+}
+
 impl Model {
     /// Convert the model to a path - may download from huggingface
     fn get_or_load(self) -> Result<PathBuf> {
         match self {
             Model::Local { path } => Ok(path),
-            Model::HuggingFace { model, repo } => ApiBuilder::new()
-                .with_progress(true)
-                .build()
-                .with_context(|| "unable to create huggingface api")?
-                .model(repo)
-                .get(&model)
-                .with_context(|| "unable to download model"),
+            Model::HuggingFace { model, repo } => {
+                let (owner, name) = hf_hub::split_id(&repo);
+                HFClientSync::new()
+                    .with_context(|| "unable to create huggingface api")?
+                    .model(owner, name)
+                    .download_file()
+                    .filename(model)
+                    .progress(DownloadProgress)
+                    .send()
+                    .with_context(|| "unable to download model")
+            }
         }
     }
 }

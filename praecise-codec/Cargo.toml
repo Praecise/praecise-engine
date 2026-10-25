@@ -9,7 +9,7 @@ description = "Praecise Engine video codecs: in-process H.264, H.265 and AV1 dec
 thiserror = "2"
 libc = "0.2"
 # H.264 encode, built from the bundled source (BSD-2-Clause).
-openh264 = { version = "0.9.8", default-features = false, features = ["source"] }
+openh264 = { version = "0.9.9", default-features = false, features = ["source"] }
 # H.264 and H.265 decode, pure Rust (MIT OR Apache-2.0).
 rust_h264 = "0.4.0"
 rust_h265 = "0.1.0"
