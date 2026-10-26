@@ -284,7 +284,7 @@ fn tensorrt_runtime_loadable() -> bool {
     // the handle is dropped immediately and no symbol is called through it.
     NAMES
         .iter()
-        .any(|name| unsafe { libloading::Library::new(name) }.is_ok())
+        .any(|name| unsafe { libloading::Library::new(*name) }.is_ok())
 }
 
 #[cfg(not(feature = "cuda"))]

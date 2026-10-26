@@ -7,6 +7,7 @@ members = [
   "praecise-diffusion",
   "praecise-codec",
   "praecise-onnx",
+  "praecise-perception",
   "praecise-moe",
   "praecise-provenance",
   "praecise-train",

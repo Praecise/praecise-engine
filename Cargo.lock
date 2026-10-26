@@ -3440,6 +3440,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "praecise-perception"
+version = "0.1.0"
+dependencies = [
+ "praecise-codec",
+ "praecise-onnx",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "praecise-provenance"
 version = "0.1.0"
 dependencies = [

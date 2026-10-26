@@ -201,6 +201,85 @@ mod onnx_backend {
         }
     }
 
+    impl GenericDetrDetector {
+        /// Detect objects in one decoded frame: `rgb` holds `width * height`
+        /// row-major 8-bit RGB pixels, as a video decoder returns them. The
+        /// frame is resampled bilinearly to the model's input size; boxes come
+        /// back in the frame's pixel coordinates.
+        ///
+        /// # Errors
+        /// When `rgb` does not hold `width * height` pixels, or inference fails.
+        pub fn detect_rgb(&self, rgb: &[u8], width: u32, height: u32, score_threshold: f32) -> Result<DetectResult> {
+            let start = Instant::now();
+            let arr = preprocess_rgb(self.family, self.input_size, rgb, width, height)?;
+            let image_tensor = Tensor::from_array(arr)
+                .map_err(|e| Error::InferenceError(format!("ORT tensor: {}", e)))?;
+            let detections = match self.family {
+                DetrFamily::RfDetr => self.run_rfdetr(image_tensor, width, height, score_threshold)?,
+                DetrFamily::DFine => self.run_dfine(image_tensor, width, height, score_threshold)?,
+            };
+            Ok(DetectResult {
+                detections,
+                generation_time_ms: start.elapsed().as_millis() as u64,
+            })
+        }
+    }
+
+    /// Bilinear resample of a raw RGB frame straight into a `[1, 3, S, S]`
+    /// model input, normalised for the family.
+    pub(super) fn preprocess_rgb(
+        family: DetrFamily,
+        input_size: u32,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Array4<f32>> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 || rgb.len() != w * h * 3 {
+            return Err(Error::InvalidModel(format!(
+                "a {width}x{height} RGB frame needs {} bytes, got {}",
+                w * h * 3,
+                rgb.len()
+            )));
+        }
+        let size = input_size as usize;
+        let (mean, std) = match family {
+            DetrFamily::RfDetr => (IMAGENET_MEAN, IMAGENET_STD),
+            DetrFamily::DFine => ([0.0; 3], [1.0; 3]),
+        };
+        let scale = [1.0 / (255.0 * std[0]), 1.0 / (255.0 * std[1]), 1.0 / (255.0 * std[2])];
+        let offset = [mean[0] / std[0], mean[1] / std[1], mean[2] / std[2]];
+        // source pixels and weight for each output column or row, pixel centres aligned
+        let taps = |n_out: usize, n_in: usize| -> Vec<(usize, usize, f32)> {
+            (0..n_out)
+                .map(|o| {
+                    let x = ((o as f32 + 0.5) * n_in as f32 / n_out as f32 - 0.5).max(0.0);
+                    let x0 = (x.floor() as usize).min(n_in - 1);
+                    let x1 = (x0 + 1).min(n_in - 1);
+                    (x0, x1, x - x0 as f32)
+                })
+                .collect()
+        };
+        let cols = taps(size, w);
+        let rows = taps(size, h);
+        let mut arr = Array4::<f32>::zeros((1, 3, size, size));
+        let plane = size * size;
+        let out = arr.as_slice_mut().expect("standard layout");
+        for (oy, &(y0, y1, fy)) in rows.iter().enumerate() {
+            let r0 = &rgb[y0 * w * 3..(y0 + 1) * w * 3];
+            let r1 = &rgb[y1 * w * 3..(y1 + 1) * w * 3];
+            for (ox, &(x0, x1, fx)) in cols.iter().enumerate() {
+                for c in 0..3 {
+                    let a = f32::from(r0[x0 * 3 + c]) * (1.0 - fx) + f32::from(r0[x1 * 3 + c]) * fx;
+                    let b = f32::from(r1[x0 * 3 + c]) * (1.0 - fx) + f32::from(r1[x1 * 3 + c]) * fx;
+                    let v = a * (1.0 - fy) + b * fy;
+                    out[c * plane + oy * size + ox] = v * scale[c] - offset[c];
+                }
+            }
+        }
+        Ok(arr)
+    }
+
     /// Numerically stable sigmoid.
     #[inline]
     fn sigmoid(x: f32) -> f32 {
@@ -516,6 +595,30 @@ pub use onnx_backend::GenericDetrDetector;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_raw_frame_is_resampled_and_normalised() {
+        // a 4x2 frame: left half black, right half white
+        let mut rgb = Vec::new();
+        for _y in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 0u8 } else { 255u8 };
+                rgb.extend_from_slice(&[v, v, v]);
+            }
+        }
+        let arr = onnx_backend::preprocess_rgb(DetrFamily::DFine, 4, &rgb, 4, 2).unwrap();
+        assert_eq!(arr.shape(), &[1, 3, 4, 4]);
+        for c in 0..3 {
+            for y in 0..4 {
+                assert!((arr[[0, c, y, 0]] - 0.0).abs() < 1e-6);
+                assert!((arr[[0, c, y, 3]] - 1.0).abs() < 1e-6);
+            }
+        }
+        let norm = onnx_backend::preprocess_rgb(DetrFamily::RfDetr, 4, &rgb, 4, 2).unwrap();
+        assert!((norm[[0, 0, 0, 0]] - (0.0 - 0.485) / 0.229).abs() < 1e-5);
+        assert!((norm[[0, 2, 0, 3]] - (1.0 - 0.406) / 0.225).abs() < 1e-5);
+        assert!(onnx_backend::preprocess_rgb(DetrFamily::RfDetr, 4, &rgb[1..], 4, 2).is_err());
+    }
 
     #[test]
     fn detection_serializes_round_trip() {
