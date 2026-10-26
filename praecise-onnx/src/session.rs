@@ -109,6 +109,18 @@ impl OnnxSettings {
 
 static SETTINGS: OnceLock<OnnxSettings> = OnceLock::new();
 static GPUS: OnceLock<Gpus> = OnceLock::new();
+static ADMISSION: OnceLock<Admission> = OnceLock::new();
+
+/// A host check every model file passes before ONNX Runtime opens it, such
+/// as a parse in a confined process. It returns why the file is refused.
+pub type Admission = fn(&Path) -> std::result::Result<(), String>;
+
+/// Install the admission check for this process. Called once at startup,
+/// before any model loads. Returns `false` when one was already installed,
+/// in which case the earlier one stays in force.
+pub fn set_admission(check: Admission) -> bool {
+    ADMISSION.set(check).is_ok()
+}
 
 /// The GPUs visible to this process, as the host detected them. The
 /// execution providers follow from these; the engine does not guess them.
@@ -333,7 +345,7 @@ fn gather_facts() -> std::result::Result<ProviderFacts, String> {
 static ORT_ENV: OnceLock<std::result::Result<Environment, String>> = OnceLock::new();
 
 /// The process's ONNX Runtime environment, created on first use.
-fn ort_environment() -> Result<&'static Environment> {
+pub(crate) fn ort_environment() -> Result<&'static Environment> {
     ORT_ENV
         .get_or_init(|| {
             ort::init()
@@ -437,7 +449,8 @@ fn session_builder(settings: &OnnxSettings) -> Result<SessionBuilder> {
 ///
 /// `what` names the artifact for error messages (e.g. `"model"`,
 /// `"encoder"`, `"decoder"`). Fails without loading when the machine's
-/// accelerator is unusable or its provider does not register.
+/// accelerator is unusable, its provider does not register, or the
+/// installed [`Admission`] check refuses the file.
 pub fn build_onnx_session(path: impl AsRef<Path>, what: &str) -> Result<Session> {
     let plan = accelerators()?;
     let mut builder = session_builder(&settings())?;
@@ -450,6 +463,9 @@ pub fn build_onnx_session(path: impl AsRef<Path>, what: &str) -> Result<Session>
             ))
         })?;
     }
+    if let Some(admit) = ADMISSION.get() {
+        admit(path.as_ref()).map_err(|e| Error::InvalidModel(format!("{what}: {e}")))?;
+    }
     builder
         .commit_from_file(path.as_ref())
         .map_err(|e| Error::ProviderNotAvailable(format!("ORT load {}: {}", what, e)))
@@ -458,6 +474,33 @@ pub fn build_onnx_session(path: impl AsRef<Path>, what: &str) -> Result<Session>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refuse_marked(path: &Path) -> std::result::Result<(), String> {
+        if path.ends_with("refused.onnx") {
+            Err("refused by the host".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_admission_check_runs_before_the_load() {
+        install(OnnxSettings::resolve(&OnnxConfig::default(), 4), Gpus::default());
+        set_admission(refuse_marked);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refused.onnx");
+        std::fs::write(&path, b"not an onnx model").unwrap();
+        match build_onnx_session(&path, "encoder") {
+            Err(Error::InvalidModel(msg)) => assert_eq!(msg, "encoder: refused by the host"),
+            other => panic!("expected the admission refusal, got {other:?}"),
+        }
+        let admitted = dir.path().join("admitted.onnx");
+        std::fs::write(&admitted, b"not an onnx model").unwrap();
+        assert!(matches!(
+            build_onnx_session(&admitted, "model"),
+            Err(Error::ProviderNotAvailable(_))
+        ));
+    }
 
     fn cuda_machine() -> ProviderFacts {
         ProviderFacts {

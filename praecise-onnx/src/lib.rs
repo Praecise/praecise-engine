@@ -17,11 +17,15 @@
 //! registers the execution provider the machine's GPU needs and refuses to
 //! load a model it cannot accelerate rather than running it on the CPU.
 //! The host declares the GPUs once with [`session::install`].
+//! A host that parses model files in a confined process first installs that
+//! check with [`session::set_admission`] and runs it there with
+//! [`parse::ParseCheck`].
 
 pub mod audio;
 pub mod detection;
 pub mod error;
 pub mod forecast;
+pub mod parse;
 pub mod segmentation;
 pub mod session;
 pub mod text_embedding;
