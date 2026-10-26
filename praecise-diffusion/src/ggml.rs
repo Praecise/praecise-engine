@@ -312,7 +312,7 @@ mod backend_tests {
     fn padding_covers_more_rows_than_one_grid_dimension() {
         // A waveform feature map: a few channels over more time steps than a
         // GPU launch holds in one grid dimension.
-        let backend = Backend::select(8).unwrap();
+        let backend = kernel_backend(8);
         let (c, t, pad) = (8usize, 70_000usize, 3usize);
         let mut g = Graph::new(&backend).unwrap();
         let x = g.input(sys::GGML_TYPE_F32, &[c as i64, t as i64]);
@@ -337,7 +337,7 @@ mod backend_tests {
     /// pipelined kernels, with and without a mask.
     #[test]
     fn attention_matches_a_direct_computation_off_the_tile_boundary() {
-        let backend = Backend::select(8).unwrap();
+        let backend = kernel_backend(8);
         let d = 128usize;
         let h = 2usize;
         for (nq, nkv, masked) in [(300usize, 333usize, false), (300, 333, true), (1000, 1037, false), (64, 65, true)] {
@@ -395,6 +395,16 @@ mod backend_tests {
             }
             assert!(worst < 5e-3, "{nq} queries over {nkv} keys (masked {masked}): max error {worst}");
         }
+    }
+
+    /// The backend a kernel check runs on: the GPU when this build has a GPU
+    /// backend, and otherwise the CPU, named explicitly. `Backend::select`
+    /// rightly refuses a CPU-only build on a host with GPU hardware, but these
+    /// checks are about the kernels the build carries, and a CPU-only build
+    /// carries the CPU ones.
+    fn kernel_backend(threads: usize) -> Backend {
+        let device = if gpu_backend_built_in() { Device::Auto } else { Device::Cpu };
+        Backend::select_device(device, threads).unwrap()
     }
 
     fn gpu_backend_built_in() -> bool {
