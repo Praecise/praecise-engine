@@ -28,7 +28,9 @@
 //! it explicitly: the same Landlock ruleset, syscall filter (internet sockets
 //! refused), `no_new_privs` and limits, without the namespaces. The host then
 //! still reaches no network and no file outside its rules, but shares the
-//! machine's process and IPC namespaces. It is never chosen automatically.
+//! machine's process and IPC namespaces, so its /proc shows the machine's
+//! processes (files there stay subject to ownership and ptrace checks) and its
+//! /dev/shm is the machine's. It is never chosen automatically.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -299,6 +301,17 @@ mod linux {
             {
                 return Err(format!("mounting /proc: {}", errno()));
             }
+            // a /dev/shm of the host's own, for POSIX semaphores and shared memory
+            let tmpfs = CString::new("tmpfs").unwrap();
+            let shm = CString::new("/dev/shm").unwrap();
+            let opts = CString::new("mode=1777,size=50%").unwrap();
+            if std::path::Path::new("/dev/shm").is_dir()
+                && unsafe {
+                    libc::mount(tmpfs.as_ptr(), shm.as_ptr(), tmpfs.as_ptr(), libc::MS_NOSUID | libc::MS_NODEV, opts.as_ptr().cast())
+                } != 0
+            {
+                return Err(format!("mounting /dev/shm: {}", errno()));
+            }
             Err(confine_and_exec(&c, &program, true))
         };
         match child() {
@@ -412,6 +425,15 @@ mod linux {
             rules.push((PathBuf::from(sys), READ));
         }
         rules.push((PathBuf::from("/dev/null"), READ | FS_WRITE_FILE));
+        // Writable files under /proc: the CUDA driver names its threads through
+        // /proc/self/task/<tid>/comm and fails to initialise when it cannot.
+        // Ownership and ptrace checks still govern every such write; with
+        // namespaces this /proc shows only the host's own processes.
+        rules.push((PathBuf::from("/proc"), READ | FS_WRITE_FILE));
+        // POSIX semaphores and shared memory (Python's multiprocessing locks
+        // among them) live in /dev/shm: with namespaces a fresh one of the
+        // host's own, without them the machine's.
+        rules.push((PathBuf::from("/dev/shm"), READ | WRITE));
         for p in &c.read_only {
             rules.push((p.clone(), READ));
         }
