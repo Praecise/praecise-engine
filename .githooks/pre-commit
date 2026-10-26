@@ -1,19 +1,30 @@
 #!/bin/sh
 # Refuse commits made under any identity other than the owner, or staging a secret.
+# gitleaks is looked up on PATH, then at $GITLEAKS, then at the newest
+# /opt/tools/gitleaks-<version>/gitleaks; when none is found the commit is refused.
 OWNER_EMAIL="hilaal@gmail.com"
 email=$(git config user.email || true)
 if [ "$email" != "$OWNER_EMAIL" ]; then
   echo "pre-commit: refused: git user.email is '$email', expected $OWNER_EMAIL" >&2
   exit 1
 fi
-if command -v gitleaks >/dev/null 2>&1; then
-  root=$(git rev-parse --show-toplevel)
-  gitleaks git --pre-commit --staged --no-banner --redact --log-level warn -c "$root/.gitleaks.toml" "$root" || {
-    echo "pre-commit: refused: gitleaks found a secret in the staged changes" >&2
+if gitleaks=$(command -v gitleaks 2>/dev/null); then :
+elif [ -n "${GITLEAKS:-}" ]; then
+  if [ ! -x "$GITLEAKS" ]; then
+    echo "pre-commit: refused: GITLEAKS is set to '$GITLEAKS', which is not an executable file" >&2
     exit 1
-  }
-elif [ "${GUARD_ALLOW_NO_GITLEAKS:-}" != 1 ]; then
-  echo "pre-commit: refused: gitleaks not installed (or set GUARD_ALLOW_NO_GITLEAKS=1)" >&2
-  exit 1
+  fi
+  gitleaks=$GITLEAKS
+else
+  gitleaks=$(for g in /opt/tools/gitleaks-*/gitleaks; do [ -x "$g" ] && echo "$g"; done | sort -V | tail -n 1)
+  if [ -z "$gitleaks" ]; then
+    echo "pre-commit: refused: gitleaks not found: not on PATH ($PATH), GITLEAKS not set, nothing at /opt/tools/gitleaks-*/gitleaks" >&2
+    exit 1
+  fi
 fi
+root=$(git rev-parse --show-toplevel)
+"$gitleaks" git --pre-commit --staged --no-banner --redact --log-level warn -c "$root/.gitleaks.toml" "$root" || {
+  echo "pre-commit: refused: gitleaks found a secret in the staged changes" >&2
+  exit 1
+}
 exit 0
