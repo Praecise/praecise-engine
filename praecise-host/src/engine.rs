@@ -267,8 +267,14 @@ mod tests {
         root
     }
 
-    fn rand_suffix() -> u128 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    /// Unique within the process. A clock reading alone is not: two tests on
+    /// parallel threads can read the same nanosecond, share a tree, and one
+    /// removes it while the other still reads it.
+    fn rand_suffix() -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        format!("{t}-{n}")
     }
 
     #[test]
