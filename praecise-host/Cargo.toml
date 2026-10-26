@@ -3,7 +3,7 @@ name = "praecise-host"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Praecise Engine runtime hosts: engines run as confined child processes (namespaces, Landlock, seccomp) spoken to over a line-delimited JSON channel on their standard streams, with streamed events."
+description = "Praecise Engine runtime hosts: model engines and job engines run as confined child processes (namespaces, Landlock, seccomp) spoken to over a line-delimited JSON channel on their standard streams, with streamed events."
 
 [dependencies]
 libc = "0.2"
@@ -24,3 +24,11 @@ harness = false
 [[test]]
 name = "engines"
 harness = false
+
+[[test]]
+name = "jobs"
+harness = false
+
+[[bin]]
+name = "praecise-job"
+path = "src/bin/praecise-job.rs"

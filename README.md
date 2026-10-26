@@ -135,6 +135,82 @@ A kernel that forbids unprivileged user namespaces (for example
 `kernel.apparmor_restrict_unprivileged_userns=1`) refuses the confinement, and
 the error names the setting; grant the application's executable `userns` in
 its AppArmor profile rather than lowering the setting for the whole machine.
+On Ubuntu that is one profile per executable, for example
+`/etc/apparmor.d/praecise-job`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+profile praecise-job /opt/praecise/bin/praecise-job flags=(unconfined) {
+  userns,
+}
+```
+
+followed by `apparmor_parser -r /etc/apparmor.d/praecise-job`. Where that is
+not possible an operator may choose `--confinement landlock-only` explicitly:
+the same Landlock ruleset and syscall filter (no internet sockets, no file
+outside the rules), without the namespaces. It is never chosen on its own.
+
+### Job engines
+
+Beside the model engines, `praecise_host::job` runs job engines: a fixed
+program with typed parameters, input files in, output files and progress out,
+run once to completion. A job engine is a pinned environment (the same
+SHA-256 tree digest, checked before every run) and one Python adapter,
+`praecise-host/adapters/praecise_job.py`, compiled into the binary and placed
+read-only beside the run's scratch directory. Every run is confined like a
+model host: no network, the environment, model caches and inputs read-only,
+one scratch directory writable, the GPU device nodes; it is supervised (time
+limit, the whole process tree stopped at the end, the last lines of its error
+output on failure); on a machine with a GPU a program refuses rather than run
+on the CPU. Parameters are checked against each program's declaration (type
+and range) before anything starts, and again by the program.
+
+The programs drive NVIDIA's open simulation systems:
+
+| Program | System | Out |
+|---|---|---|
+| `sionna.radio_map` | Sionna RT | radio_map.npz, radio_map.png |
+| `warp.example` | Warp | the example's USD stage |
+| `newton.example` | Newton | sim.usd |
+| `cosmos.generate` | Cosmos 3 (guardrail forced on) | video.mp4 |
+| `physicsnemo.darcy_fno` | PhysicsNeMo | fno_darcy.pt and its error on unseen fields |
+| `cudaq.ghz`, `cudaq.maxcut` | CUDA-Q | sampled states, the best cut against the optimum |
+| `boltz.predict` | Boltz-2 | structures, confidence, affinity |
+
+Each writes result.json. The `praecise-job` binary runs one:
+
+```
+praecise-job programs                      # the catalogue, with every parameter's type and range
+praecise-job digest /opt/envs/cudaq        # the digest to pin an environment by
+praecise-job run --engines engines.json --program cudaq.ghz --param qubits=24 --out out/
+```
+
+`engines.json` names each engine's environment and pin:
+`{"engines": {"cudaq": {"root": "/opt/envs/cudaq", "digest": "<sha256>",
+"read_only": [...], "env": {...}}}}`. Progress is printed as JSON lines and
+the last line is the result.
+
+## Perception: `praecise-perception`
+
+Video in, per-frame object tracks out, as an open replacement for a
+Metropolis/DeepStream perception pipeline. `praecise-codec` decodes the video
+in process, an ONNX detector from `praecise-onnx` (RF-DETR Nano to Large,
+Apache-2.0, or D-FINE) runs on every frame on the GPU's execution provider,
+and ByteTrack (an independent Rust implementation: Kalman prediction,
+two-stage association with low-score detections, minimum-cost assignment)
+gives every person and vehicle a stable id, box, score and velocity. With an
+image-to-ground homography each track also has a ground position and speed
+in metres. Frames can be written as NVIDIA Metropolis `nv.Frame` protobuf
+messages, the input Halos Safety Core reads.
+
+```
+praecise-track --model rfdetr-medium.onnx --input-size 576 --video in.mp4 --out out/ --nvframe
+```
+
+writes `tracks.json`, `summary.json` (frames per second, time per stage,
+peak memory) and `frames.nvpb` (one `nv.Frame` per frame, each prefixed by its
+length as a varint).
 
 
 ## What the layer provides
@@ -215,10 +291,13 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `llama-cpp-2` — safe Rust bindings, including the speculative-decode primitives.
 - `praecise-runtime` — the backend-agnostic acceleration runtime and inference API.
 - `praecise-host` — runtime hosts and the engine set: confined, supervised
-  engines, one per model, within one memory budget.
+  engines, one per model, within one memory budget; job engines and the
+  `praecise-job` binary.
 - `praecise-codec` — in-process video coding: H.264, H.265 and AV1 decoding
   from MP4 and Matroska/WebM, H.264 and AV1 encoding to MP4 (AV1 also to
   WebM) with an Opus soundtrack. Generated videos are written as MP4.
+- `praecise-perception` — video in, object tracks out: detection on every
+  decoded frame, ByteTrack, `nv.Frame` output; the `praecise-track` binary.
 - `praecise-onnx` — the ONNX model families: speech-to-text, object
   detection, promptable and text-prompted segmentation, image encoders,
   time-series forecasting and text embedding. Sessions register the execution

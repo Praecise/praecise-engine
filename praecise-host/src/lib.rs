@@ -17,11 +17,17 @@
 //! engines: each model is claimed by exactly one engine, in the process or in
 //! a supervised runtime host started from a pinned [`EngineEnv`], within one
 //! GPU memory budget.
+//!
+//! [`job`] runs job engines beside them: a fixed program with typed
+//! parameters, input files in and output files and progress out, run once to
+//! completion in a host started from a pinned environment under the same
+//! confinement. The `praecise-job` binary runs one from the command line.
 
 pub mod engine;
 pub mod engines;
 pub mod generation;
 pub mod host;
+pub mod job;
 pub mod sandbox;
 
 pub use engine::EngineEnv;

@@ -133,7 +133,9 @@ enum Entry {
 /// regular files and links.
 pub fn digest(root: &Path) -> Result<String> {
     let mut entries = Vec::new();
-    walk(root, root, &mut entries)?;
+    let mut files = Vec::new();
+    walk(root, root, &mut entries, &mut files)?;
+    hash_files(&mut entries, &files)?;
     entries.sort();
     let mut h = Sha256::new();
     for (rel, entry) in &entries {
@@ -155,7 +157,7 @@ pub fn digest(root: &Path) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<(Vec<u8>, Entry)>) -> Result<()> {
+fn walk(root: &Path, dir: &Path, out: &mut Vec<(Vec<u8>, Entry)>, files: &mut Vec<(usize, PathBuf)>) -> Result<()> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let path = e.path();
@@ -167,11 +169,43 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(Vec<u8>, Entry)>) -> Result<()> 
             out.push((rel, Entry::Link(target)));
         } else if ft.is_dir() {
             out.push((rel, Entry::Dir));
-            walk(root, &path, out)?;
+            walk(root, &path, out, files)?;
         } else if ft.is_file() {
-            out.push((rel, Entry::File { executable: executable(&meta), sha256: file_sha256(&path)? }));
+            // contents are hashed afterwards, several files at once
+            files.push((out.len(), path));
+            out.push((rel, Entry::File { executable: executable(&meta), sha256: [0; 32] }));
         } else {
             return Err(Error::Refused(format!("{} is not a file, directory or link", path.display())));
+        }
+    }
+    Ok(())
+}
+
+/// Hash the files `walk` listed, on up to eight threads, into their entries.
+fn hash_files(entries: &mut [(Vec<u8>, Entry)], files: &[(usize, PathBuf)]) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get).min(8);
+    let next = AtomicUsize::new(0);
+    type Hashed = Result<Vec<(usize, [u8; 32])>>;
+    let results: Vec<Hashed> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    while let Some((idx, path)) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        done.push((*idx, file_sha256(path)?));
+                    }
+                    Ok(done)
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().expect("a hashing thread panicked")).collect()
+    });
+    for r in results {
+        for (idx, h) in r? {
+            if let Entry::File { sha256, .. } = &mut entries[idx].1 {
+                *sha256 = h;
+            }
         }
     }
     Ok(())

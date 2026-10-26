@@ -22,6 +22,13 @@
 //! still single-threaded; [`enter_if_requested`] runs that path from `main`
 //! before anything else. When the kernel refuses unprivileged user namespaces
 //! the host is not started at all, and the error names the setting to change.
+//!
+//! [`Confinement::landlock_only`] is the reduced form for a machine whose
+//! kernel refuses unprivileged user namespaces and whose operator has chosen
+//! it explicitly: the same Landlock ruleset, syscall filter (internet sockets
+//! refused), `no_new_privs` and limits, without the namespaces. The host then
+//! still reaches no network and no file outside its rules, but shares the
+//! machine's process and IPC namespaces. It is never chosen automatically.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -49,6 +56,10 @@ pub struct Confinement {
     /// Bring up loopback in the host's network namespace and allow
     /// internet-family sockets on it; the namespace has no route out.
     pub loopback: bool,
+    /// Apply the Landlock ruleset, the syscall filter and the limits without
+    /// new namespaces (see the module documentation). Refuses `loopback`,
+    /// which needs a network namespace of its own.
+    pub landlock_only: bool,
 }
 
 impl Confinement {
@@ -56,6 +67,9 @@ impl Confinement {
         let mut args = vec![OsString::from(SANDBOX_ARG), OsString::from("--scratch"), self.scratch.clone().into()];
         if self.loopback {
             args.push("--loopback".into());
+        }
+        if self.landlock_only {
+            args.push("--landlock-only".into());
         }
         for p in &self.read_only {
             args.push("--ro".into());
@@ -174,6 +188,10 @@ mod linux {
                     c.loopback = true;
                     i += 1;
                 }
+                "--landlock-only" => {
+                    c.landlock_only = true;
+                    i += 1;
+                }
                 "--" => return Ok((c, args[i + 1..].to_vec())),
                 other => return Err(format!("unexpected launcher argument {other}")),
             }
@@ -217,6 +235,12 @@ mod linux {
         let (c, program) = parse(args)?;
         if program.is_empty() {
             return Err("no program given".into());
+        }
+        if c.landlock_only {
+            if c.loopback {
+                return Err("loopback needs a network namespace; it cannot be granted without namespaces".into());
+            }
+            return Err(confine_and_exec(&c, &program, false));
         }
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -275,6 +299,26 @@ mod linux {
             {
                 return Err(format!("mounting /proc: {}", errno()));
             }
+            Err(confine_and_exec(&c, &program, true))
+        };
+        match child() {
+            Ok(()) => unreachable!("exec returned without an error"),
+            Err(e) => {
+                eprintln!("runtime host confinement refused: {e}");
+                unsafe { libc::_exit(super::EXIT_REFUSED) };
+            }
+        }
+    }
+
+    /// Apply limits, `no_new_privs`, the Landlock ruleset and the syscall
+    /// filter to this process and exec the program. Returns only on failure,
+    /// with the reason. `namespaced` says the process is PID 1 of new
+    /// namespaces; otherwise it is the launcher itself and dies with its parent.
+    fn confine_and_exec(c: &Confinement, program: &[OsString], namespaced: bool) -> String {
+        let run = || -> std::result::Result<(), String> {
+            if !namespaced && unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+                return Err(format!("PR_SET_PDEATHSIG: {}", errno()));
+            }
             limits()?;
             if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
                 return Err(format!("no_new_privs: {}", errno()));
@@ -282,7 +326,7 @@ mod linux {
             if c.loopback {
                 loopback_up()?;
             }
-            landlock(&c)?;
+            landlock(c)?;
             seccomp(c.loopback)?;
             let prog: Vec<CString> = program
                 .iter()
@@ -293,12 +337,9 @@ mod linux {
             unsafe { libc::execvp(prog[0].as_ptr(), argv.as_ptr()) };
             Err(format!("exec {}: {}", program[0].to_string_lossy(), errno()))
         };
-        match child() {
+        match run() {
             Ok(()) => unreachable!("exec returned without an error"),
-            Err(e) => {
-                eprintln!("runtime host confinement refused: {e}");
-                unsafe { libc::_exit(super::EXIT_REFUSED) };
-            }
+            Err(e) => e,
         }
     }
 

@@ -19,7 +19,7 @@ fn main() {
     let scratch = std::env::temp_dir().join(format!("praecise-host-confinement-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let c = Confinement { read_only: Vec::new(), scratch: scratch.clone(), devices: Vec::new(), loopback: false };
+    let c = Confinement { read_only: Vec::new(), scratch: scratch.clone(), devices: Vec::new(), loopback: false, landlock_only: false };
     let probe = "tail -n +3 /proc/self/net/dev | cut -d: -f1 | tr -d ' '; ls \"$HOME\" >/dev/null 2>&1 && echo READ-HOME; echo DONE";
     let out = sandbox::spawn(&c, Path::new("/bin/sh"), &["-c".into(), probe.into()], &[("HOME".into(), home)])
         .expect("spawn")

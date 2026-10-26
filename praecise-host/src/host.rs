@@ -109,6 +109,7 @@ impl RuntimeHost {
             scratch: scratch.to_path_buf(),
             devices: sandbox::gpu_devices(),
             loopback: spec.loopback,
+            landlock_only: false,
         };
         let s = scratch.display().to_string();
         let mut environment = vec![
