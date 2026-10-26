@@ -20,7 +20,8 @@ ok)
   echo hello > "$HOME/../out/hello.txt"
   if echo x > "$OUTSIDE" 2>/dev/null; then w=escaped; else w=held; fi
   if cat "$SECRET" >/dev/null 2>&1; then r=escaped; else r=held; fi
-  echo "{\"id\":0,\"ok\":true,\"result\":{\"write\":\"$w\",\"read\":\"$r\",\"gpu\":\"$PRAECISE_GPU_REQUIRED\"}}"
+  mkdir -p "$HOME/a" && echo x > "$HOME/a/f" && mv "$HOME/a/f" "$HOME/f" && m=moved || m=failed
+  echo "{\"id\":0,\"ok\":true,\"result\":{\"write\":\"$w\",\"read\":\"$r\",\"rename\":\"$m\",\"gpu\":\"$PRAECISE_GPU_REQUIRED\"}}"
   ;;
 fail) echo '{"id":0,"ok":false,"error":"the program said no"}' ;;
 sleep) sleep 30 ;;
@@ -84,6 +85,7 @@ fn main() {
     assert_eq!(events, vec![json!({"progress": 0.5, "message": "half"})]);
     assert_eq!(done.result["write"], "held", "the job wrote outside its scratch directory");
     assert_eq!(done.result["read"], "held", "the job read a file it was not given");
+    assert_eq!(done.result["rename"], "moved", "a file could not move between directories of the scratch");
     assert!(!outside.exists());
     assert_eq!(std::fs::read_to_string(done.out_dir.join("hello.txt")).unwrap().trim(), "hello");
     let gpu = if sandbox::gpu_devices().is_empty() { "0" } else { "1" };

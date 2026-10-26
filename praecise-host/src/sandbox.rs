@@ -381,6 +381,10 @@ mod linux {
     const FS_MAKE_BLOCK: u64 = 1 << 11;
     const FS_MAKE_SYM: u64 = 1 << 12;
     const FS_ALL_V1: u64 = (1 << 13) - 1;
+    // Landlock ABI v2: moving or linking a file between directories. Without
+    // it every such rename fails with EXDEV, even inside the scratch directory.
+    const FS_REFER: u64 = 1 << 13;
+    const CREATE_RULESET_VERSION: u32 = 1;
     const READ: u64 = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR;
     const WRITE: u64 = FS_WRITE_FILE
         | FS_REMOVE_DIR
@@ -408,7 +412,11 @@ mod linux {
     /// named is refused; the system's executables and libraries are named
     /// read-only because the interpreter needs them.
     fn landlock(c: &Confinement) -> std::result::Result<(), String> {
-        let attr = RulesetAttr { handled_access_fs: FS_ALL_V1 };
+        let abi = unsafe {
+            libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<RulesetAttr>(), 0usize, CREATE_RULESET_VERSION)
+        };
+        let refer = if abi >= 2 { FS_REFER } else { 0 };
+        let attr = RulesetAttr { handled_access_fs: FS_ALL_V1 | refer };
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
@@ -440,7 +448,7 @@ mod linux {
         for p in &c.devices {
             rules.push((p.clone(), READ | FS_WRITE_FILE));
         }
-        rules.push((c.scratch.clone(), READ | WRITE));
+        rules.push((c.scratch.clone(), READ | WRITE | refer));
         for (path, access) in rules {
             if !path.exists() {
                 continue;

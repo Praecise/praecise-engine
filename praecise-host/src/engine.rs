@@ -92,12 +92,23 @@ impl EngineEnv {
                 self.digest
             )));
         }
+        let program = self.root.join(&self.program);
+        let mut read_only = vec![self.root.clone()];
+        // the interpreter may be a link to an installation outside the
+        // environment (a virtual environment's python): that installation is
+        // readable too
+        if let Ok(real) = std::fs::canonicalize(&program)
+            && !real.starts_with(&self.root)
+            && let Some(prefix) = real.parent().and_then(Path::parent)
+        {
+            read_only.push(prefix.to_path_buf());
+        }
         Ok(HostSpec {
             kind: self.kind.clone(),
-            program: self.root.join(&self.program),
+            program,
             args: self.args.iter().map(Into::into).collect(),
             env: vec![("PRAECISE_ENGINE".to_string(), self.kind.clone())],
-            read_only: vec![self.root.clone()],
+            read_only,
             loopback: self.loopback,
         })
     }
