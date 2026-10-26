@@ -22,6 +22,8 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
   "download-binaries",
   "tls-rustls",
   "copy-dylibs",
+  # External data held in memory, for a parse in a confined process.
+  "api-18",
 ] }
 ndarray = "0.17"
 # Image decode and resize for vision, detection and segmentation inputs.
