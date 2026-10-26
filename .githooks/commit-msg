@@ -1,0 +1,8 @@
+#!/bin/sh
+# Refuse co-author trailers and assistant attribution in commit messages.
+msg="$1"
+if grep -qiE '^[[:space:]]*co-authored-by:|generated with[^a-z]*\[?claude|noreply@anthropic\.com|^[[:space:]]*claude code' "$msg"; then
+  echo "commit-msg: refused: Co-Authored-By or Claude attribution in the message" >&2
+  exit 1
+fi
+exit 0

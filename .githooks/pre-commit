@@ -1,0 +1,19 @@
+#!/bin/sh
+# Refuse commits made under any identity other than the owner, or staging a secret.
+OWNER_EMAIL="hilaal@gmail.com"
+email=$(git config user.email || true)
+if [ "$email" != "$OWNER_EMAIL" ]; then
+  echo "pre-commit: refused: git user.email is '$email', expected $OWNER_EMAIL" >&2
+  exit 1
+fi
+if command -v gitleaks >/dev/null 2>&1; then
+  root=$(git rev-parse --show-toplevel)
+  gitleaks git --pre-commit --staged --no-banner --redact --log-level warn -c "$root/.gitleaks.toml" "$root" || {
+    echo "pre-commit: refused: gitleaks found a secret in the staged changes" >&2
+    exit 1
+  }
+elif [ "${GUARD_ALLOW_NO_GITLEAKS:-}" != 1 ]; then
+  echo "pre-commit: refused: gitleaks not installed (or set GUARD_ALLOW_NO_GITLEAKS=1)" >&2
+  exit 1
+fi
+exit 0

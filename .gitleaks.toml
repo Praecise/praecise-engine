@@ -1,0 +1,23 @@
+# Secret scan configuration for the repository guard (.githooks/guard.sh).
+# Extends the gitleaks default rules. Add an allowlist entry only for a value
+# that is verified not to be a credential (a hash, a test fixture, vendored code).
+title = "repository guard"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "dependencies, build output and lockfiles"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+  '''(^|/)\.next/''',
+  '''(^|/)dist/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)__pycache__/''',
+  '''(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|uv\.lock|poetry\.lock)$''',
+]
+
+[[allowlists]]
+description = 'vendored llama.cpp sources and fixtures'
+paths = ['''(^|/)llama\.cpp/''']
