@@ -168,3 +168,50 @@ Step 3 is the commitment point, and it is reversible.
   reuse the slot accounting.
 - **ARM.** FastVideo ships no prebuilt aarch64 wheel; kernel work on GB10 builds
   from source.
+
+## Serving a video world model: what is hosted today and what a service would need
+
+Inventory (2026-10-29, checked against the code). The Nebius study discussed
+in [admission-and-queueing.md](admission-and-queueing.md) served a video model
+as a service; this repository hosts video models in two narrower ways:
+
+- **In process:** `praecise-diffusion` contains a `Cosmos3` implementation
+  (`src/cosmos3.rs`, with `src/cosmos3/`), exposed through `examples/cosmos3`,
+  which takes a checkpoint directory, a prompt, optional first frame, frame
+  count and run count and reports per-stage timings. `wan-world`,
+  `ltx2` and a `matrix_game` module sit beside it. These are examples and
+  library code: nothing here is a long-running, multi-request video server, and
+  the examples run one generation at a time.
+- **As a job:** `praecise_host::job` runs `cosmos.generate` (Cosmos 3 Edge or
+  Nano through the Python `diffusers` pipeline in a pinned environment, with
+  the Cosmos guardrail forced on). One run per process, confined, to
+  completion.
+- **Not present:** the Cosmos 3 Super model the study used, a request queue
+  for video, multi-GPU parallelism, or any measurement of any of it against
+  this study. No claim is made here that the engine reproduces the study's
+  throughput or latency.
+
+If the engine were to serve a video world model as a service, the study
+says what the serving path must have:
+
+1. **One in-flight generation per resident copy** unless a measurement shows
+   otherwise, with the queue outside the model; the second request should wait,
+   not share. The `Engines` claim already guarantees one copy.
+2. **A memory ledger that sees the whole serving set.** `diffusion-family.md`
+   records a 66.5 GiB video DiT serving set beside a 41.6 GiB LLM (108.1 GiB
+   against an 88 GiB ceiling on one GB10, neither side aware of the other); the `Budget` reservation must include text encoder, VAE and
+   activations, not weights alone.
+3. **A video gate:** the output decodes fully, has the expected frame count,
+   width and height, and is neither blank nor frozen. `Gate` takes any
+   checker; the video one would use `praecise-codec`. It does not exist yet.
+4. **Latency as time to a complete file, and a throughput unit of valid
+   video-seconds per hour**, which is `units` in `Attempt` with
+   `units = seconds of valid video`.
+5. **Throughput accounted per whole run:** warmup, model load and encode in
+   or out of the timed boundary stated in the pin, as the study did (it
+   excluded startup and load, included routing, generation and MP4 encoding).
+6. **Guardrail state in the pin.** The study ran with guardrails disabled;
+   the `cosmos.generate` job forces them on. A comparison across the two is
+   not like for like.
+7. **A topology decision only on hardware with more than one device.** On a
+   single GB10 the question does not arise.

@@ -31,6 +31,9 @@ pub mod backend;
 /// Allocator simulation — **retired**. Its cost model was refuted by
 /// measurement; kept as a record of a self-consistent simulation being wrong.
 pub mod bench_alloc;
+/// Concurrency sweep: valid output per hour at each level, a marginal-gain
+/// stopping rule, a validity gate, and a pinned configuration. Backend-agnostic.
+pub mod concurrency_sweep;
 pub mod config;
 pub mod denoise;
 /// Published speculative drafters, their licences, and the known ways a
