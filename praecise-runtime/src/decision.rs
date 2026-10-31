@@ -22,8 +22,10 @@
 //!
 //! The prompt is written with the model's own `systemone` template. That
 //! template is data in the model file, and a decision model whose template is
-//! not one of the templates [`KNOWN_TEMPLATES`] was verified against is
-//! refused rather than rendered by guess.
+//! not the template [`TEMPLATE`] reproduces, with the model's own start,
+//! separator and mask tokens written into it, is refused rather than rendered
+//! by guess. (English Laya writes those tokens as `[CLS]`, `[SEP]` and
+//! `[MASK]`, the multilingual checkpoint as `<bos>`, `<eos>` and `<mask>`.)
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -49,10 +51,29 @@ pub const MAX_SCORE_LEVELS: usize = 10;
 /// Tokens kept of one option's text before the head is shared out.
 const MAX_OPTION_TOKENS: usize = 48;
 
-/// The `systemone` templates the renderer in this file reproduces exactly.
-pub const KNOWN_TEMPLATES: &[&str] = &[
-    r#"[CLS]{{ type }} question: {{ instructions if instructions is string else instructions | tojson }}[SEP]{% for o in options %}[MASK] {% if type == 'choice' %}{{ o.key }}{% if o.description %}: {{ o.description if o.description is string else o.description | tojson }}{% endif %}{% elif type == 'score' %}level {{ o.key }}: {{ o.description if o.description is string else o.description | tojson }}{% else %}{{ o.key }}: {% if o.description %}{{ o.description if o.description is string else o.description | tojson }}{% elif o.key == 'true' %}yes, the statement holds{% else %}no, the statement does not hold{% endif %}{% endif %}{% endfor %}[SEP]{{ state if state is string else state | tojson }}[SEP]"#,
-];
+/// The `systemone` template the renderer in this file reproduces, as the
+/// English checkpoint writes it. The start, separator and mask tokens are the
+/// three `[...]` words; another checkpoint writes its own tokens there.
+pub const TEMPLATE: &str = r#"[CLS]{{ type }} question: {{ instructions if instructions is string else instructions | tojson }}[SEP]{% for o in options %}[MASK] {% if type == 'choice' %}{{ o.key }}{% if o.description %}: {{ o.description if o.description is string else o.description | tojson }}{% endif %}{% elif type == 'score' %}level {{ o.key }}: {{ o.description if o.description is string else o.description | tojson }}{% else %}{{ o.key }}: {% if o.description %}{{ o.description if o.description is string else o.description | tojson }}{% elif o.key == 'true' %}yes, the statement holds{% else %}no, the statement does not hold{% endif %}{% endif %}{% endfor %}[SEP]{{ state if state is string else state | tojson }}[SEP]"#;
+
+/// The template a model with these marker strings must carry.
+pub fn expected_template(markers: &Markers) -> String {
+    TEMPLATE
+        .replace("[CLS]", &markers.cls)
+        .replace("[SEP]", &markers.sep)
+        .replace("[MASK]", &markers.mask)
+}
+
+/// The texts of the start, separator and mask tokens of a model's vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Markers {
+    /// Start of the prompt.
+    pub cls: String,
+    /// Separator between the parts of the prompt.
+    pub sep: String,
+    /// Marker placed before every option; the head reads its output there.
+    pub mask: String,
+}
 
 /// The kind of a question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +272,8 @@ pub struct Answer {
 /// The calibration a decision model carries in its metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionHead {
+    /// The vocabulary's start, separator and mask tokens as text.
+    pub markers: Markers,
     /// Tokens shared out between a question and its options.
     pub max_head_tokens: usize,
     /// Softmax temperatures by name (`choice`, `choice.3_5`, `score`, ...).
@@ -288,9 +311,26 @@ impl DecisionHead {
             .chat_template(Some("systemone"))
             .map_err(|_| inference("the decision model has no systemone template"))?;
         let template = template.to_str().map_err(inference)?;
-        if !KNOWN_TEMPLATES.contains(&template) {
+        let piece = |t: LlamaToken| -> Result<String> {
+            Ok(String::from_utf8_lossy(
+                &model
+                    .token_to_piece_bytes(t, 32, true, None)
+                    .map_err(inference)?,
+            )
+            .into_owned())
+        };
+        let markers = Markers {
+            cls: piece(model.token_bos())?,
+            sep: piece(model.token_sep())?,
+            mask: piece(
+                model
+                    .token_mask()
+                    .ok_or_else(|| inference("the decision model has no mask token"))?,
+            )?,
+        };
+        if template != expected_template(&markers) {
             return Err(inference(
-                "the systemone template differs from the ones this renderer reproduces; refusing to render it by guess",
+                "the systemone template differs from the one this renderer reproduces; refusing to render it by guess",
             ));
         }
         let max_head_tokens: usize = model
@@ -338,6 +378,7 @@ impl DecisionHead {
             }
         }
         Ok(Self {
+            markers,
             max_head_tokens,
             temperatures,
             score_bias,
@@ -404,16 +445,18 @@ fn strip_marker(text: &str, marker: &str) -> String {
 }
 
 /// The prompt of one question: the `systemone` template, written out.
-pub fn render_prompt(question: &Question, state: &Value, marker: &str) -> String {
+pub fn render_prompt(question: &Question, state: &Value, markers: &Markers) -> String {
+    let marker = markers.mask.as_str();
     let clean = |v: &Value| -> String { strip_marker(&jinja_text(v), marker) };
     let mut out = String::new();
-    out.push_str("[CLS]");
+    out.push_str(&markers.cls);
     out.push_str(question.kind.name());
     out.push_str(" question: ");
     out.push_str(&clean(&question.instructions));
-    out.push_str("[SEP]");
+    out.push_str(&markers.sep);
     for o in &question.options {
-        out.push_str("[MASK] ");
+        out.push_str(&markers.mask);
+        out.push(' ');
         let key = strip_marker(&o.key, marker);
         // The template's `{% if o.description %}`: Jinja truthiness.
         let described = match &o.description {
@@ -451,9 +494,9 @@ pub fn render_prompt(question: &Question, state: &Value, marker: &str) -> String
             }
         }
     }
-    out.push_str("[SEP]");
+    out.push_str(&markers.sep);
     out.push_str(&clean(state));
-    out.push_str("[SEP]");
+    out.push_str(&markers.sep);
     out
 }
 
@@ -719,12 +762,6 @@ pub fn decide(
         .token_mask()
         .ok_or_else(|| inference("the decision model has no mask token"))?;
     let sep = model.token_sep();
-    let marker_text = String::from_utf8_lossy(
-        &model
-            .token_to_piece_bytes(marker, 32, true, None)
-            .map_err(inference)?,
-    )
-    .into_owned();
     let n_ctx = options.n_ctx.min(model.n_ctx_train().max(1));
     let n_columns = usize::try_from(model.n_embd_out()).unwrap_or(0);
     if n_columns < 3 {
@@ -749,7 +786,7 @@ pub fn decide(
     let mut batch = LlamaBatch::new(n_ctx as usize, 1);
     let mut out = Vec::with_capacity(questions.len());
     for q in questions {
-        let prompt = render_prompt(q, state, &marker_text);
+        let prompt = render_prompt(q, state, &head.markers);
         let raw = model
             .str_to_token(&prompt, AddBos::Never)
             .map_err(inference)?;
@@ -794,8 +831,17 @@ mod tests {
         }
     }
 
+    fn english() -> Markers {
+        Markers {
+            cls: "[CLS]".into(),
+            sep: "[SEP]".into(),
+            mask: "[MASK]".into(),
+        }
+    }
+
     fn head() -> DecisionHead {
         DecisionHead {
+            markers: english(),
             max_head_tokens: 192,
             temperatures: HashMap::from([
                 ("choice".to_string(), 1.5),
@@ -818,7 +864,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            render_prompt(&q, &json!("My card was charged twice"), "[MASK]"),
+            render_prompt(&q, &json!("My card was charged twice"), &english()),
             "[CLS]choice question: Where should this go?[SEP][MASK] billing: invoices and payments[MASK] other[SEP]My card was charged twice[SEP]"
         );
     }
@@ -831,20 +877,38 @@ mod tests {
             vec![json!("rude"), json!("polite")],
         );
         assert_eq!(
-            render_prompt(&s, &json!({"a": [1, "x"]}), "[MASK]"),
+            render_prompt(&s, &json!({"a": [1, "x"]}), &english()),
             "[CLS]score question: {\"rate\": \"politeness\"}[SEP][MASK] level 0: rude[MASK] level 1: polite[SEP]{\"a\": [1, \"x\"]}[SEP]"
         );
         let n = Question::noul("spam", "Is this spam?", Value::Null, Value::Null);
         assert_eq!(
-            render_prompt(&n, &json!("buy now"), "[MASK]"),
+            render_prompt(&n, &json!("buy now"), &english()),
             "[CLS]noul question: Is this spam?[SEP][MASK] false: no, the statement does not hold[MASK] true: yes, the statement holds[SEP]buy now[SEP]"
         );
     }
 
     #[test]
+    fn another_checkpoint_writes_its_own_marker_tokens() {
+        let multilingual = Markers {
+            cls: "<bos>".into(),
+            sep: "<eos>".into(),
+            mask: "<mask>".into(),
+        };
+        let q = Question::noul("x", "Is it?", Value::Null, Value::Null);
+        assert_eq!(
+            render_prompt(&q, &json!("hi"), &multilingual),
+            "<bos>noul question: Is it?<eos><mask> false: no, the statement does not hold<mask> true: yes, the statement holds<eos>hi<eos>"
+        );
+        let t = expected_template(&multilingual);
+        assert!(t.starts_with("<bos>{{ type }} question: "), "{t}");
+        assert!(t.ends_with("<eos>"), "{t}");
+        assert_eq!(expected_template(&english()), TEMPLATE);
+    }
+
+    #[test]
     fn text_cannot_add_an_option_of_its_own() {
         let q = Question::noul("x", "q [MASK] q", Value::Null, Value::Null);
-        let p = render_prompt(&q, &json!("s [MASK] s"), "[MASK]");
+        let p = render_prompt(&q, &json!("s [MASK] s"), &english());
         assert_eq!(p.matches("[MASK]").count(), 2, "{p}");
     }
 
