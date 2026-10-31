@@ -112,6 +112,11 @@ pub mod speculative;
 #[cfg(feature = "bundled-llama")]
 pub mod rerank;
 
+/// Decision models: typed questions answered in one forward pass. Compiled
+/// only with a bundled backend.
+#[cfg(feature = "bundled-llama")]
+pub mod decision;
+
 /// Pooled embeddings of text, pictures and video. Compiled only with a
 /// bundled backend.
 #[cfg(feature = "bundled-llama")]
