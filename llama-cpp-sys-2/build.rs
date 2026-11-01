@@ -843,6 +843,10 @@ fn main() {
         },
     );
     config.define("LLAMA_CURL", "OFF");
+    // The HTTP client in the common library runs without TLS: the engine never downloads
+    // models itself, and linking OpenSSL into every consumer for code that is never
+    // reached is a cost with no user.
+    config.define("LLAMA_OPENSSL", "OFF");
 
     // Pass CMAKE_ environment variables down to CMake
     for (key, value) in env::vars() {
