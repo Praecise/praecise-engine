@@ -15,7 +15,7 @@ impl TestKey {
     fn public(&self) -> [u8; 65] {
         self.0
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .unwrap()
