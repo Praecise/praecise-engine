@@ -17,8 +17,11 @@ Programs:
   sionna.radio_map       Sionna RT radio map of a built-in or uploaded Mitsuba scene
   warp.example           one of NVIDIA Warp's examples, headless, with its USD stage
   newton.example         one of Newton's examples, headless, as a USD stage
+  newton.scene           Newton on a scene the job brings (USD, MJCF or URDF), headless, with a trajectory
   cosmos.generate        NVIDIA Cosmos 3 video generation, guardrail always on
   physicsnemo.darcy_fno  PhysicsNeMo Fourier neural operator trained on Darcy flow
+  physicsnemo.surrogate_fit      a PhysicsNeMo FNO or MLP trained on the job's dataset, with a model card
+  physicsnemo.surrogate_predict  that model on new inputs, refusing any input outside its validity band
   cudaq.ghz              CUDA-Q GHZ state sampled on a simulator
   cudaq.maxcut           CUDA-Q QAOA MaxCut on an input graph
   boltz.predict          Boltz-2 structure and affinity prediction
@@ -261,6 +264,79 @@ def newton_example(params, inputs, out, work):
     return {"example": name, "stage": stage.name, "log": tail[-15:]}
 
 
+SCENE_SUFFIXES = {".usd": "usd", ".usda": "usd", ".usdc": "usd", ".usdz": "usd", ".xml": "mjcf", ".mjcf": "mjcf", ".urdf": "urdf"}
+SCENE_MAX_BYTES = 200 * 1024 * 1024
+
+
+@program("newton.scene")
+def newton_scene(params, inputs, out, work):
+    """Newton on a scene the job brings. The scene is read from the (read-only) input; anything it references outside
+    the input is out of reach of the confined host, so a scene that needs it fails to load instead of reading it."""
+    wp = warp_cuda("newton.scene")
+    import numpy as np
+    import newton
+
+    scene = Path(inputs["scene"])
+    kind = SCENE_SUFFIXES.get(scene.suffix.lower())
+    if kind is None:
+        raise ValueError("the scene is a USD (.usd .usda .usdc .usdz), MJCF (.xml .mjcf) or URDF (.urdf) file")
+    if scene.stat().st_size > SCENE_MAX_BYTES:
+        raise ValueError("the scene is at most 200 MB")
+    frames = limit(params, "frames", 120, 1, 20000)
+    substeps = limit(params, "substeps", 8, 1, 32)
+    every = limit(params, "record_every", 1, 1, 1000)
+    dt = flimit(params, "dt", 1.0 / 240.0, 1e-4, 0.05)
+    solver_name = params.get("solver", "xpbd")
+    np.random.seed(limit(params, "seed", 0, *SEED))
+
+    builder = newton.ModelBuilder()
+    {"usd": builder.add_usd, "mjcf": builder.add_mjcf, "urdf": builder.add_urdf}[kind](str(scene))
+    if params.get("ground", True):
+        builder.add_ground_plane()
+    model = builder.finalize()
+    solvers = {"xpbd": newton.solvers.SolverXPBD, "mujoco": newton.solvers.SolverMuJoCo,
+               "featherstone": newton.solvers.SolverFeatherstone, "vbd": newton.solvers.SolverVBD}
+    solver = solvers[solver_name](model)
+    s0, s1, control = model.state(), model.state(), model.control()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+    pipeline = None if solver_name == "mujoco" else newton.CollisionPipeline(model)
+    contacts = pipeline.contacts() if pipeline else None
+
+    stage = Path(out, "sim.usd")
+    viewer = newton.viewer.ViewerUSD(output_path=str(stage), fps=max(1, round(1.0 / (dt * substeps))), num_frames=frames)
+    viewer.set_model(model)
+    traj, t0, sim_t = [], time.time(), 0.0
+    wp.synchronize()
+    for f in range(frames):
+        for _ in range(substeps):
+            s0.clear_forces()
+            if pipeline:
+                pipeline.collide(s0, contacts)
+            solver.step(s0, s1, control, contacts, dt)
+            s0, s1 = s1, s0
+        sim_t += dt * substeps
+        viewer.begin_frame(sim_t)
+        viewer.log_state(s0)
+        viewer.end_frame()
+        if f % every == 0:
+            traj.append(s0.body_q.numpy().copy() if s0.body_q is not None else np.zeros((0, 7), "float32"))
+        if f % 20 == 0:
+            progress(f / frames, f"frame {f} of {frames}")
+    viewer.close()
+    q = np.stack(traj) if traj else np.zeros((0, 0, 7), "float32")
+    np.savez_compressed(Path(out, "trajectory.npz"), body_q=q, dt=dt * substeps, record_every=every)
+    finite = bool(np.isfinite(q).all()) if q.size else True
+    res = {"scene": scene.name, "format": kind, "solver": solver_name, "frames": frames, "substeps": substeps, "dt": dt,
+           "bodies": int(model.body_count), "joints": int(model.joint_count), "shapes": int(model.shape_count),
+           "finite": bool(finite), "min_body_height": float(q[..., 2].min()) if q.size else None,
+           "seconds": round(time.time() - t0, 2), "stage": stage.name if stage.exists() else None,
+           "trajectory": "trajectory.npz"}
+    if not finite:
+        write_result(out, res)
+        raise RuntimeError("the simulation produced non-finite values; try a smaller dt or more substeps")
+    return write_result(out, res)
+
+
 # ---------------------------------------------------------------- Cosmos
 
 COSMOS_MODELS = {"edge": "nvidia/Cosmos3-Edge", "nano": "nvidia/Cosmos3-Nano"}
@@ -364,6 +440,179 @@ def darcy_fno(params, inputs, out, work):
                "relative_l2_error_unseen": sum(errs) / len(errs), "unseen_batches": len(errs),
                "seconds": round(time.time() - t0, 1), "parameters": sum(p.numel() for p in model.parameters())}
     return write_result(out, res_out)
+
+
+# ---------------------------------------------------------------- PhysicsNeMo surrogates
+
+SURROGATE_MAX_BYTES = 2 * 1024 ** 3
+SURROGATE_LIMIT = 0.1
+
+
+def _sha256(path):
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _surrogate_net(arch):
+    if arch["model"] == "fno":
+        from physicsnemo.models.fno import FNO
+
+        return FNO(in_channels=arch["in"], out_channels=arch["out"], decoder_layers=1, decoder_layer_size=arch["width"],
+                   dimension=arch["dimension"], latent_channels=arch["width"], num_fno_layers=4,
+                   num_fno_modes=arch["modes"], padding=arch["padding"])
+    from physicsnemo.models.mlp import FullyConnected
+
+    return FullyConnected(in_features=arch["in"], layer_size=arch["width"], out_features=arch["out"], num_layers=4)
+
+
+@program("physicsnemo.surrogate_fit")
+def surrogate_fit(params, inputs, out, work):
+    torch = torch_cuda("physicsnemo.surrogate_fit")
+    import numpy as np
+    import physicsnemo
+
+    data = Path(inputs["dataset"])
+    if data.stat().st_size > SURROGATE_MAX_BYTES:
+        raise ValueError("the dataset is at most 2 GB")
+    z = np.load(data, allow_pickle=False)
+    if "x" not in z.files or "y" not in z.files:
+        raise ValueError("the dataset is an NPZ with arrays x and y")
+    x, y = np.asarray(z["x"], dtype="float32"), np.asarray(z["y"], dtype="float32")
+    meta = json.loads(str(z["meta"])) if "meta" in z.files else {}
+    n = x.shape[0]
+    if n < 20 or y.shape[0] != n:
+        raise ValueError("x and y have the same number of samples, at least 20")
+    kind = params.get("model", "fno")
+    if kind == "fno":
+        if x.ndim not in (3, 4, 5) or y.ndim != x.ndim or y.shape[2:] != x.shape[2:]:
+            raise ValueError("fno takes x (N, C, spatial...) with 1 to 3 spatial axes and y with the same spatial shape")
+        arch = {"model": "fno", "in": int(x.shape[1]), "out": int(y.shape[1]), "dimension": x.ndim - 2,
+                "width": limit(params, "width", 32, 8, 256), "modes": limit(params, "modes", 12, 2, 64),
+                "padding": 9 if x.ndim == 4 else 8}
+        axes = tuple(i for i in range(x.ndim) if i != 1)
+    else:
+        if x.ndim != 2 or y.ndim != 2:
+            raise ValueError("mlp takes x (N, features) and y (N, outputs)")
+        arch = {"model": "mlp", "in": int(x.shape[1]), "out": int(y.shape[1]), "width": limit(params, "width", 128, 8, 1024)}
+        axes = (0,)
+    if arch["in"] > 256 or arch["out"] > 256:
+        raise ValueError("at most 256 input and 256 output channels")
+    seed = limit(params, "seed", 0, *SEED)
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n)
+    nval = max(1, int(round(n * flimit(params, "val_fraction", 0.2, 0.05, 0.5))))
+    val_i, tr_i = order[:nval], order[nval:]
+    lo_in = x.min(axis=axes, keepdims=False)
+    hi_in = x.max(axis=axes, keepdims=False)
+    lo_out, hi_out = y.min(axis=axes), y.max(axis=axes)
+    mx, sx = x[tr_i].mean(axis=axes, keepdims=True), x[tr_i].std(axis=axes, keepdims=True) + 1e-8
+    my, sy = y[tr_i].mean(axis=axes, keepdims=True), y[tr_i].std(axis=axes, keepdims=True) + 1e-8
+    dev = torch.device("cuda")
+    T = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev)
+    xt, yt = T((x - mx) / sx), T((y - my) / sy)
+    net = _surrogate_net(arch).to(dev)
+    steps, batch = limit(params, "steps", 2000, 1, 50000), limit(params, "batch", 32, 1, 512)
+    opt = torch.optim.Adam(net.parameters(), lr=flimit(params, "lr", 1e-3, 1e-6, 1e-1))
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps)
+    tri = torch.from_numpy(tr_i).to(dev)
+    t0, loss = time.time(), None
+    for it in range(1, steps + 1):
+        b = tri[torch.randint(0, len(tri), (min(batch, len(tri)),), device=dev)]
+        loss = torch.nn.functional.mse_loss(net(xt[b]), yt[b])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        sched.step()
+        if it % 50 == 0:
+            progress(it / steps, f"step {it} of {steps}, loss {loss.item():.3e}")
+    net.eval()
+    vi = torch.from_numpy(val_i).to(dev)
+    with torch.no_grad():
+        pred = net(xt[vi]) * T(sy) + T(my)
+        truth = T(y[val_i])
+        rel = (torch.linalg.norm(pred - truth) / torch.linalg.norm(truth)).item()
+    model_path = Path(out, "model.pt")
+    torch.save({"arch": arch, "state": net.state_dict(), "norm": {"mx": mx, "sx": sx, "my": my, "sy": sy}}, model_path)
+    np.savez_compressed(Path(out, "val_preds.npz"), pred=pred[:64].cpu().numpy(), truth=truth[:64].cpu().numpy())
+    limit_v = flimit(params, "error_limit", SURROGATE_LIMIT, 1e-6, 10.0)
+    admitted = rel <= limit_v
+
+    def variables(prefix, names, lo, hi, unit_key):
+        units = meta.get(unit_key) or []
+        cnt = len(lo.reshape(-1))
+        shape = [1] if arch["model"] == "mlp" else list(x.shape[2:] if prefix == "x" else y.shape[2:])
+        res = []
+        for i in range(cnt):
+            a, b = float(lo.reshape(-1)[i]), float(hi.reshape(-1)[i])
+            if not b > a:
+                b = a + 1e-6
+            res.append({"name": (meta.get(names) or [])[i] if i < len(meta.get(names) or []) else f"{prefix}{i}",
+                        "unit": units[i] if i < len(units) else "1", "min": a, "max": b, "shape": shape})
+        return res
+
+    card = {"id": str(meta.get("id") or f"surrogate-{arch['model']}-{_sha256(data)[:8]}")[:64], "framework": "physicsnemo",
+            "version": physicsnemo.__version__, "checkpoint_sha256": _sha256(model_path), "train_data_sha256": _sha256(data),
+            "inputs": variables("x", "x_names", lo_in, hi_in, "x_units"),
+            "outputs": variables("y", "y_names", lo_out, hi_out, "y_units"),
+            "validation": {"metric": "relative_l2", "value": rel, "limit": limit_v, "samples": int(nval), "held_out": True},
+            "runtime": {"device": "cuda", "batch_max": 16}, "licence": str(meta.get("licence") or "Apache-2.0")}
+    if admitted:
+        Path(out, "model_card.json").write_text(json.dumps(card, indent=1))
+    res_out = {"model": arch["model"], "samples": int(n), "val_samples": int(nval), "steps": steps,
+               "train_loss_last": float(loss.item()), "relative_l2_held_out": rel, "error_limit": limit_v, "admitted": bool(admitted),
+               "seconds": round(time.time() - t0, 1), "parameters": sum(p.numel() for p in net.parameters())}
+    write_result(out, res_out)
+    if not admitted:
+        raise RuntimeError(f"the held-out relative L2 error {rel:.4g} is over the limit {limit_v}: no model card written")
+    return res_out
+
+
+@program("physicsnemo.surrogate_predict")
+def surrogate_predict(params, inputs, out, work):
+    torch = torch_cuda("physicsnemo.surrogate_predict")
+    import numpy as np
+
+    mpath, cpath = Path(inputs["model"]), Path(inputs["card"])
+    card = json.loads(cpath.read_text())
+    if _sha256(mpath) != card.get("checkpoint_sha256"):
+        raise ValueError("the checkpoint does not match the card (checkpoint_sha256)")
+    z = np.load(inputs["x"], allow_pickle=False)
+    x = np.asarray(z["x"], dtype="float32")
+    ck = torch.load(mpath, map_location="cuda", weights_only=False)
+    arch = ck["arch"]
+    axes = tuple(i for i in range(x.ndim) if i != 1) if arch["model"] == "fno" else (0,)
+    if x.ndim != (arch["dimension"] + 2 if arch["model"] == "fno" else 2) or x.shape[1] != arch["in"]:
+        raise ValueError("x does not match the model's input shape")
+    # the validity band: no extrapolation
+    lo = np.array([v["min"] for v in card["inputs"]], dtype="float32")
+    hi = np.array([v["max"] for v in card["inputs"]], dtype="float32")
+    shape = [1, -1] + [1] * (x.ndim - 2)
+    lo, hi = lo.reshape(shape), hi.reshape(shape)
+    mn, mx_ = x.min(axis=tuple(i for i in range(x.ndim) if i != 1), keepdims=True), x.max(axis=tuple(i for i in range(x.ndim) if i != 1), keepdims=True)
+    bad = np.where((mn < lo - 1e-6).reshape(-1) | (mx_ > hi + 1e-6).reshape(-1))[0]
+    if bad.size:
+        names = [card["inputs"][i]["name"] for i in bad[:5]]
+        raise ValueError(f"the input lies outside the validity band of the model card for {names}: not extrapolated")
+    net = _surrogate_net(arch).to("cuda")
+    net.load_state_dict(ck["state"])
+    net.eval()
+    nrm = ck["norm"]
+    with torch.no_grad():
+        xt = torch.from_numpy((x - nrm["mx"]) / nrm["sx"]).to("cuda")
+        pred = (net(xt) * torch.from_numpy(nrm["sy"]).to("cuda") + torch.from_numpy(nrm["my"]).to("cuda")).cpu().numpy()
+    olo = np.array([v["min"] for v in card["outputs"]], dtype="float32").reshape([1, -1] + [1] * (pred.ndim - 2))
+    ohi = np.array([v["max"] for v in card["outputs"]], dtype="float32").reshape([1, -1] + [1] * (pred.ndim - 2))
+    span = (ohi - olo)
+    flag = ((pred < olo - 0.1 * span) | (pred > ohi + 0.1 * span)).reshape(pred.shape[0], -1).any(axis=1)
+    np.savez_compressed(Path(out, "y.npz"), y=pred, output_out_of_range=flag)
+    return write_result(out, {"samples": int(x.shape[0]), "card": card["id"], "outputs_flagged": int(flag.sum()),
+                              "validation": card["validation"]})
 
 
 # ---------------------------------------------------------------- CUDA-Q

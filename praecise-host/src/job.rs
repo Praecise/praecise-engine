@@ -111,7 +111,7 @@ const SEED: (i64, i64) = (0, (1 << 31) - 1);
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn programs() -> Vec<Program> {
-    use ParamType::{Enum, Float, Int, Json, Name, Str};
+    use ParamType::{Bool, Enum, Float, Int, Json, Name, Str};
     let cudaq_targets: &'static [&'static str] = &["nvidia", "tensornet", "qpp-cpu"];
     vec![
         Program {
@@ -147,6 +147,22 @@ pub fn programs() -> Vec<Program> {
             inputs: vec![],
         },
         Program {
+            name: "newton.scene",
+            engine: "newton",
+            about: "Newton simulates a scene the job brings (USD, MJCF or URDF, up to 200 MB) headless with the chosen \
+                    solver. Writes sim.usd, trajectory.npz (body transforms per recorded frame) and result.json.",
+            params: vec![
+                p("frames", Int(1, 20_000), false),
+                p("substeps", Int(1, 32), false),
+                p("dt", Float(1e-4, 0.05), false),
+                p("solver", Enum(&["xpbd", "mujoco", "featherstone", "vbd"]), false),
+                p("record_every", Int(1, 1000), false),
+                p("ground", Bool, false),
+                p("seed", Int(SEED.0, SEED.1), false),
+            ],
+            inputs: vec![Input { name: "scene", required: true }],
+        },
+        Program {
             name: "cosmos.generate",
             engine: "cosmos",
             about: "NVIDIA Cosmos 3 (Edge or Nano) generates a video from a prompt and an optional first image, with the \
@@ -174,6 +190,37 @@ pub fn programs() -> Vec<Program> {
                 p("seed", Int(SEED.0, SEED.1), false),
             ],
             inputs: vec![],
+        },
+        Program {
+            name: "physicsnemo.surrogate_fit",
+            engine: "physicsnemo",
+            about: "PhysicsNeMo trains a Fourier neural operator or an MLP on the job's dataset (NPZ with x and y, up to \
+                    2 GB), validates it on held-out samples and, if the error is under the limit, writes a model card with \
+                    the validity band. Writes model.pt, model_card.json, val_preds.npz and result.json.",
+            params: vec![
+                p("model", Enum(&["fno", "mlp"]), false),
+                p("steps", Int(1, 50_000), false),
+                p("batch", Int(1, 512), false),
+                p("lr", Float(1e-6, 0.1), false),
+                p("val_fraction", Float(0.05, 0.5), false),
+                p("width", Int(8, 1024), false),
+                p("modes", Int(2, 64), false),
+                p("error_limit", Float(1e-6, 10.0), false),
+                p("seed", Int(SEED.0, SEED.1), false),
+            ],
+            inputs: vec![Input { name: "dataset", required: true }],
+        },
+        Program {
+            name: "physicsnemo.surrogate_predict",
+            engine: "physicsnemo",
+            about: "Runs a trained surrogate (inputs model, card and x) and refuses any input outside the validity band \
+                    of its model card instead of extrapolating. Writes y.npz and result.json.",
+            params: vec![],
+            inputs: vec![
+                Input { name: "model", required: true },
+                Input { name: "card", required: true },
+                Input { name: "x", required: true },
+            ],
         },
         Program {
             name: "cudaq.ghz",
@@ -716,6 +763,34 @@ mod tests {
         assert!(ghz.parse_param("qubits", "twelve").is_err());
         let radio = program("sionna.radio_map").unwrap();
         assert_eq!(radio.parse_param("transmitters", "[{\"position\": [0, 0, 10]}]").unwrap()[0]["position"][2], json!(10));
+    }
+
+    #[test]
+    fn the_scene_and_surrogate_programs_are_held_to_their_declaration() {
+        let scene = program("newton.scene").unwrap();
+        scene.check_params(&params(json!({"frames": 10, "solver": "mujoco", "ground": true, "dt": 0.004}))).unwrap();
+        for bad in [json!({"frames": 20_001}), json!({"solver": "euler"}), json!({"dt": 1.0}), json!({"ground": "yes"}), json!({"path": "/etc/passwd"})] {
+            assert!(scene.check_params(&params(bad.clone())).is_err(), "{bad}");
+        }
+        let fit = program("physicsnemo.surrogate_fit").unwrap();
+        fit.check_params(&params(json!({"model": "fno", "steps": 100, "val_fraction": 0.2, "error_limit": 0.05}))).unwrap();
+        for bad in [json!({"model": "resnet"}), json!({"val_fraction": 0.9}), json!({"steps": 0}), json!({"checkpoint": "x.pt"})] {
+            assert!(fit.check_params(&params(bad.clone())).is_err(), "{bad}");
+        }
+        let predict = program("physicsnemo.surrogate_predict").unwrap();
+        predict.check_params(&params(json!({}))).unwrap();
+        assert!(predict.check_params(&params(json!({"anything": 1}))).is_err());
+        let dir = std::env::temp_dir().join(format!("surrogate-inputs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ins = BTreeMap::new();
+        for n in ["model", "card", "x"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+            ins.insert(n.to_string(), dir.join(n));
+        }
+        predict.check_inputs(&ins).unwrap();
+        ins.remove("card");
+        assert!(predict.check_inputs(&ins).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
