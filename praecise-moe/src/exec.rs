@@ -346,7 +346,10 @@ impl Projection {
 /// `gate`/`up`).
 #[derive(Debug, Clone)]
 pub struct ExpertFfn {
-    gate: Projection,
+    /// The gate projection of a gated (SwiGLU) expert. `None` for an expert
+    /// with only up and down projections and a squared-ReLU activation
+    /// (Nemotron-H), which `forward` selects.
+    gate: Option<Projection>,
     up: Projection,
     down: Projection,
     d_model: usize,
@@ -362,25 +365,34 @@ impl ExpertFfn {
     pub fn from_safetensors(bytes: &[u8]) -> MoeExecResult<Self> {
         let st = SafeTensors::deserialize(bytes).map_err(|e| MoeExecError::Parse(e.to_string()))?;
         let meta = safetensors_metadata(bytes);
-        let gate = load_projection(&st, &meta, TENSOR_GATE_PROJ)?;
+        // A blob without `gate_proj.weight` is an ungated expert; one with
+        // it is SwiGLU. A gate tensor that is present but broken is an error,
+        // not a reason to fall back to the ungated form.
+        let gate = if st.tensor(TENSOR_GATE_PROJ).is_ok() {
+            Some(load_projection(&st, &meta, TENSOR_GATE_PROJ)?)
+        } else {
+            None
+        };
         let up = load_projection(&st, &meta, TENSOR_UP_PROJ)?;
         let down = load_projection(&st, &meta, TENSOR_DOWN_PROJ)?;
 
-        let (d_ff, d_model) = gate.dim();
-        if up.dim() != (d_ff, d_model) {
-            let (r, c) = up.dim();
-            return Err(MoeExecError::BadShape {
-                name: TENSOR_UP_PROJ.to_string(),
-                got: vec![r, c],
-                expected: format!("[{d_ff}, {d_model}] to match {TENSOR_GATE_PROJ}"),
-            });
+        let (d_ff, d_model) = up.dim();
+        if let Some(gate) = &gate {
+            if gate.dim() != (d_ff, d_model) {
+                let (r, c) = gate.dim();
+                return Err(MoeExecError::BadShape {
+                    name: TENSOR_GATE_PROJ.to_string(),
+                    got: vec![r, c],
+                    expected: format!("[{d_ff}, {d_model}] to match {TENSOR_UP_PROJ}"),
+                });
+            }
         }
         if down.dim() != (d_model, d_ff) {
             let (r, c) = down.dim();
             return Err(MoeExecError::BadShape {
                 name: TENSOR_DOWN_PROJ.to_string(),
                 got: vec![r, c],
-                expected: format!("[{d_model}, {d_ff}] (transpose of {TENSOR_GATE_PROJ})"),
+                expected: format!("[{d_model}, {d_ff}] (transpose of {TENSOR_UP_PROJ})"),
             });
         }
 
@@ -406,7 +418,9 @@ impl ExpertFfn {
     /// Approximate resident bytes for the weights as held — dense
     /// projections count `f32` bytes, quantized ones count block bytes.
     pub fn approx_bytes(&self) -> u64 {
-        self.gate.approx_bytes() + self.up.approx_bytes() + self.down.approx_bytes()
+        self.gate.as_ref().map_or(0, Projection::approx_bytes)
+            + self.up.approx_bytes()
+            + self.down.approx_bytes()
     }
 
     /// The highest-compression quant kind present across the three
@@ -416,7 +430,7 @@ impl ExpertFfn {
         // Report the coarsest (smallest) quant present, since that bounds
         // the expert's fidelity; fall back to any tag when only one differs.
         let tags = [
-            self.gate.quant_tag(),
+            self.gate.as_ref().and_then(Projection::quant_tag),
             self.up.quant_tag(),
             self.down.quant_tag(),
         ];
@@ -437,12 +451,25 @@ impl ExpertFfn {
     /// batching is inherent: the whole token batch shares each projection's
     /// weight, so `W` is dequantized/uploaded once per projection, not once
     /// per token.
+    ///
+    /// An expert with no gate projection (Nemotron-H) computes
+    /// `Y = relu(X W_u^T)^2 W_d^T` instead.
     pub fn forward(&self, x: ArrayView2<'_, f32>, be: &dyn ExpertCompute) -> Array2<f32> {
         debug_assert_eq!(x.ncols(), self.d_model);
-        let mut h = be.matmul_xt(x, &self.gate.as_weight());
-        h.mapv_inplace(silu);
-        let u = be.matmul_xt(x, &self.up.as_weight());
-        h *= &u;
+        let h = match &self.gate {
+            Some(gate) => {
+                let mut h = be.matmul_xt(x, &gate.as_weight());
+                h.mapv_inplace(silu);
+                let u = be.matmul_xt(x, &self.up.as_weight());
+                h *= &u;
+                h
+            }
+            None => {
+                let mut h = be.matmul_xt(x, &self.up.as_weight());
+                h.mapv_inplace(relu_squared);
+                h
+            }
+        };
         be.matmul_xt(h.view(), &self.down.as_weight())
     }
 }
@@ -518,8 +545,130 @@ fn parse_shape(meta: &HashMap<String, String>, name: &str) -> MoeExecResult<(usi
 }
 
 #[inline]
+fn relu_squared(x: f32) -> f32 {
+    let r = x.max(0.0);
+    r * r
+}
+
+#[inline]
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+// ---------------------------------------------------------------------------
+// Latent MoE layer
+// ---------------------------------------------------------------------------
+
+/// Tensor name of the hidden-to-latent projection in a latent-projection blob.
+pub const TENSOR_LATENT_IN: &str = "latent_in.weight";
+/// Tensor name of the latent-to-hidden projection in a latent-projection blob.
+pub const TENSOR_LATENT_OUT: &str = "latent_out.weight";
+
+/// The two layer-level projections of a Latent MoE layer (Nemotron-H).
+///
+/// The routed experts work in a latent space smaller than the hidden size:
+/// the hidden state is projected down once, every selected expert runs on the
+/// latent vector, the weighted sum is projected back up once. The router and
+/// the shared expert read the full hidden state, so a routed expert's
+/// `d_model` is the latent size, not the model's.
+#[derive(Debug, Clone)]
+pub struct LatentProjection {
+    /// `[d_latent, d_model]`.
+    down: Array2<f32>,
+    /// `[d_model, d_latent]`.
+    up: Array2<f32>,
+}
+
+impl LatentProjection {
+    /// Parse a latent-projection blob ([`TENSOR_LATENT_IN`] and
+    /// [`TENSOR_LATENT_OUT`]) and check the two against each other.
+    pub fn from_safetensors(bytes: &[u8]) -> MoeExecResult<Self> {
+        let st = SafeTensors::deserialize(bytes).map_err(|e| MoeExecError::Parse(e.to_string()))?;
+        let down = tensor_to_f32_matrix(TENSOR_LATENT_IN, &required_tensor(&st, TENSOR_LATENT_IN)?)?;
+        let up = tensor_to_f32_matrix(TENSOR_LATENT_OUT, &required_tensor(&st, TENSOR_LATENT_OUT)?)?;
+        if up.dim() != (down.ncols(), down.nrows()) {
+            let (r, c) = up.dim();
+            return Err(MoeExecError::BadShape {
+                name: TENSOR_LATENT_OUT.to_string(),
+                got: vec![r, c],
+                expected: format!(
+                    "[{}, {}] (transpose of {TENSOR_LATENT_IN})",
+                    down.ncols(),
+                    down.nrows()
+                ),
+            });
+        }
+        Ok(Self { down, up })
+    }
+
+    /// Latent width the routed experts work in.
+    pub fn d_latent(&self) -> usize {
+        self.down.nrows()
+    }
+
+    /// Model (hidden) width.
+    pub fn d_model(&self) -> usize {
+        self.down.ncols()
+    }
+}
+
+/// One Latent MoE layer over a batch of hidden states `[n_tokens, d_model]`:
+/// `y = shared(h) + latent_up( sum_i w_i * expert_i( latent_down(h) ) )`,
+/// with the routing weights `w_i` from the gate (sigmoid scores renormalised
+/// over the selection and scaled, selection steered by the bias).
+///
+/// `experts` holds the routed experts this caller can run, by expert index;
+/// an expert the router selects that is not present contributes nothing, so
+/// the function also computes one holder's partial sum when the experts are
+/// sharded across nodes (the partials of the holders add up to the layer's
+/// routed output, and the up projection is linear).
+///
+/// # Errors
+/// When the gate, the projection and the experts disagree on widths.
+pub fn latent_moe_forward(
+    hidden: ArrayView2<'_, f32>,
+    gate: &GatingNetwork,
+    top_k: usize,
+    latent: &LatentProjection,
+    experts: &HashMap<u32, ExpertFfn>,
+    shared: Option<&ExpertFfn>,
+    be: &dyn ExpertCompute,
+) -> MoeExecResult<Array2<f32>> {
+    let d_model = latent.d_model();
+    if hidden.ncols() != d_model || gate.d_model() != d_model {
+        return Err(MoeExecError::DimensionMismatch {
+            len: hidden.ncols(),
+            tokens: 1,
+            d_model,
+        });
+    }
+    let d_latent = latent.d_latent();
+    for e in experts.values() {
+        if e.d_model() != d_latent {
+            return Err(MoeExecError::DimensionMismatch {
+                len: e.d_model(),
+                tokens: 1,
+                d_model: d_latent,
+            });
+        }
+    }
+    let n = hidden.nrows();
+    // [n, d_latent] = hidden · downᵀ
+    let z = be.matmul_xt(hidden, &Weight::Dense(latent.down.view()));
+    let mut mixed = Array2::<f32>::zeros((n, d_latent));
+    for (t, row) in hidden.axis_iter(Axis(0)).enumerate() {
+        for (expert, weight) in gate.route(row, top_k) {
+            if let Some(ffn) = experts.get(&expert) {
+                let out = ffn.forward(z.slice(ndarray::s![t..=t, ..]), be);
+                mixed.row_mut(t).scaled_add(weight, &out.row(0));
+            }
+        }
+    }
+    let mut y = be.matmul_xt(mixed.view(), &Weight::Dense(latent.up.view()));
+    if let Some(shared) = shared {
+        y += &shared.forward(hidden, be);
+    }
+    Ok(y)
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +695,11 @@ pub struct GatingNetwork {
     bias: Option<Array1<f32>>,
     routed_scaling_factor: f32,
     shared_experts: u32,
+    /// The Latent MoE projections of this layer, when the blob carries them
+    /// ([`TENSOR_LATENT_IN`] and [`TENSOR_LATENT_OUT`]). The routed experts
+    /// then work in the latent space and the shared expert, if any, in the
+    /// full hidden space on the router peer.
+    latent: Option<LatentProjection>,
 }
 
 impl GatingNetwork {
@@ -578,12 +732,32 @@ impl GatingNetwork {
             .get(META_SHARED_EXPERTS)
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
+        let latent = if st.tensor(TENSOR_LATENT_IN).is_ok() {
+            Some(LatentProjection::from_safetensors(bytes)?)
+        } else {
+            None
+        };
+        if let Some(l) = &latent
+            && l.d_model() != weight.ncols()
+        {
+            return Err(MoeExecError::BadShape {
+                name: TENSOR_LATENT_IN.to_string(),
+                got: vec![l.d_latent(), l.d_model()],
+                expected: format!("[d_latent, {}] (the router's hidden width)", weight.ncols()),
+            });
+        }
         Ok(Self {
             weight,
             bias,
             routed_scaling_factor,
             shared_experts,
+            latent,
         })
+    }
+
+    /// The layer's Latent MoE projections, when it has them.
+    pub fn latent(&self) -> Option<&LatentProjection> {
+        self.latent.as_ref()
     }
 
     /// Number of routed experts this gate selects over.
@@ -677,7 +851,10 @@ impl GatingNetwork {
         hidden: ArrayView2<'_, f32>,
         top_k: usize,
     ) -> Vec<RoutedToken> {
-        let shared_slot = (self.shared_experts > 0).then(|| RoutedSlot {
+        // A Latent MoE layer's shared expert reads the full hidden state and
+        // runs on the router peer ([`MoeExpertRuntime::latent_finish`]); it
+        // is not a slot shipped to an expert holder in the latent space.
+        let shared_slot = (self.shared_experts > 0 && self.latent.is_none()).then(|| RoutedSlot {
             expert: ExpertId::new(layer, self.num_experts() as u32),
             weight: 1.0,
         });
@@ -1560,6 +1737,93 @@ impl MoeExpertRuntime {
         Ok(gate.route_batch(layer, x, top_k))
     }
 
+    /// For a Latent MoE layer, project the hidden states `[n, d_model]` down
+    /// to the latent space the routed experts work in. `None` for a layer
+    /// without latent projections, whose hidden states go to the experts as
+    /// they are. Returns the flattened `[n, d_latent]` buffer and `d_latent`.
+    pub fn latent_down(
+        &self,
+        model_id: &str,
+        layer: u32,
+        d_model: usize,
+        hidden_states: &[f32],
+    ) -> MoeExecResult<Option<(Vec<f32>, usize)>> {
+        let Some(gate) = self.gates.get(&GateKey {
+            model_id: model_id.to_string(),
+            layer,
+        }) else {
+            return Ok(None);
+        };
+        let Some(latent) = gate.latent() else {
+            return Ok(None);
+        };
+        let x = view_hidden(hidden_states, d_model)?;
+        if d_model != latent.d_model() {
+            return Err(MoeExecError::DimensionMismatch {
+                len: hidden_states.len(),
+                tokens: x.nrows(),
+                d_model,
+            });
+        }
+        let (_, compute) = self
+            .backend
+            .as_ref()
+            .map_err(|reason| MoeExecError::ComputeUnavailable(reason.clone()))?;
+        let z = compute.matmul_xt(x, &Weight::Dense(latent.down.view()));
+        Ok(Some((z.iter().copied().collect(), latent.d_latent())))
+    }
+
+    /// Finish a Latent MoE layer: project the combined routed output
+    /// `[n, d_latent]` back up to the hidden width and add the shared expert,
+    /// when this peer holds it (loaded as expert `num_experts` of the layer,
+    /// reading the full hidden states `[n, d_model]`).
+    pub fn latent_finish(
+        &self,
+        model_id: &str,
+        layer: u32,
+        mixed: &[f32],
+        hidden_states: &[f32],
+    ) -> MoeExecResult<Vec<f32>> {
+        let gate = self
+            .gates
+            .get(&GateKey {
+                model_id: model_id.to_string(),
+                layer,
+            })
+            .map(|g| Arc::clone(g.value()))
+            .ok_or_else(|| MoeExecError::GateNotLoaded {
+                model_id: model_id.to_string(),
+                layer,
+            })?;
+        let latent = gate.latent().ok_or_else(|| {
+            MoeExecError::Parse(format!("layer {layer} of {model_id} has no latent projections"))
+        })?;
+        let d_model = latent.d_model();
+        let m = view_hidden(mixed, latent.d_latent())?;
+        let h = view_hidden(hidden_states, d_model)?;
+        if m.nrows() != h.nrows() {
+            return Err(MoeExecError::DimensionMismatch {
+                len: mixed.len(),
+                tokens: h.nrows(),
+                d_model: latent.d_latent(),
+            });
+        }
+        let (_, compute) = self
+            .backend
+            .as_ref()
+            .map_err(|reason| MoeExecError::ComputeUnavailable(reason.clone()))?;
+        let mut y = compute.matmul_xt(m, &Weight::Dense(latent.up.view()));
+        let shared = ExpertKey {
+            model_id: model_id.to_string(),
+            layer,
+            expert: gate.num_experts() as u32,
+        };
+        if let Some(ffn) = self.resolve(&shared)? {
+            y += &ffn.forward(h, compute.as_ref());
+        }
+        Ok(y.iter().copied().collect())
+    }
+
     /// Execute one batched expert-FFN request against a resident expert.
     /// A disk-tier expert is promoted into memory on demand.
     pub fn execute(&self, req: &ExpertExecuteRequest) -> MoeExecResult<ExpertExecuteResponse> {
@@ -1800,7 +2064,10 @@ impl ExpertQuantPlan {
 pub fn quantize_expert_blob(dense_blob: &[u8], plan: ExpertQuantPlan) -> MoeExecResult<Vec<u8>> {
     let st =
         SafeTensors::deserialize(dense_blob).map_err(|e| MoeExecError::Parse(e.to_string()))?;
-    let gate = tensor_to_f32_matrix(TENSOR_GATE_PROJ, &required_tensor(&st, TENSOR_GATE_PROJ)?)?;
+    let gate = match st.tensor(TENSOR_GATE_PROJ) {
+        Ok(view) => Some(tensor_to_f32_matrix(TENSOR_GATE_PROJ, &view)?),
+        Err(_) => None,
+    };
     let up = tensor_to_f32_matrix(TENSOR_UP_PROJ, &required_tensor(&st, TENSOR_UP_PROJ)?)?;
     let down = tensor_to_f32_matrix(TENSOR_DOWN_PROJ, &required_tensor(&st, TENSOR_DOWN_PROJ)?)?;
 
@@ -1847,18 +2114,18 @@ pub fn quantize_expert_blob(dense_blob: &[u8], plan: ExpertQuantPlan) -> MoeExec
         }
     }
 
-    let encoded = [
-        encode(TENSOR_GATE_PROJ, &gate, plan.gate),
-        encode(TENSOR_UP_PROJ, &up, plan.up),
-        encode(TENSOR_DOWN_PROJ, &down, plan.down),
-    ];
+    let mut encoded = Vec::with_capacity(3);
+    let mut logical = Vec::with_capacity(3);
+    if let Some(gate) = &gate {
+        encoded.push(encode(TENSOR_GATE_PROJ, gate, plan.gate));
+        logical.push((TENSOR_GATE_PROJ, gate.nrows(), gate.ncols()));
+    }
+    encoded.push(encode(TENSOR_UP_PROJ, &up, plan.up));
+    logical.push((TENSOR_UP_PROJ, up.nrows(), up.ncols()));
+    encoded.push(encode(TENSOR_DOWN_PROJ, &down, plan.down));
+    logical.push((TENSOR_DOWN_PROJ, down.nrows(), down.ncols()));
 
     let mut metadata: HashMap<String, String> = HashMap::new();
-    let logical = [
-        (TENSOR_GATE_PROJ, gate.nrows(), gate.ncols()),
-        (TENSOR_UP_PROJ, up.nrows(), up.ncols()),
-        (TENSOR_DOWN_PROJ, down.nrows(), down.ncols()),
-    ];
     for (e, (_, r, c)) in encoded.iter().zip(logical.iter()) {
         if let Some(k) = e.quant {
             metadata.insert(
@@ -3277,5 +3544,253 @@ mod carrier_bound_tests {
         let rows = vec![0.5f32; 2 * 32];
         let req = ExpertExecuteRequest::compressed("m".into(), 0, 0, vec![0, 1], 32, rows);
         assert_eq!(req.materialize_hidden().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn an_expert_without_a_gate_projection_computes_squared_relu() {
+        // Nemotron-H experts have up and down only: Y = relu(X Wu^T)^2 Wd^T.
+        // up = [[1,0],[0,-1]], down = [[1,1],[2,0]], x = [3, 2]:
+        // u = [3, -2] -> relu = [3, 0] -> sq = [9, 0] -> y = [9, 18].
+        let up = vec![1.0f32, 0.0, 0.0, -1.0];
+        let down = vec![1.0f32, 1.0, 2.0, 0.0];
+        let blob = {
+            let to = |v: &Vec<f32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            let (ub, db) = (to(&up), to(&down));
+            safetensors::serialize(
+                vec![
+                    (TENSOR_UP_PROJ, TensorView::new(Dtype::F32, vec![2, 2], &ub).unwrap()),
+                    (TENSOR_DOWN_PROJ, TensorView::new(Dtype::F32, vec![2, 2], &db).unwrap()),
+                ],
+                None,
+            )
+            .unwrap()
+        };
+        let ffn = ExpertFfn::from_safetensors(&blob).expect("an ungated expert loads");
+        assert_eq!((ffn.d_model(), ffn.d_ff()), (2, 2));
+        let x = ndarray::arr2(&[[3.0f32, 2.0]]);
+        let y = ffn.forward(x.view(), &crate::compute::CpuCompute::detect());
+        assert_eq!(y.row(0).to_vec(), vec![9.0, 18.0]);
+        // The quantise step keeps the blob ungated.
+        let q = quantize_expert_blob(&blob, ExpertQuantPlan::default()).unwrap();
+        assert!(ExpertFfn::from_safetensors(&q).is_ok());
+    }
+
+    /// A small Latent MoE layer, end to end from safetensors blobs: the layer
+    /// output equals an independent reference written out by hand, and the
+    /// partial sums of two expert holders add up to the routed output.
+    #[test]
+    fn a_latent_moe_layer_matches_a_hand_written_reference_and_shards() {
+        let (d_model, d_latent, d_ff, n_experts, top_k) = (8usize, 4usize, 6usize, 6usize, 2usize);
+        let mut seed = 0x2545_f491_u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 0.8
+        };
+        let mat = |rows: usize, cols: usize, rnd: &mut dyn FnMut() -> f32| -> Vec<f32> {
+            (0..rows * cols).map(|_| rnd()).collect()
+        };
+        let f32_bytes =
+            |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let blob = |tensors: Vec<(&str, usize, usize, Vec<u8>)>, meta: Option<HashMap<String, String>>| {
+            let views: Vec<(String, TensorView<'_>)> = tensors
+                .iter()
+                .map(|(n, r, c, b)| {
+                    (n.to_string(), TensorView::new(Dtype::F32, vec![*r, *c], b).unwrap())
+                })
+                .collect();
+            safetensors::serialize(views, meta).unwrap()
+        };
+        // weights
+        let down_w = mat(d_latent, d_model, &mut rnd);
+        let up_w = mat(d_model, d_latent, &mut rnd);
+        let router_w = mat(n_experts, d_model, &mut rnd);
+        let bias_w: Vec<f32> = (0..n_experts).map(|i| i as f32 * 0.01).collect();
+        let mut up_proj = Vec::new();
+        let mut down_proj = Vec::new();
+        for _ in 0..n_experts {
+            up_proj.push(mat(d_ff, d_latent, &mut rnd));
+            down_proj.push(mat(d_latent, d_ff, &mut rnd));
+        }
+        let sh_up = mat(d_ff, d_model, &mut rnd);
+        let sh_down = mat(d_model, d_ff, &mut rnd);
+        // blobs
+        let latent = LatentProjection::from_safetensors(&blob(
+            vec![
+                (TENSOR_LATENT_IN, d_latent, d_model, f32_bytes(&down_w)),
+                (TENSOR_LATENT_OUT, d_model, d_latent, f32_bytes(&up_w)),
+            ],
+            None,
+        ))
+        .unwrap();
+        let bias_bytes = f32_bytes(&bias_w);
+        let router_bytes = f32_bytes(&router_w);
+        let gate = GatingNetwork::from_safetensors(&{
+            let views = vec![
+                (TENSOR_ROUTER, TensorView::new(Dtype::F32, vec![n_experts, d_model], &router_bytes).unwrap()),
+                (TENSOR_ROUTER_BIAS, TensorView::new(Dtype::F32, vec![n_experts], &bias_bytes).unwrap()),
+            ];
+            safetensors::serialize(
+                views,
+                Some(HashMap::from([
+                    (META_ROUTED_SCALING_FACTOR.to_string(), "5.0".to_string()),
+                    (META_SHARED_EXPERTS.to_string(), "1".to_string()),
+                ])),
+            )
+            .unwrap()
+        })
+        .unwrap();
+        let mut experts = HashMap::new();
+        for e in 0..n_experts {
+            let b = blob(
+                vec![
+                    (TENSOR_UP_PROJ, d_ff, d_latent, f32_bytes(&up_proj[e])),
+                    (TENSOR_DOWN_PROJ, d_latent, d_ff, f32_bytes(&down_proj[e])),
+                ],
+                None,
+            );
+            experts.insert(e as u32, ExpertFfn::from_safetensors(&b).unwrap());
+        }
+        let shared = ExpertFfn::from_safetensors(&blob(
+            vec![
+                (TENSOR_UP_PROJ, d_ff, d_model, f32_bytes(&sh_up)),
+                (TENSOR_DOWN_PROJ, d_model, d_ff, f32_bytes(&sh_down)),
+            ],
+            None,
+        ))
+        .unwrap();
+        let hidden = Array2::from_shape_fn((3, d_model), |(t, i)| ((t * 7 + i * 3) % 11) as f32 * 0.1 - 0.5);
+        let cpu = crate::compute::CpuCompute::detect();
+        let y = latent_moe_forward(hidden.view(), &gate, top_k, &latent, &experts, Some(&shared), &cpu).unwrap();
+
+        // Independent reference, plain loops.
+        let at = |w: &[f32], cols: usize, r: usize, c: usize| w[r * cols + c];
+        let mut want = Array2::<f32>::zeros((3, d_model));
+        for t in 0..3 {
+            let h = hidden.row(t);
+            let z: Vec<f32> = (0..d_latent)
+                .map(|r| (0..d_model).map(|c| at(&down_w, d_model, r, c) * h[c]).sum())
+                .collect();
+            let mut mixed = vec![0.0f32; d_latent];
+            for (expert, weight) in gate.route(h, top_k) {
+                let e = expert as usize;
+                let hid: Vec<f32> = (0..d_ff)
+                    .map(|r| {
+                        let u: f32 = (0..d_latent).map(|c| at(&up_proj[e], d_latent, r, c) * z[c]).sum();
+                        u.max(0.0) * u.max(0.0)
+                    })
+                    .collect();
+                for r in 0..d_latent {
+                    let o: f32 = (0..d_ff).map(|c| at(&down_proj[e], d_ff, r, c) * hid[c]).sum();
+                    mixed[r] += weight * o;
+                }
+            }
+            let shared_hid: Vec<f32> = (0..d_ff)
+                .map(|r| {
+                    let u: f32 = (0..d_model).map(|c| at(&sh_up, d_model, r, c) * h[c]).sum();
+                    u.max(0.0) * u.max(0.0)
+                })
+                .collect();
+            for r in 0..d_model {
+                let routed: f32 = (0..d_latent).map(|c| at(&up_w, d_latent, r, c) * mixed[c]).sum();
+                let sh: f32 = (0..d_ff).map(|c| at(&sh_down, d_ff, r, c) * shared_hid[c]).sum();
+                want[[t, r]] = routed + sh;
+            }
+        }
+        for (a, b) in y.iter().zip(want.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+        // Two holders, each with half the experts: the partials add up.
+        let (mut left, mut right) = (HashMap::new(), HashMap::new());
+        for (id, ffn) in experts {
+            if id % 2 == 0 { left.insert(id, ffn) } else { right.insert(id, ffn) };
+        }
+        let a = latent_moe_forward(hidden.view(), &gate, top_k, &latent, &left, None, &cpu).unwrap();
+        let b = latent_moe_forward(hidden.view(), &gate, top_k, &latent, &right, None, &cpu).unwrap();
+        let shared_only = shared.forward(hidden.view(), &cpu);
+        let sum = &a + &b + &shared_only;
+        for (x, y) in sum.iter().zip(y.iter()) {
+            assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+        }
+        // The serving path: the same layer through the runtime a router peer
+        // and its expert holders run. The gate blob carries the latent
+        // projections, the experts are loaded in the latent space and the
+        // shared expert at index `num_experts` in the hidden space.
+        let down_bytes = f32_bytes(&down_w);
+        let up_bytes = f32_bytes(&up_w);
+        let gate_blob = safetensors::serialize(
+            vec![
+                (TENSOR_ROUTER, TensorView::new(Dtype::F32, vec![n_experts, d_model], &router_bytes).unwrap()),
+                (TENSOR_ROUTER_BIAS, TensorView::new(Dtype::F32, vec![n_experts], &bias_bytes).unwrap()),
+                (TENSOR_LATENT_IN, TensorView::new(Dtype::F32, vec![d_latent, d_model], &down_bytes).unwrap()),
+                (TENSOR_LATENT_OUT, TensorView::new(Dtype::F32, vec![d_model, d_latent], &up_bytes).unwrap()),
+            ],
+            Some(HashMap::from([
+                (META_ROUTED_SCALING_FACTOR.to_string(), "5.0".to_string()),
+                (META_SHARED_EXPERTS.to_string(), "1".to_string()),
+            ])),
+        )
+        .unwrap();
+        let rt = MoeExpertRuntime::cpu();
+        rt.load_gate("m", 4, &gate_blob).unwrap();
+        for e in 0..n_experts {
+            let b = blob(
+                vec![
+                    (TENSOR_UP_PROJ, d_ff, d_latent, f32_bytes(&up_proj[e])),
+                    (TENSOR_DOWN_PROJ, d_latent, d_ff, f32_bytes(&down_proj[e])),
+                ],
+                None,
+            );
+            rt.load_expert("m", 4, e as u32, &b, None).unwrap();
+        }
+        let shared_blob = blob(
+            vec![
+                (TENSOR_UP_PROJ, d_ff, d_model, f32_bytes(&sh_up)),
+                (TENSOR_DOWN_PROJ, d_model, d_ff, f32_bytes(&sh_down)),
+            ],
+            None,
+        );
+        rt.load_expert("m", 4, n_experts as u32, &shared_blob, None).unwrap();
+        let flat: Vec<f32> = hidden.iter().copied().collect();
+        let routed = rt.route("m", 4, d_model, &flat, top_k).unwrap();
+        // No slot is shipped for the shared expert: it runs here.
+        assert!(routed.iter().all(|t| t.slots.iter().all(|s| (s.expert.expert as usize) < n_experts)));
+        let (z, dl) = rt.latent_down("m", 4, d_model, &flat).unwrap().expect("a latent layer");
+        assert_eq!(dl, d_latent);
+        let mut combiner = MoeCombiner::new(d_latent, &routed).unwrap();
+        let mut by_expert: HashMap<u32, Vec<u32>> = HashMap::new();
+        for t in &routed {
+            for slot in &t.slots {
+                by_expert.entry(slot.expert.expert).or_default().push(t.token_index);
+            }
+        }
+        for (expert, tokens) in by_expert {
+            let rows: Vec<f32> = tokens
+                .iter()
+                .flat_map(|t| z[*t as usize * d_latent..(*t as usize + 1) * d_latent].to_vec())
+                .collect();
+            let req = ExpertExecuteRequest::compressed("m".to_string(), 4, expert, tokens, d_latent as u32, rows);
+            combiner.accumulate(&rt.execute(&req).unwrap()).unwrap();
+        }
+        let mixed = combiner.finish().unwrap();
+        let served = rt.latent_finish("m", 4, &mixed, &flat).unwrap();
+        for (a, b) in served.iter().zip(y.iter()) {
+            assert!((a - b).abs() < 1e-4, "serving path {a} vs layer function {b}");
+        }
+        // A layer without latent projections is untouched by the path.
+        rt.load_gate("m", 5, &{
+            safetensors::serialize(
+                vec![(TENSOR_ROUTER, TensorView::new(Dtype::F32, vec![n_experts, d_model], &router_bytes).unwrap())],
+                None,
+            )
+            .unwrap()
+        })
+        .unwrap();
+        assert!(rt.latent_down("m", 5, d_model, &flat).unwrap().is_none());
+
+        // Widths that disagree are refused.
+        let narrow = Array2::<f32>::zeros((1, d_model + 1));
+        assert!(latent_moe_forward(narrow.view(), &gate, top_k, &latent, &HashMap::new(), None, &cpu).is_err());
     }
 }
