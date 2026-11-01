@@ -18,6 +18,7 @@ Programs:
   warp.example           one of NVIDIA Warp's examples, headless, with its USD stage
   newton.example         one of Newton's examples, headless, as a USD stage
   newton.scene           Newton on a scene the job brings (USD, MJCF or URDF), headless, with a trajectory
+  lw.lives               Living Worlds' population life course from the pinned engine tree (GPU build or CPU twin)
   cosmos.generate        NVIDIA Cosmos 3 video generation, guardrail always on
   physicsnemo.darcy_fno  PhysicsNeMo Fourier neural operator trained on Darcy flow
   physicsnemo.surrogate_fit      a PhysicsNeMo FNO or MLP trained on the job's dataset, with a model card
@@ -340,6 +341,115 @@ def newton_scene(params, inputs, out, work):
 # ---------------------------------------------------------------- Cosmos
 
 COSMOS_MODELS = {"edge": "nvidia/Cosmos3-Edge", "nano": "nvidia/Cosmos3-Nano"}
+
+
+LW_SEED0 = 20261004  # the first registered seed; the engine adds the seed's index
+LW_REGISTERED = {"lives": 200000, "months": 120, "seeds": 10}  # the registered equivalence run (eq10.txt)
+
+
+def _lw_root():
+    root = os.environ.get("LW_ENGINE_ROOT", "")
+    if not root or not Path(root).is_dir():
+        raise RuntimeError("the Living Worlds engine tree is not installed on this machine (LW_ENGINE_ROOT)")
+    return Path(root)
+
+
+def _lw_hardware(backend):
+    cpu = ""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.lower().startswith(("model name", "cpu part", "hardware")):
+                cpu = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    gpu = ""
+    if backend == "gpu":
+        try:
+            gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"], capture_output=True,
+                                 text=True, timeout=20).stdout.strip().splitlines()[0]
+        except (OSError, IndexError, subprocess.SubprocessError):
+            gpu = "unknown (nvidia-smi is not available in the confined host)"
+    return {"machine": os.uname().machine, "cpu": cpu, "gpu": gpu}
+
+
+@program("lw.lives")
+def lw_lives(params, inputs, out, work):
+    """Runs the pinned Living Worlds life-course binary. Nothing a caller sends is a command: the mode, backend and
+    counts are checked, the binary and its tables come from the pinned tree, and the tree's own record (`PINNED.json`)
+    says which engine commit and which file hashes it was built from."""
+    root = _lw_root()
+    mode = params.get("mode", "equivalence")
+    backend = params.get("backend", "gpu")
+    if mode not in ("equivalence", "throughput") or backend not in ("gpu", "cpu"):
+        raise ValueError("mode is equivalence or throughput, backend is gpu or cpu")
+    if backend == "gpu" and not Path("/dev/nvidiactl").exists():
+        raise RuntimeError("the GPU backend needs a CUDA GPU and none is usable here")
+    equivalence = mode == "equivalence"
+    lives = limit(params, "lives", LW_REGISTERED["lives"] if equivalence else 1_000_000, 1_000, 2_000_000_000)
+    months = limit(params, "months", LW_REGISTERED["months"] if equivalence else 12, 1, 1200)
+    seeds = limit(params, "seeds", LW_REGISTERED["seeds"], 1, 100) if equivalence else 1
+    threads = limit(params, "threads", 8, 1, 64)
+    binary = root / "bin" / ("lives" if backend == "gpu" else "lives_cpu")
+    if not binary.is_file():
+        raise RuntimeError(f"the {backend} build is not in the pinned tree ({binary.name})")
+    pinned = {}
+    try:
+        pinned = json.loads((root / "PINNED.json").read_text())
+    except (OSError, ValueError):
+        raise RuntimeError("the pinned tree has no PINNED.json") from None
+    hazards = Path(inputs["hazards"]) if inputs.get("hazards") else root / "hazards.txt"
+    registered_hazards = (root / "hazards.txt").is_file() and _sha256(hazards) == _sha256(root / "hazards.txt")
+    if params.get("registered") and not registered_hazards:
+        raise ValueError("a registered run uses the tree's own hazards.txt")
+    argv = [str(binary), mode, str(hazards), str(lives), str(months)] + ([str(seeds)] if equivalence else [])
+    env = {"OMP_NUM_THREADS": str(threads), "OMP_PROC_BIND": "true"} if backend == "cpu" else {}
+    started = time.time()
+    results = Path(out, "results.jsonl")
+    tail = deque(maxlen=60)
+    progress(0.02, f"{mode} {backend}: {lives} lives, {months} months" + (f", {seeds} seeds" if equivalence else ""))
+    p = subprocess.Popen(argv, cwd=work, env={**os.environ, **env}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         errors="replace", preexec_fn=(lambda: os.nice(19)) if backend == "cpu" else None)
+    lines = []
+    try:
+        for line in p.stdout:
+            line = line.rstrip()
+            tail.append(line)
+            if line.startswith("{"):
+                lines.append(line)
+                if equivalence:
+                    progress(min(0.98, len(lines) / seeds), f"seed {len(lines)} of {seeds}")
+        code = p.wait(timeout=3600)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        raise RuntimeError("the run exceeded its time limit") from None
+    if code != 0 or not lines:
+        raise RuntimeError(f"{binary.name} exited with {code}:\n" + "\n".join(list(tail)[-15:]))
+    results.write_text("\n".join(lines) + "\n")
+    matches = None
+    registered_file = root / "eq10.txt"
+    if equivalence and registered_hazards and (lives, months) == (LW_REGISTERED["lives"], LW_REGISTERED["months"]) and registered_file.is_file():
+        record = [l for l in registered_file.read_text().splitlines() if l.startswith("{")]
+        matches = lines == record[:len(lines)] and len(lines) <= len(record)
+    summary = {"program": "lw.lives", "mode": mode, "backend": backend, "lives": lives, "months": months,
+               "seeds": [LW_SEED0 + i for i in range(seeds)] if equivalence else [7],
+               "wall_seconds": round(time.time() - started, 3),
+               "engine_commit": pinned.get("engine_commit"), "engine_tree": pinned.get("source_files"),
+               "binary": binary.name, "binary_sha256": _sha256(binary),
+               "hazards_sha256": _sha256(hazards), "hazards_is_the_registered_table": registered_hazards,
+               "matches_registered_ten_seed_record": matches, "hardware": _lw_hardware(backend)}
+    Path(out, "summary.json").write_text(json.dumps(summary, indent=1))
+    Path(out, "run.log").write_text("\n".join(tail) + "\n")
+    if params.get("registered"):
+        if not equivalence:
+            raise ValueError("a registered run is an equivalence run")
+        # the registered record: the engine commit, the build, the hardware, then the lines, as registered-run.txt in the engine's repository
+        header = [f"engine_commit {pinned.get('engine_commit')}", f"build {(pinned.get('build') or {}).get(backend)}",
+                  f"hardware {json.dumps(summary['hardware'])}", f"start {time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(started))}",
+                  f"hazards_sha256 {summary['hazards_sha256']}", f"binary_sha256 {summary['binary_sha256']}"]
+        Path(out, "registered-run.txt").write_text("\n".join(header + lines) + "\nmatches_registered_ten_seed_record " + str(matches).lower() + "\n")
+    return write_result(out, {"mode": mode, "backend": backend, "lines": len(lines), "matches_registered_ten_seed_record": matches,
+                              "engine_commit": pinned.get("engine_commit"), "wall_seconds": summary["wall_seconds"]})
 
 
 @program("cosmos.generate")

@@ -163,6 +163,25 @@ pub fn programs() -> Vec<Program> {
             inputs: vec![Input { name: "scene", required: true }],
         },
         Program {
+            name: "lw.lives",
+            engine: "lw",
+            about: "Living Worlds' population life course (births, deaths, partnerships, separations, leaving home), run \
+                    from the pinned Living Worlds engine tree on the GPU build or the CPU twin. `equivalence` runs the \
+                    registered seeds (20261004 and up) and writes one JSON line per seed; `throughput` times a run. \
+                    Writes results.jsonl, summary.json (engine commit, tree files and their SHA-256, input SHA-256, \
+                    seeds, wall time, hardware, and whether the run matches the registered ten-seed record) and result.json.",
+            params: vec![
+                p("mode", Enum(&["equivalence", "throughput"]), false),
+                p("backend", Enum(&["gpu", "cpu"]), false),
+                p("lives", Int(1_000, 2_000_000_000), false),
+                p("months", Int(1, 1200), false),
+                p("seeds", Int(1, 100), false),
+                p("threads", Int(1, 64), false),
+                p("registered", Bool, false),
+            ],
+            inputs: vec![Input { name: "hazards", required: false }],
+        },
+        Program {
             name: "cosmos.generate",
             engine: "cosmos",
             about: "NVIDIA Cosmos 3 (Edge or Nano) generates a video from a prompt and an optional first image, with the \
@@ -805,6 +824,28 @@ mod tests {
         assert_eq!(names.len(), all.len());
         for p in &all {
             assert!(JOB_ADAPTER.contains(&format!("\"{}\"", p.name)), "the adapter has no program {}", p.name);
+        }
+    }
+
+    #[test]
+    fn the_life_course_program_is_held_to_its_declaration() {
+        let lw = program("lw.lives").unwrap();
+        assert_eq!(lw.engine, "lw");
+        lw.check_params(&params(json!({"mode": "equivalence", "backend": "cpu", "lives": 200_000, "months": 120, "seeds": 10, "threads": 8, "registered": true}))).unwrap();
+        lw.check_params(&params(json!({}))).unwrap();
+        for bad in [
+            json!({"mode": "run"}),
+            json!({"backend": "tpu"}),
+            json!({"lives": 10}),
+            json!({"lives": 3_000_000_000_i64}),
+            json!({"months": 0}),
+            json!({"seeds": 0}),
+            json!({"seeds": 101}),
+            json!({"threads": 0}),
+            json!({"command": "rm -rf /"}),
+            json!({"registered": "yes"}),
+        ] {
+            assert!(matches!(lw.check_params(&params(bad.clone())), Err(Error::Refused(_))), "{bad}");
         }
     }
 
