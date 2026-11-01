@@ -1635,6 +1635,25 @@ fn main() {
                 common_lib_dir.display()
             );
         }
+
+        // The common library's HTTP client code lives in the vendored
+        // cpp-httplib, which the llama.cpp build produces as its own library.
+        // Without linking it, a binary that pulls those objects in fails on
+        // undefined httplib symbols.
+        let httplib_dir = out_dir.join("build").join("vendor").join("cpp-httplib");
+        let mut httplib_dirs = vec![httplib_dir.clone()];
+        let httplib_profile_dir = httplib_dir.join(&profile);
+        if httplib_profile_dir.is_dir() {
+            httplib_dirs.push(httplib_profile_dir);
+        }
+        if library_file_exists(&httplib_dirs, "cpp-httplib", build_shared_libs, &target_os) {
+            for dir in &httplib_dirs {
+                if dir.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", dir.display());
+                }
+            }
+            println!("cargo:rustc-link-lib={llama_libs_kind}=cpp-httplib");
+        }
     }
 
     if cfg!(feature = "system-ggml") {

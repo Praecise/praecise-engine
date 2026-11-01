@@ -666,6 +666,7 @@ pub fn run_job(engine: &JobEngine, req: JobRequest, mut on_event: impl FnMut(&Va
 }
 
 /// The processes descended from `pid`, deepest first.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn descendants(pid: u32) -> Vec<u32> {
     let mut out = Vec::new();
@@ -680,12 +681,79 @@ pub fn descendants(pid: u32) -> Vec<u32> {
     out
 }
 
+/// The processes descended from `pid`, deepest first, from a snapshot of the
+/// process table.
+#[cfg(windows)]
+#[must_use]
+pub fn descendants(pid: u32) -> Vec<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    };
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    // SAFETY: the snapshot handle is checked and closed; the entry is a
+    // plain struct with `dwSize` set as the API requires.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut entry);
+        while ok != 0 {
+            pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            ok = Process32NextW(snap, &mut entry);
+        }
+        CloseHandle(snap);
+    }
+    fn walk(pid: u32, pairs: &[(u32, u32)], out: &mut Vec<u32>, depth: u32) {
+        if depth > 64 {
+            return;
+        }
+        for &(child, parent) in pairs {
+            if parent == pid && child != pid {
+                walk(child, pairs, out, depth + 1);
+                out.push(child);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(pid, &pairs, &mut out, 0);
+    out
+}
+
+/// No process table to read on this platform.
+#[cfg(not(any(target_os = "linux", windows)))]
+#[must_use]
+pub fn descendants(_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
 /// Kill every process descended from `pid` (not `pid` itself).
+#[cfg(unix)]
 pub fn kill_tree(pid: u32) {
     for p in descendants(pid) {
         if let Ok(p) = i32::try_from(p) {
             // SAFETY: sends a signal; no memory is touched.
             unsafe { libc::kill(p, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Kill every process descended from `pid` (not `pid` itself).
+#[cfg(windows)]
+pub fn kill_tree(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    for p in descendants(pid) {
+        // SAFETY: the handle is checked and closed; terminating takes no memory.
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, p);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
         }
     }
 }
