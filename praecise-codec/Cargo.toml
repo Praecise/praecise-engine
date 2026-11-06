@@ -11,7 +11,7 @@ libc = "0.2"
 # H.264 encode, built from the bundled source (BSD-2-Clause).
 openh264 = { version = "0.9.9", default-features = false, features = ["source"] }
 # H.264 and H.265 decode, pure Rust (MIT OR Apache-2.0).
-rust_h264 = "0.4.0"
+rust_h264 = "0.6.1"
 rust_h265 = "0.1.0"
 # AV1 encode, pure Rust (BSD-2-Clause); no assembly, so no assembler is needed.
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
