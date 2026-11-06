@@ -18,7 +18,7 @@ ndarray = "0.17"
 safetensors = "0.8"
 half = "2"
 # Available memory, for the auto-sized expert residency budget.
-sysinfo = "0.39"
+sysinfo = "0.40"
 # NVIDIA: cuBLAS grouped GEMM for expert projections. The driver is loaded at
 # run time.
 cudarc = { version = "0.19.10", optional = true, default-features = false, features = ["std", "cublas", "driver", "dynamic-loading"] }
