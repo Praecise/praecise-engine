@@ -23,7 +23,8 @@ alongside Praecise Engine-accelerated LLMs on a GB10.
 ## The problem
 
 Praecise Engine is backend-agnostic acceleration on top of an inference backend,
-llama.cpp first, with vLLM / TensorRT-LLM / MLX planned. That is agnosticism
+llama.cpp first (linked), with vLLM, SGLang, TensorRT-LLM and
+transformers reached as hosted backends. That is agnosticism
 across **backends**. Every backend on that roadmap is an **autoregressive token
 generator**.
 
