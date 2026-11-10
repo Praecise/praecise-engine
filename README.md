@@ -293,6 +293,15 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `praecise-host` — runtime hosts and the engine set: confined, supervised
   engines, one per model, within one memory budget; job engines and the
   `praecise-job` binary.
+- `praecise-ffi` — the stable C ABI over the runtime's backend-agnostic types
+  (config, result, stop reason, error), for callers in other languages.
+- `praecise-diffusion` — flow-matching image, video, audio and 3D generation on
+  the same ggml backend, device and memory budget as the language-model family.
+- `praecise-provenance` — signed C2PA content credentials embedded in generated
+  PNG, WAV and MP4 files, and their verification.
+- `praecise-train` — the training substrate: the deterministic replayable step,
+  the hash-linked step log, content-hashed checkpoints with lineage, objectives,
+  optimizers and parameter-delta primitives.
 - `praecise-codec` — in-process video coding: H.264, H.265 and AV1 decoding
   from MP4 and Matroska/WebM, H.264 and AV1 encoding to MP4 (AV1 also to
   WebM) with an Opus soundtrack. Generated videos are written as MP4.
