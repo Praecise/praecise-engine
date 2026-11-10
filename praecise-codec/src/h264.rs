@@ -5,7 +5,7 @@ use openh264::OpenH264API;
 use openh264::encoder::{BitRate, EncoderConfig, FrameRate, IntraFramePeriod, QpRange, RateControlMode, VuiConfig};
 use openh264::formats::YUVSlices;
 use rust_h264::decoder::OrderedDecoder;
-use rust_h264::nal::parse_annex_b;
+use rust_h264::nal::{NalUnitType, parse_annex_b, parse_sps_info};
 
 use crate::color::{Matrix, Planes, Yuv420};
 use crate::nal::{build_avcc, h264_type, parse_avcc, push_annex_b, push_prefixed, split_annex_b, split_prefixed};
@@ -106,6 +106,16 @@ fn decode_error(e: impl std::fmt::Debug) -> Error {
     Error::Codec(format!("H.264: {e:?}"))
 }
 
+/// Refuse sequences other than 8-bit 4:2:0, which the decoder now accepts
+/// but the sink does not take.
+fn check_sequence(sps: &rust_h264::nal::NalUnit<'_>) -> Result<()> {
+    let info = parse_sps_info(sps).map_err(decode_error)?;
+    if info.chroma_format != 1 || info.bit_depth_luma != 8 || info.bit_depth_chroma != 8 {
+        return Err(codec("unsupported: only 8-bit 4:2:0 streams are decoded"));
+    }
+    Ok(())
+}
+
 /// Decode with the pure-Rust decoder, which emits pictures in display order.
 pub(crate) fn decode(d: &Demuxed, sink: &mut Sink<'_>) -> Result<()> {
     let cfg = parse_avcc(&d.config)?;
@@ -123,6 +133,9 @@ pub(crate) fn decode(d: &Demuxed, sink: &mut Sink<'_>) -> Result<()> {
             push_annex_b(&mut stream, unit);
         }
         for unit in parse_annex_b(&stream) {
+            if unit.nal_unit_type == NalUnitType::Sps {
+                check_sequence(&unit)?;
+            }
             for f in dec.decode_nal(&unit).map_err(decode_error)? {
                 emit(sink, &f, m)?;
                 if sink.stopped() {

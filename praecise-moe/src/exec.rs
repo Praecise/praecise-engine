@@ -1286,7 +1286,9 @@ impl ResidencyConfig {
 /// host reports as available. Falls back to [`DEFAULT_MEMORY_BUDGET_BYTES`]
 /// when the reading is unavailable or rounds to zero.
 fn auto_memory_budget_bytes() -> u64 {
-    let mut sys = sysinfo::System::new();
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return DEFAULT_MEMORY_BUDGET_BYTES;
+    };
     sys.refresh_memory();
     let budget = sys.available_memory() / AUTO_BUDGET_DEN * AUTO_BUDGET_NUM;
     if budget > 0 {
