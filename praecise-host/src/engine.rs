@@ -50,8 +50,10 @@ impl EngineEnv {
     /// An environment for a hosted `backend`: a Python environment at `root`
     /// with the engine's packages installed and [`ADAPTER`] written by
     /// [`install_adapter`], run as `bin/python3 praecise_adapter.py <backend>`.
-    /// Every backend but transformers gets loopback: their workers and
-    /// collective-communication setup meet on 127.0.0.1 even on one GPU.
+    /// The serving engines (vLLM, SGLang, TensorRT-LLM) get loopback: their
+    /// workers and collective-communication setup meet on 127.0.0.1 even on
+    /// one device. transformers and OpenVINO GenAI run in one process and
+    /// get none.
     ///
     /// # Errors
     /// When `backend` is linked, not hosted.
@@ -65,7 +67,7 @@ impl EngineEnv {
             program: PathBuf::from("bin/python3"),
             args: vec![root.join(ADAPTER_FILE).display().to_string(), backend.as_str().to_string()],
             digest: digest.to_ascii_lowercase(),
-            loopback: backend != Backend::Transformers,
+            loopback: !matches!(backend, Backend::Transformers | Backend::OpenVino),
         })
     }
 
@@ -328,6 +330,9 @@ mod tests {
         let env = EngineEnv::adapter(Backend::Vllm, root, "AB").unwrap();
         assert!(env.loopback);
         assert!(!EngineEnv::adapter(Backend::Transformers, root, "ab").unwrap().loopback);
+        let openvino = EngineEnv::adapter(Backend::OpenVino, root, "ab").unwrap();
+        assert!(!openvino.loopback);
+        assert_eq!(openvino.args.last().map(String::as_str), Some("openvino"));
         assert_eq!(env.args, vec![root.join(ADAPTER_FILE).display().to_string(), "vllm".to_string()]);
         assert_eq!(env.digest, "ab");
         assert!(EngineEnv::adapter(Backend::LlamaCpp, root, "ab").is_err());

@@ -43,6 +43,9 @@ pub mod drafters;
 /// all, rather than how to draft them better. Backend-agnostic.
 pub mod entropy;
 pub mod error;
+/// The hardware layer: which accelerators the machine has (every vendor),
+/// which backend drives each, and the decode ceiling their memory sets.
+pub use praecise_hardware as hardware;
 /// Moving a live sequence's KV cache between engine instances of the same
 /// model: versioned, integrity-checked, incremental blobs. The format and its
 /// checks are backend-agnostic; export and import need a bundled backend.

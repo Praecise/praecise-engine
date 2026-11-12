@@ -19,7 +19,17 @@
 //!   to over its standard streams (the `praecise-host` crate). The runtime
 //!   owns its own decode loop. The engine chooses the model and the sampling
 //!   parameters, but it cannot interpose on token-by-token decoding. vLLM,
-//!   SGLang, TensorRT-LLM and transformers are hosted.
+//!   SGLang, TensorRT-LLM, transformers and OpenVINO GenAI are hosted.
+//!
+//! ## Which silicon each one reaches
+//!
+//! A backend is not a vendor. llama.cpp reaches every accelerator a ggml
+//! backend is built for; vLLM, SGLang and transformers reach whichever one
+//! the packages of their environment drive, through torch or a vendor's
+//! platform plugin; TensorRT-LLM is NVIDIA's and OpenVINO is Intel's.
+//! [`Backend::reaches`] answers it per accelerator from the routing tables of
+//! [`crate::hardware`], so a model is never assigned an engine that has no
+//! way onto the machine's silicon.
 //!
 //! That distinction is load-bearing. Against a hosted backend, this engine's
 //! speculation is **not** available — the runtime does its own, with its own
@@ -35,6 +45,7 @@
 use std::fmt;
 
 use crate::error::{Error, Result};
+use crate::hardware::{route, Accelerator, Kind, Machine, Vendor};
 use crate::spec_policy::{self, LoadState, ModelProfile, SpecPlan, SpecPolicy};
 
 /// An inference runtime the engine can drive.
@@ -51,6 +62,8 @@ pub enum Backend {
     TensorRtLlm,
     /// Hugging Face transformers, hosted; runs on the CPU as well as the GPU.
     Transformers,
+    /// OpenVINO GenAI, hosted: Intel CPUs, GPUs and NPUs.
+    OpenVino,
 }
 
 /// How the engine reaches a backend — see the module docs on why this decides
@@ -89,7 +102,14 @@ impl Backend {
     /// Every backend the engine knows about.
     #[must_use]
     pub fn all() -> &'static [Backend] {
-        &[Backend::LlamaCpp, Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::Transformers]
+        &[
+            Backend::LlamaCpp,
+            Backend::Vllm,
+            Backend::SgLang,
+            Backend::TensorRtLlm,
+            Backend::Transformers,
+            Backend::OpenVino,
+        ]
     }
 
     /// Stable identifier used in configuration, logs and engine claims.
@@ -101,6 +121,7 @@ impl Backend {
             Backend::SgLang => "sglang",
             Backend::TensorRtLlm => "tensorrt-llm",
             Backend::Transformers => "transformers",
+            Backend::OpenVino => "openvino",
         }
     }
 
@@ -116,6 +137,7 @@ impl Backend {
             "sglang" | "sgl" => Ok(Backend::SgLang),
             "tensorrt.llm" | "tensorrtllm" | "trtllm" | "tensorrt" => Ok(Backend::TensorRtLlm),
             "transformers" | "hf" => Ok(Backend::Transformers),
+            "openvino" | "openvino.genai" | "ov" => Ok(Backend::OpenVino),
             _ => Err(Error::BackendUnknown {
                 name: s.to_string(),
                 known: Backend::all().iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", "),
@@ -138,7 +160,11 @@ impl Backend {
             // streams text back. Nothing reaches inside its decode loop, so
             // engine-side speculation is impossible by construction, and the
             // host protocol carries no schema, so output is not constrained.
-            Backend::Vllm | Backend::SgLang | Backend::TensorRtLlm | Backend::Transformers => Capabilities {
+            Backend::Vllm
+            | Backend::SgLang
+            | Backend::TensorRtLlm
+            | Backend::Transformers
+            | Backend::OpenVino => Capabilities {
                 integration: Integration::Hosted,
                 engine_speculation: false,
                 logit_access: false,
@@ -146,6 +172,53 @@ impl Backend {
                 implemented: cfg!(target_os = "linux"),
             },
         }
+    }
+
+    /// Whether this backend has a way onto `accelerator`.
+    ///
+    /// For the linked backend that is a ggml backend for it; whether this
+    /// build carries that backend is a separate question the device list
+    /// answers at load. For a hosted backend it is the runtime's own reach:
+    /// a torch device, a vLLM platform or plugin, or the vendor the runtime
+    /// belongs to.
+    #[must_use]
+    pub fn reaches(self, accelerator: Accelerator) -> bool {
+        match self {
+            Backend::LlamaCpp => !route::ggml_backends(accelerator).is_empty(),
+            Backend::Vllm => route::vllm_platform(accelerator).is_some(),
+            // SGLang's server takes these torch device types.
+            Backend::SgLang => {
+                matches!(route::torch_device(accelerator), Some("cuda" | "xpu" | "hpu" | "npu" | "musa"))
+            }
+            Backend::Transformers => route::torch_device(accelerator).is_some(),
+            Backend::TensorRtLlm => accelerator == Accelerator { vendor: Vendor::Nvidia, kind: Kind::Gpu },
+            Backend::OpenVino => accelerator.vendor == Vendor::Intel && accelerator.kind != Kind::Accelerator,
+        }
+    }
+
+    /// The accelerators of `machine` this backend has a way onto.
+    #[must_use]
+    pub fn reachable(self, machine: &Machine) -> Vec<Accelerator> {
+        machine.accelerators().iter().copied().filter(|a| self.reaches(*a)).collect()
+    }
+
+    /// Fail unless this backend can use an accelerator of `machine`. A
+    /// machine without accelerators passes: there the CPU is the device.
+    ///
+    /// # Errors
+    /// [`Error::BackendUnreachable`] when the machine has accelerators and
+    /// the backend reaches none of them, naming the backends that do.
+    pub fn ensure_reaches(self, machine: &Machine) -> Result<()> {
+        if machine.is_cpu_only() || !self.reachable(machine).is_empty() {
+            return Ok(());
+        }
+        let able: Vec<&str> =
+            Backend::all().iter().filter(|b| !b.reachable(machine).is_empty()).map(|b| b.as_str()).collect();
+        Err(Error::BackendUnreachable {
+            backend: self.as_str(),
+            machine: machine.to_string(),
+            able: if able.is_empty() { "none".to_string() } else { able.join(", ") },
+        })
     }
 
     /// Whether this backend can be used right now.
@@ -215,7 +288,60 @@ mod tests {
     use super::*;
     use crate::config::GenerationConfig;
 
-    const HOSTED: [Backend; 4] = [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::Transformers];
+    const HOSTED: [Backend; 5] =
+        [Backend::Vllm, Backend::SgLang, Backend::TensorRtLlm, Backend::Transformers, Backend::OpenVino];
+
+    fn acc(vendor: Vendor, kind: Kind) -> Accelerator {
+        Accelerator { vendor, kind }
+    }
+
+    #[test]
+    fn every_major_vendor_gpu_is_reached_by_more_than_one_backend() {
+        // The point of the layer: no vendor's GPU depends on a single runtime.
+        for vendor in [Vendor::Nvidia, Vendor::Amd, Vendor::Intel, Vendor::Apple] {
+            let gpu = acc(vendor, Kind::Gpu);
+            let able: Vec<&str> = Backend::all().iter().filter(|b| b.reaches(gpu)).map(|b| b.as_str()).collect();
+            assert!(able.len() >= 3, "{vendor}: {able:?}");
+            assert!(able.contains(&"llama.cpp"), "{vendor}: {able:?}");
+        }
+    }
+
+    #[test]
+    fn vendor_runtimes_reach_only_their_own_silicon() {
+        assert!(Backend::TensorRtLlm.reaches(acc(Vendor::Nvidia, Kind::Gpu)));
+        // ROCm presents as torch "cuda"; TensorRT-LLM still cannot run there
+        assert!(!Backend::TensorRtLlm.reaches(acc(Vendor::Amd, Kind::Gpu)));
+        assert!(Backend::OpenVino.reaches(acc(Vendor::Intel, Kind::Npu)));
+        assert!(!Backend::OpenVino.reaches(acc(Vendor::Intel, Kind::Accelerator)));
+        assert!(!Backend::OpenVino.reaches(acc(Vendor::Amd, Kind::Gpu)));
+    }
+
+    #[test]
+    fn accelerators_without_a_linked_backend_are_reached_through_a_host() {
+        let gaudi = acc(Vendor::Intel, Kind::Accelerator);
+        assert!(!Backend::LlamaCpp.reaches(gaudi));
+        assert!(Backend::Vllm.reaches(gaudi) && Backend::SgLang.reaches(gaudi));
+        let ascend = acc(Vendor::Huawei, Kind::Npu);
+        assert!(Backend::LlamaCpp.reaches(ascend) && Backend::Vllm.reaches(ascend) && Backend::SgLang.reaches(ascend));
+        let tpu = acc(Vendor::Google, Kind::Accelerator);
+        assert_eq!(Backend::all().iter().filter(|b| b.reaches(tpu)).count(), 1);
+        assert!(Backend::Vllm.reaches(tpu));
+    }
+
+    #[test]
+    fn a_backend_with_no_route_onto_the_machine_is_refused_by_name() {
+        let amd = Machine::with([acc(Vendor::Amd, Kind::Gpu)]);
+        let e = Backend::TensorRtLlm.ensure_reaches(&amd).unwrap_err().to_string();
+        assert!(e.contains("amd:gpu") && e.contains("vllm") && e.contains("llama.cpp"), "{e}");
+        Backend::Vllm.ensure_reaches(&amd).unwrap();
+        // without accelerators the CPU is the device, for every backend
+        for b in Backend::all() {
+            b.ensure_reaches(&Machine::cpu_only()).unwrap();
+        }
+        // an NPU only its vendor's runtime drives
+        let xdna = Machine::with([acc(Vendor::Amd, Kind::Npu)]);
+        assert!(Backend::LlamaCpp.ensure_reaches(&xdna).unwrap_err().to_string().ends_with("backends that do: none"));
+    }
 
     #[test]
     fn names_round_trip() {
@@ -235,6 +361,8 @@ mod tests {
             ("SGL", Backend::SgLang),
             ("trtllm", Backend::TensorRtLlm),
             ("HF", Backend::Transformers),
+            ("OpenVINO", Backend::OpenVino),
+            ("openvino-genai", Backend::OpenVino),
         ] {
             assert_eq!(Backend::parse(s).unwrap(), want, "parsing {s:?}");
         }

@@ -549,6 +549,7 @@ pub fn run_job(engine: &JobEngine, req: JobRequest, mut on_event: impl FnMut(&Va
     let mut read_only = spec.read_only.clone();
     read_only.extend(engine.read_only.iter().cloned());
     read_only.push(adapter_dir.clone());
+    read_only.extend(sandbox::runtime_roots());
     let mut inputs = Map::new();
     for (name, path) in &req.inputs {
         let abs = std::fs::canonicalize(path)?;
@@ -573,12 +574,8 @@ pub fn run_job(engine: &JobEngine, req: JobRequest, mut on_event: impl FnMut(&Va
         ("PYTHONUNBUFFERED".to_string(), "1".to_string()),
         ("HF_HUB_OFFLINE".to_string(), "1".to_string()),
     ];
-    // the operator's choice of GPUs carries through
-    for k in ["CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"] {
-        if let Ok(v) = std::env::var(k) {
-            env.push((k.to_string(), v));
-        }
-    }
+    // the operator's choice of devices carries through, for every vendor
+    env.extend(sandbox::selection_env());
     env.extend(engine.vars.iter().cloned());
     let args: Vec<OsString> = vec!["-I".into(), adapter.into_os_string()];
     let mut child = sandbox::spawn(&confinement, &spec.program, &args, &env)?;

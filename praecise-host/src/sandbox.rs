@@ -86,24 +86,29 @@ impl Confinement {
     }
 }
 
-/// The GPU device nodes present on this host.
+/// The accelerator device nodes present on this host: every vendor's, as
+/// [`praecise_hardware::confine::device_nodes`] recognises them (NVIDIA, AMD,
+/// the kernel's DRM and compute-accelerator classes, Ascend, Neuron,
+/// Tenstorrent, Adreno and Hexagon, Mali, Cambricon).
 #[must_use]
 pub fn gpu_devices() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("nvidia") || name == "kfd" {
-                out.push(e.path());
-            }
-        }
-    }
-    if Path::new("/dev/dri").is_dir() {
-        out.push(PathBuf::from("/dev/dri"));
-    }
-    out.sort();
-    out
+    praecise_hardware::confine::device_nodes(&praecise_hardware::detect::HostProbe)
+}
+
+/// Directories a vendor runtime installs into outside the system library
+/// paths (`/opt/rocm`, `/opt/intel`, `/usr/local/Ascend`, …) that exist on
+/// this host. A host that loads a vendor runtime reads them.
+#[must_use]
+pub fn runtime_roots() -> Vec<PathBuf> {
+    praecise_hardware::confine::runtime_roots(&praecise_hardware::detect::HostProbe)
+}
+
+/// The device-selection variables the operator set (`CUDA_VISIBLE_DEVICES`,
+/// `HIP_VISIBLE_DEVICES`, `ZE_AFFINITY_MASK`, `ASCEND_RT_VISIBLE_DEVICES`, …),
+/// to carry into a host's environment so the choice of devices holds there.
+#[must_use]
+pub fn selection_env() -> Vec<(String, String)> {
+    praecise_hardware::confine::selection_env()
 }
 
 /// Start `program args...` confined by `c`, with piped stdin and stdout.
