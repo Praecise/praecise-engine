@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "praecise-hardware",
   "praecise-runtime",
   "praecise-ffi",
   "praecise-host",

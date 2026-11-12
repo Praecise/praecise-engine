@@ -94,6 +94,25 @@ steps:
           echo "         Fix it in its own commit, then make this step fatal."
         fi
 
+  # The hardware layer: detection, routing, confinement and the silicon
+  # catalogue. It has no dependencies and makes no vendor call, so every rule
+  # runs here against described machines, whatever this worker is.
+  - id: hardware-test
+    name: rust:1-bookworm
+    entrypoint: bash
+    env:
+      - CARGO_HOME=/workspace/.cargo-home
+      - RUSTUP_HOME=/workspace/.rustup-home
+      - CARGO_TERM_COLOR=never
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        cargo fmt --package praecise-hardware --check
+        cargo clippy --package praecise-hardware --all-targets -- -D warnings
+        cargo test --package praecise-hardware
+        cargo run --package praecise-hardware --bin praecise-hw
+
   # The backend-agnostic runtime. `default = []` means no llama.cpp is pulled,
   # so this needs neither the submodule nor a GPU — it is the part of the engine
   # that is genuinely architecture-independent.
