@@ -1,5 +1,5 @@
-ARG CUDA_VERSION=12.3.1
-ARG UBUNTU_VERSION=22.04
+ARG CUDA_VERSION=13.5.0
+ARG UBUNTU_VERSION=26.04
 FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS base-cuda
 
 # Install requirements for rustup install + bindgen: https://rust-lang.github.io/rust-bindgen/requirements.html

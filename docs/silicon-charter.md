@@ -222,6 +222,15 @@ speculation; each is a note of where the next gap will open.
 
 ## Changelog
 
+- **2026-11-13.** Versions refreshed: the lockfile and the four crates that
+  had a newer release (`cc`, `encoding_rs`, `openh264`, `wgpu`); the cloud
+  build image moved from Debian 12 to Debian 13; the CUDA test image moved
+  to CUDA 13.5.0 on Ubuntu 26.04. Neither image has been built since the
+  change. Every other declared crate was already at its newest stable
+  release; `ort`, `dashmap`, `tokenizers` and `libc` have newer
+  pre-releases only, and stay where they are. A November survey of decode
+  speedups was added to [acceleration-research.md](acceleration-research.md):
+  no new batch-1 kernel was found.
 - **2026-11-12.** Remote backend (`praecise-remote`) added as an opt-in
   route to API-only silicon. Quantum section added; open items J and K
   recorded. bindgen built without `prettyplease` so the workspace builds.
