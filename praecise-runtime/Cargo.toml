@@ -14,6 +14,7 @@ description = "Praecise Engine — inference-acceleration runtime: speculative d
 llama-cpp-2 = { path = "../llama-cpp-2", optional = true }
 # Image heads and decoders for image generation on a language backbone.
 praecise-diffusion = { path = "../praecise-diffusion", optional = true }
+praecise-hardware = { path = "../praecise-hardware" }
 thiserror = "2"
 tracing = "0.1"
 encoding_rs = "0.8"
@@ -34,16 +35,50 @@ libc = "0.2"
 
 [features]
 default = []
+# Marks a build that carries the remote backend. Set by the `praecise-remote`
+# crate, which holds the client; nothing in this crate opens a connection.
+remote = []
 # Bundle and build the llama.cpp backend for standalone use. Omit when the host
 # application already provides llama-cpp-2.
 bundled-llama = ["dep:llama-cpp-2"]
 # Backend accelerators — only meaningful with a bundled backend, so each implies
 # `bundled-llama`.
+# `bundled-llama`. One per ggml backend, under the name
+# `praecise_hardware::route::GgmlBackend::feature` gives it; `praecise-hw`
+# prints the ones a machine needs.
+# NVIDIA.
 cuda = ["bundled-llama", "llama-cpp-2/cuda", "praecise-diffusion?/cuda"]
 cuda-no-vmm = ["bundled-llama", "llama-cpp-2/cuda-no-vmm"]
-rocm = ["bundled-llama", "llama-cpp-2/rocm"]
+# AMD: ROCm through HIP (Radeon, Instinct, Ryzen integrated GPUs).
+rocm = ["bundled-llama", "llama-cpp-2/rocm", "praecise-diffusion?/rocm"]
+# Apple.
 metal = ["bundled-llama", "llama-cpp-2/metal", "praecise-diffusion?/metal"]
-vulkan = ["bundled-llama", "llama-cpp-2/vulkan"]
+# Any vendor's GPU with a Vulkan driver.
+vulkan = ["bundled-llama", "llama-cpp-2/vulkan", "praecise-diffusion?/vulkan"]
+# Intel: oneAPI SYCL (Arc, integrated Xe, data-centre GPUs).
+sycl = ["bundled-llama", "llama-cpp-2/sycl", "praecise-diffusion?/sycl"]
+# Intel: OpenVINO (CPU, GPU and NPU; GGML_OPENVINO_DEVICE selects).
+openvino = ["bundled-llama", "llama-cpp-2/openvino", "praecise-diffusion?/openvino"]
+# Qualcomm: OpenCL on Adreno GPUs.
+opencl = ["bundled-llama", "llama-cpp-2/opencl", "praecise-diffusion?/opencl"]
+# Qualcomm: the Hexagon NPU.
+hexagon = ["bundled-llama", "llama-cpp-2/hexagon", "praecise-diffusion?/hexagon"]
+# Huawei: Ascend NPUs through CANN.
+cann = ["bundled-llama", "llama-cpp-2/cann", "praecise-diffusion?/cann"]
+# Moore Threads: MUSA.
+musa = ["bundled-llama", "llama-cpp-2/musa", "praecise-diffusion?/musa"]
+# WebGPU through Dawn, on any vendor's GPU.
+webgpu = ["bundled-llama", "llama-cpp-2/webgpu", "praecise-diffusion?/webgpu"]
+# IBM Z: the on-chip accelerator through zDNN.
+zdnn = ["bundled-llama", "llama-cpp-2/zdnn", "praecise-diffusion?/zdnn"]
+# Esperanto ET-SoC.
+et = ["bundled-llama", "llama-cpp-2/et", "praecise-diffusion?/et"]
+# CPU kernels: AMD ZenDNN on Zen, Arm KleidiAI on AArch64 (SVE, SME), a BLAS.
+zendnn = ["bundled-llama", "llama-cpp-2/zendnn"]
+kleidiai = ["bundled-llama", "llama-cpp-2/kleidiai"]
+blas = ["bundled-llama", "llama-cpp-2/blas"]
+# A ggml backend reached through virglrenderer from inside a virtual machine.
+virtgpu = ["bundled-llama", "llama-cpp-2/virtgpu"]
 # Image and audio input in the batching engine, through llama.cpp mtmd.
 mtmd = ["bundled-llama", "llama-cpp-2/mtmd"]
 # Image generation on a language backbone, with its image side from praecise-diffusion.

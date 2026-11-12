@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "Praecise Engine expert-parallel MoE execution: per-expert SwiGLU FFNs from safetensors blobs, top-k gating, GGUF block-quantized expert weights, a byte-bounded expert residency cache, and the combine step, on the CPU, CUDA (cuBLAS) or any other GPU through wgpu."
 
 [dependencies]
+praecise-hardware = { path = "../praecise-hardware" }
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

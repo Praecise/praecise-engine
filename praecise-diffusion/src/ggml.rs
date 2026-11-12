@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::path::Path;
 use std::ptr;
 
 use llama_cpp_sys_2 as sys;
@@ -40,19 +39,22 @@ impl Drop for Backend {
     }
 }
 
-/// GPU hardware present on this host, independent of what the build can
-/// drive. Used to refuse a CPU run on a machine that has a GPU.
-fn gpu_hardware_present() -> Option<&'static str> {
-    if Path::new("/proc/driver/nvidia/version").exists() || Path::new("/dev/nvidiactl").exists() {
-        return Some("NVIDIA");
-    }
-    if Path::new("/dev/kfd").exists() {
-        return Some("AMD");
-    }
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        return Some("Apple");
-    }
-    None
+/// Accelerator hardware present on this host that a ggml backend can drive,
+/// independent of what this build carries. Used to refuse a CPU run on a
+/// machine that has such hardware. Every vendor counts, not NVIDIA and AMD
+/// alone: an Intel, Qualcomm, Ascend or Moore Threads machine is refused the
+/// same way. Hardware no ggml backend reaches (an AMD NPU, a Gaudi card)
+/// does not count, since no build of this crate could use it.
+fn gpu_hardware_present() -> Option<String> {
+    use praecise_hardware::{route, Machine};
+    let machine = Machine::from_env_or_detect().unwrap_or_else(|_| Machine::detect());
+    let drivable: Vec<String> = machine
+        .accelerators()
+        .iter()
+        .filter(|a| !route::ggml_backends(**a).is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if drivable.is_empty() { None } else { Some(drivable.join(",")) }
 }
 
 /// Which device a [`Backend`] runs on.
@@ -120,7 +122,7 @@ impl Backend {
     pub fn select_device(device: Device, cpu_threads: usize) -> Result<Self> {
         if device == Device::Cpu {
             tracing::warn!(
-                gpu_hardware = gpu_hardware_present().unwrap_or("none"),
+                gpu_hardware = gpu_hardware_present().as_deref().unwrap_or("none"),
                 threads = cpu_threads.max(1),
                 "{DEVICE_ENV}=cpu: running on the CPU by explicit request"
             );
@@ -143,15 +145,16 @@ impl Backend {
                 return Ok(Self { raw, name, gpu: true });
             }
         }
-        if let Some(vendor) = gpu_hardware_present() {
+        if let Some(hardware) = gpu_hardware_present() {
+            // CPU, BLAS and ZenDNN run on the processor; RPC is another machine.
             let gpu_backend_built = (0..unsafe { sys::ggml_backend_reg_count() }).any(|i| {
                 let name = unsafe { CStr::from_ptr(sys::ggml_backend_reg_name(sys::ggml_backend_reg_get(i))) };
-                name.to_bytes() != b"CPU" && name.to_bytes() != b"BLAS" && name.to_bytes() != b"RPC"
+                !matches!(name.to_bytes(), b"CPU" | b"BLAS" | b"ZenDNN" | b"RPC")
             });
             return Err(Error::GpuRequired(if gpu_backend_built {
-                format!("{vendor} GPU hardware is present and a GPU backend is built, but it found no usable device (driver or device failure)")
+                format!("accelerator hardware is present ({hardware}) and a GPU backend is built, but it found no usable device (driver or device failure)")
             } else {
-                format!("{vendor} GPU hardware is present but this build has no backend for it")
+                format!("accelerator hardware is present ({hardware}) but this build has no backend for it")
             }));
         }
         Self::cpu(cpu_threads)

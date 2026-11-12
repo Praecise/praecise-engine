@@ -1,0 +1,15 @@
+[package]
+name = "praecise-remote"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine remote backend: generation on an inference API outside the machine (Groq, Cerebras, SambaNova or any OpenAI-compatible endpoint), in the runtime's own types. Opt-in twice: by depending on this crate, and by the operator naming each host prompts may be sent to."
+
+[dependencies]
+praecise-runtime = { path = "../praecise-runtime", default-features = false, features = ["remote"] }
+serde_json = "1"
+thiserror = "2"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[lints]
+workspace = true

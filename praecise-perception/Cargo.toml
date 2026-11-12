@@ -8,14 +8,30 @@ description = "Praecise Engine perception: video in, per-frame object tracks out
 [dependencies]
 praecise-codec = { path = "../praecise-codec" }
 praecise-onnx = { path = "../praecise-onnx" }
+praecise-hardware = { path = "../praecise-hardware" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
 [features]
 default = []
-# NVIDIA: the detector runs on ONNX Runtime's CUDA execution provider.
+# The detector runs on the execution provider of the machine's GPU; one
+# feature per provider, as praecise-onnx names them.
+# NVIDIA: CUDA and TensorRT.
 cuda = ["praecise-onnx/cuda"]
+# AMD: MIGraphX.
+rocm = ["praecise-onnx/rocm"]
+# Intel: OpenVINO.
+openvino = ["praecise-onnx/openvino"]
+# Qualcomm: QNN.
+qnn = ["praecise-onnx/qnn"]
+# Huawei Ascend: CANN.
+cann = ["praecise-onnx/cann"]
+# Apple: CoreML.
+coreml = ["praecise-onnx/coreml"]
+# Any vendor's GPU: DirectML on Windows, WebGPU everywhere.
+directml = ["praecise-onnx/directml"]
+webgpu = ["praecise-onnx/webgpu"]
 
 [[bin]]
 name = "praecise-track"

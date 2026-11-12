@@ -19,6 +19,7 @@ pub const KERNEL_SET_VERSION: u32 = 1;
 
 /// Compute backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Backend {
     /// Host CPU.
     Cpu,
@@ -28,6 +29,68 @@ pub enum Backend {
     Metal,
     /// Vulkan.
     Vulkan,
+    /// AMD ROCm through HIP.
+    Hip,
+    /// Intel oneAPI SYCL.
+    Sycl,
+    /// Intel OpenVINO.
+    OpenVino,
+    /// OpenCL (Qualcomm Adreno).
+    OpenCl,
+    /// Qualcomm Hexagon NPU.
+    Hexagon,
+    /// Huawei Ascend through CANN.
+    Cann,
+    /// Moore Threads MUSA.
+    Musa,
+    /// WebGPU.
+    WebGpu,
+    /// IBM Z on-chip accelerator through zDNN.
+    Zdnn,
+    /// Esperanto ET-SoC.
+    Et,
+}
+
+impl Backend {
+    /// Every backend a device can belong to.
+    pub const ALL: &'static [Backend] = &[
+        Self::Cpu,
+        Self::Cuda,
+        Self::Metal,
+        Self::Vulkan,
+        Self::Hip,
+        Self::Sycl,
+        Self::OpenVino,
+        Self::OpenCl,
+        Self::Hexagon,
+        Self::Cann,
+        Self::Musa,
+        Self::WebGpu,
+        Self::Zdnn,
+        Self::Et,
+    ];
+
+    /// The prefix of the device names the backend registers with the
+    /// scheduler (`CUDA0`, `ROCm0`, `MTL0`, `Vulkan0`, `SYCL0`, `CANN0`, …).
+    #[must_use]
+    pub const fn device_prefix(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+            Self::Metal => "MTL",
+            Self::Vulkan => "Vulkan",
+            Self::Hip => "ROCm",
+            Self::Sycl => "SYCL",
+            Self::OpenVino => "OPENVINO",
+            Self::OpenCl => "GPUOpenCL",
+            Self::Hexagon => "HTP",
+            Self::Cann => "CANN",
+            Self::Musa => "MUSA",
+            Self::WebGpu => "WebGPU",
+            Self::Zdnn => "zDNN",
+            Self::Et => "ET",
+        }
+    }
 }
 
 impl fmt::Display for Backend {
@@ -37,6 +100,16 @@ impl fmt::Display for Backend {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Vulkan => "vulkan",
+            Self::Hip => "hip",
+            Self::Sycl => "sycl",
+            Self::OpenVino => "openvino",
+            Self::OpenCl => "opencl",
+            Self::Hexagon => "hexagon",
+            Self::Cann => "cann",
+            Self::Musa => "musa",
+            Self::WebGpu => "webgpu",
+            Self::Zdnn => "zdnn",
+            Self::Et => "et",
         })
     }
 }
@@ -117,6 +190,8 @@ pub enum DeviceRequest {
     Metal,
     /// The `n`-th Vulkan device.
     Vulkan(usize),
+    /// The `n`-th device of any other backend.
+    Device(Backend, usize),
 }
 
 /// Resolves a request against the devices present.
@@ -144,6 +219,8 @@ pub fn resolve_device(
         DeviceRequest::Cuda(n) => pick(Backend::Cuda, n),
         DeviceRequest::Metal => pick(Backend::Metal, 0),
         DeviceRequest::Vulkan(n) => pick(Backend::Vulkan, n),
+        DeviceRequest::Device(Backend::Cpu, _) => return resolve_device(DeviceRequest::Cpu, available),
+        DeviceRequest::Device(backend, n) => pick(backend, n),
     };
     found.ok_or_else(|| {
         let present: Vec<&str> = available.iter().map(|d| d.name.as_str()).collect();
@@ -173,15 +250,19 @@ pub fn resolve_device(
 /// architecture of a kernel class names it. Flash attention is not in the set:
 /// a training context turns it off.
 ///
-/// Metal and Vulkan kernel sets are not yet audited; until they are,
-/// deterministic mode refuses every op on them rather than claiming
-/// reproducibility it has not measured.
+/// No other backend's kernel set is audited. That includes HIP and MUSA,
+/// which compile the CUDA kernel sources: their matrix products go through
+/// hipBLAS and muBLAS, and their split follows a different device, so the
+/// CUDA audit does not carry over. Until a backend is audited on its own
+/// hardware, deterministic mode refuses every op on it rather than claiming
+/// reproducibility it has not measured. A run there is still possible in
+/// tolerance mode, and is recognised and kept on its device.
 #[must_use]
 pub fn deterministic_ops(backend: Backend) -> &'static [&'static str] {
     match backend {
         Backend::Cpu => CPU_DETERMINISTIC,
         Backend::Cuda => CUDA_DETERMINISTIC,
-        Backend::Metal | Backend::Vulkan => &[],
+        _ => &[],
     }
 }
 
@@ -242,21 +323,25 @@ const CUDA_DETERMINISTIC: &[&str] = &[
 /// Ops that compute nothing: they describe a tensor over another one's memory.
 const NO_COMPUTE: &[&str] = &["NONE", "RESHAPE", "VIEW", "PERMUTE", "TRANSPOSE"];
 
-/// The backend a scheduler device name (`CPU`, `CUDA0`, `Metal`, `Vulkan0`) belongs to.
+/// The backend a scheduler device name (`CPU`, `CUDA0`, `ROCm0`, `MTL0`,
+/// `Vulkan0`, `SYCL0`, `CANN0`, `HTP0`, …) belongs to. `Metal` is accepted
+/// beside `MTL`, the name older builds registered. A name of no backend
+/// here (an RPC endpoint, BLAS) is none.
 #[must_use]
 pub fn backend_of_device(name: &str) -> Option<Backend> {
     let lower = name.to_ascii_lowercase();
     if lower == "cpu" {
-        Some(Backend::Cpu)
-    } else if lower.starts_with("cuda") {
-        Some(Backend::Cuda)
-    } else if lower.starts_with("metal") || lower.starts_with("mtl") {
-        Some(Backend::Metal)
-    } else if lower.starts_with("vulkan") {
-        Some(Backend::Vulkan)
-    } else {
-        None
+        return Some(Backend::Cpu);
     }
+    if lower.starts_with("metal") {
+        return Some(Backend::Metal);
+    }
+    // the longest prefix wins, so no name is claimed by a shorter one
+    Backend::ALL
+        .iter()
+        .copied()
+        .filter(|b| *b != Backend::Cpu && lower.starts_with(&b.device_prefix().to_ascii_lowercase()))
+        .max_by_key(|b| b.device_prefix().len())
 }
 
 /// Checks where every op of a graph ran, as `(op, device)` pairs, against a run
@@ -417,6 +502,60 @@ mod tests {
         check_deterministic(Backend::Cuda, ["MUL_MAT", "OUT_PROD", "ROPE_BACK"]).unwrap();
         assert!(check_deterministic(Backend::Cuda, ["FLASH_ATTN_EXT"]).is_err());
         assert!(check_deterministic(Backend::Metal, ["MUL_MAT"]).is_err());
+    }
+
+    #[test]
+    fn every_backend_is_recognised_by_its_device_name() {
+        for (name, want) in [
+            ("CPU", Backend::Cpu),
+            ("CUDA0", Backend::Cuda),
+            ("ROCm0", Backend::Hip),
+            ("MTL0", Backend::Metal),
+            ("Metal", Backend::Metal),
+            ("Vulkan1", Backend::Vulkan),
+            ("SYCL0", Backend::Sycl),
+            ("OPENVINO", Backend::OpenVino),
+            ("GPUOpenCL", Backend::OpenCl),
+            ("HTP0:1", Backend::Hexagon),
+            ("CANN0", Backend::Cann),
+            ("MUSA0", Backend::Musa),
+            ("WebGPU", Backend::WebGpu),
+            ("zDNN", Backend::Zdnn),
+        ] {
+            assert_eq!(backend_of_device(name), Some(want), "{name}");
+        }
+        assert_eq!(backend_of_device("RPC[10.0.0.2:50052]"), None);
+        assert_eq!(backend_of_device("BLAS"), None);
+        for b in Backend::ALL.iter().filter(|b| **b != Backend::Cpu) {
+            assert_eq!(backend_of_device(&format!("{}0", b.device_prefix())), Some(*b));
+        }
+    }
+
+    #[test]
+    fn other_vendors_resolve_and_stay_on_their_device_but_are_not_called_deterministic() {
+        let amd = vec![DeviceInfo {
+            backend: Backend::Hip,
+            name: "ROCm0".into(),
+            arch: "gfx950".into(),
+        }];
+        assert_eq!(
+            resolve_device(DeviceRequest::Device(Backend::Hip, 0), &amd).unwrap().name,
+            "ROCm0"
+        );
+        assert!(resolve_device(DeviceRequest::Device(Backend::Hip, 1), &amd).is_err());
+        assert!(resolve_device(DeviceRequest::Device(Backend::Cann, 0), &amd).is_err());
+        assert!(resolve_device(DeviceRequest::Cuda(0), &amd).is_err());
+        assert_eq!(KernelClass::new(Backend::Hip, "gfx950").id(), format!("hip/gfx950/ks{KERNEL_SET_VERSION}"));
+        // the CUDA audit does not carry over to the HIP build of the same kernels
+        for b in Backend::ALL {
+            if !matches!(b, Backend::Cpu | Backend::Cuda) {
+                assert!(check_deterministic(*b, ["MUL_MAT"]).is_err(), "{b}");
+                assert!(deterministic_ops(*b).is_empty(), "{b}");
+            }
+        }
+        // a tolerance-mode run on ROCm that strays to the CPU is still caught
+        let err = check_placements(Backend::Hip, [("VIEW", "ROCm0"), ("MUL_MAT", "CPU")]).unwrap_err();
+        assert!(err.to_string().contains("MUL_MAT ran on CPU"), "{err}");
     }
 
     #[test]

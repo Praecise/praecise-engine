@@ -907,8 +907,26 @@ fn main() {
         //   https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute
         // GGML config flags have been found by looking at:
         //   llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt
+        // ggml's AVX-512 switch compiles with F, CD, VL, DQ and BW together,
+        // so it is only set for a target that has all five.
+        let has = |f: &str| features.split(',').any(|x| x == f);
+        if ["avx512f", "avx512cd", "avx512vl", "avx512dq", "avx512bw"]
+            .iter()
+            .all(|f| has(f))
+        {
+            config.define("GGML_AVX512", "ON");
+        }
         for feature in features.split(',') {
             match feature {
+                "amx-tile" => {
+                    config.define("GGML_AMX_TILE", "ON");
+                }
+                "amx-int8" => {
+                    config.define("GGML_AMX_INT8", "ON");
+                }
+                "amx-bf16" => {
+                    config.define("GGML_AMX_BF16", "ON");
+                }
                 "avx" => {
                     config.define("GGML_AVX", "ON");
                 }
@@ -1253,6 +1271,58 @@ fn main() {
         config.define("GGML_ZDNN", "ON");
     }
 
+    if cfg!(feature = "hexagon") {
+        // Qualcomm Hexagon NPU. ggml-hexagon builds its HTP skeleton
+        // libraries with the Hexagon SDK, found through these two variables.
+        config.define("GGML_HEXAGON", "ON");
+        for var in ["HEXAGON_SDK_ROOT", "HEXAGON_TOOLS_ROOT"] {
+            println!("cargo:rerun-if-env-changed={var}");
+            if let Ok(value) = env::var(var) {
+                config.define(var, value);
+            }
+        }
+        assert!(
+            env::var("HEXAGON_SDK_ROOT").is_ok(),
+            "The `hexagon` feature needs the Qualcomm Hexagon SDK: set HEXAGON_SDK_ROOT to its installation."
+        );
+    }
+
+    if cfg!(feature = "zendnn") {
+        // AMD ZenDNN. With ZENDNN_ROOT unset, CMake downloads and builds it.
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        assert_eq!(
+            target_arch, "x86_64",
+            "The `zendnn` feature requires an x86_64 target; ZenDNN is unavailable for {target_arch}."
+        );
+        config.define("GGML_ZENDNN", "ON");
+        println!("cargo:rerun-if-env-changed=ZENDNN_ROOT");
+        if let Ok(root) = env::var("ZENDNN_ROOT") {
+            config.define("ZENDNN_ROOT", root);
+        }
+    }
+
+    if cfg!(feature = "et") {
+        // Esperanto ET-SoC. ggml-et reads the platform path from ET_PLATFORM.
+        config.define("GGML_ET", "ON");
+        println!("cargo:rerun-if-env-changed=ET_PLATFORM");
+    }
+
+    if cfg!(feature = "virtgpu") {
+        config.define("GGML_VIRTGPU", "ON");
+    }
+
+    if cfg!(feature = "kleidiai") {
+        // Arm KleidiAI kernels in the CPU backend. CMake fetches the pinned
+        // KleidiAI release and installs its archive beside the ggml ones, so
+        // the link step below picks it up with them.
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        assert_eq!(
+            target_arch, "aarch64",
+            "The `kleidiai` feature requires an aarch64 target; KleidiAI is unavailable for {target_arch}."
+        );
+        config.define("GGML_CPU_KLEIDIAI", "ON");
+    }
+
     if cfg!(feature = "opencl") {
         // The Qualcomm-supported GPU backend for Adreno. EMBED_KERNELS and
         // USE_ADRENO_KERNELS are ON by default upstream, so no extra defines are
@@ -1567,6 +1637,45 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=amdhip64");
         println!("cargo:rustc-link-lib=dylib=rocblas");
         println!("cargo:rustc-link-lib=dylib=hipblas");
+    }
+
+    if cfg!(feature = "zendnn") && !build_shared_libs {
+        // ggml-zendnn links ZenDNN and its dependencies as static archives
+        // from the ZenDNN installation: the one CMake built under the build
+        // tree, or ZENDNN_ROOT.
+        let root = env::var("ZENDNN_ROOT").map(PathBuf::from).unwrap_or_else(|_| {
+            out_dir
+                .join("build")
+                .join("_deps")
+                .join("zendnn-prefix")
+                .join("build")
+                .join("install")
+        });
+        for (dir, libs) in [
+            ("zendnnl/lib", &["zendnnl_archive"][..]),
+            ("deps/aoclutils/lib*", &["aoclutils", "au_cpuid"][..]),
+            ("deps/aocldlp/lib", &["aocl-dlp"][..]),
+            ("deps/onednn/lib*", &["dnnl"][..]),
+            ("deps/libxsmm/lib", &["xsmm", "xsmmext", "xsmmnoblas"][..]),
+        ] {
+            let pattern = root.join(dir);
+            let found: Vec<PathBuf> = glob(pattern.to_str().unwrap())
+                .unwrap()
+                .flatten()
+                .filter(|p| p.is_dir())
+                .collect();
+            assert!(
+                !found.is_empty(),
+                "ZenDNN libraries not found at {}; set ZENDNN_ROOT to a ZenDNN installation",
+                pattern.display()
+            );
+            for d in found {
+                println!("cargo:rustc-link-search=native={}", d.display());
+            }
+            for lib in libs {
+                println!("cargo:rustc-link-lib=static={lib}");
+            }
+        }
     }
 
     if cfg!(feature = "mkl") && !build_shared_libs {

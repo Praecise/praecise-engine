@@ -52,6 +52,18 @@ include = [
     "/llama.cpp/ggml/src/ggml-vulkan/**/*",
     "/llama.cpp/ggml/src/ggml-opencl/**/*",
     "/llama.cpp/ggml/src/ggml-hip/**/*",
+    "/llama.cpp/ggml/src/ggml-musa/**/*",
+    "/llama.cpp/ggml/src/ggml-sycl/**/*",
+    "/llama.cpp/ggml/src/ggml-openvino/**/*",
+    "/llama.cpp/ggml/src/ggml-cann/**/*",
+    "/llama.cpp/ggml/src/ggml-webgpu/**/*",
+    "/llama.cpp/ggml/src/ggml-zdnn/**/*",
+    "/llama.cpp/ggml/src/ggml-zendnn/**/*",
+    "/llama.cpp/ggml/src/ggml-hexagon/**/*",
+    "/llama.cpp/ggml/src/ggml-et/**/*",
+    "/llama.cpp/ggml/src/ggml-virtgpu/**/*",
+    "/llama.cpp/ggml/src/ggml-blas/**/*",
+    "/llama.cpp/ggml/src/ggml-rpc/**/*",
 
     "/llama.cpp/ggml/src/llamafile/sgemm.h",
     "/llama.cpp/ggml/src/llamafile/sgemm.cpp",
@@ -139,3 +151,20 @@ webgpu = []
 blas = []
 # IBM Z zDNN backend (Telum on-chip AI accelerator).
 zdnn = []
+# Qualcomm Hexagon NPU backend (GGML_HEXAGON=ON). Needs the Hexagon SDK:
+# HEXAGON_SDK_ROOT (and HEXAGON_TOOLS_ROOT when the SDK does not name its
+# tools) are forwarded to CMake. Devices are chosen at run time with
+# GGML_HEXAGON_DEVICES.
+hexagon = []
+# AMD ZenDNN backend (GGML_ZENDNN=ON), for Zen CPUs. Builds ZenDNN from source
+# unless ZENDNN_ROOT names an installation.
+zendnn = []
+# Esperanto ET-SoC backend (GGML_ET=ON). The ET platform is found at
+# ET_PLATFORM, /opt/et when unset.
+et = []
+# VirtGPU API-remoting frontend (GGML_VIRTGPU=ON): a guest reaches the host's
+# ggml backend through virglrenderer.
+virtgpu = []
+# Arm KleidiAI kernels in the CPU backend (GGML_CPU_KLEIDIAI=ON): SVE, SVE2,
+# SME and SME2 matmul paths chosen at run time. AArch64 targets only.
+kleidiai = []

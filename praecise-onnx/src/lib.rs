@@ -27,6 +27,7 @@ pub mod error;
 pub mod forecast;
 pub mod parse;
 pub mod segmentation;
+pub mod plan;
 pub mod session;
 pub mod text_embedding;
 pub mod text_segmentation;

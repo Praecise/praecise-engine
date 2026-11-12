@@ -104,6 +104,7 @@ impl RuntimeHost {
         std::fs::create_dir_all(scratch)?;
         let mut read_only = spec.read_only.clone();
         read_only.push(model_dir.to_path_buf());
+        read_only.extend(sandbox::runtime_roots());
         let confinement = Confinement {
             read_only,
             scratch: scratch.to_path_buf(),
@@ -116,10 +117,12 @@ impl RuntimeHost {
             ("HOME".to_string(), s.clone()),
             ("TMPDIR".to_string(), s),
             ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-            // Set when the machine has GPU hardware: the engine must then
-            // refuse to load rather than run on the CPU.
+            // Set when the machine has an accelerator of any vendor: the
+            // engine must then refuse to load rather than run on the CPU.
             ("PRAECISE_GPU_REQUIRED".to_string(), if confinement.devices.is_empty() { "0" } else { "1" }.to_string()),
         ];
+        // the operator's choice of devices carries through, for every vendor
+        environment.extend(sandbox::selection_env());
         environment.extend(spec.env.iter().cloned());
         let mut child = sandbox::spawn(&confinement, &spec.program, &spec.args, &environment)?;
         let stdin = child.stdin.take().expect("piped");

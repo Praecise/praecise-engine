@@ -29,6 +29,13 @@ pub enum Error {
     #[error("Backend {backend} is unavailable: {reason}")]
     BackendUnavailable { backend: &'static str, reason: &'static str },
 
+    /// A backend with no way onto any accelerator of the machine: the runtime
+    /// belongs to another vendor, or has no device type or platform for this
+    /// silicon. `able` names the backends that do reach it, `none` when no
+    /// backend does.
+    #[error("Backend {backend} has no route to this machine's accelerators ({machine}); backends that do: {able}")]
+    BackendUnreachable { backend: &'static str, machine: String, able: String },
+
     /// A drafter whose licence does not permit shipping it.
     ///
     /// Refused at selection rather than left to whoever writes the config: a

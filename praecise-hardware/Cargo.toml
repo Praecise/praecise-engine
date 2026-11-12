@@ -1,0 +1,11 @@
+[package]
+name = "praecise-hardware"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Praecise Engine hardware layer: which accelerators a machine has (every vendor, not one), which backend drives each, what a confined engine needs to reach them, and the decode ceiling their memory sets. No dependencies."
+
+[dependencies]
+
+[lints]
+workspace = true
