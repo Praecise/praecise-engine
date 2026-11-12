@@ -84,10 +84,18 @@ enum CpuSimd {
     /// AVX-512 Foundation + VNNI (`vpdpbusd`) available.
     #[cfg(target_arch = "x86_64")]
     Avx512Vnni,
+    /// AVX-VNNI: the same `vpdpbusd` in its 256-bit VEX encoding, on Intel
+    /// client cores that have no AVX-512.
+    #[cfg(target_arch = "x86_64")]
+    AvxVnni,
     /// NEON advanced SIMD. Architecturally guaranteed on every ARMv8-A part,
     /// so on aarch64 this tier is always selected rather than probed.
     #[cfg(target_arch = "aarch64")]
     Neon,
+    /// NEON with the Armv8.2 dot-product extension (`SDOT`): every Armv8.4
+    /// and Armv9 core, Apple silicon, Neoverse N1 and later.
+    #[cfg(target_arch = "aarch64")]
+    NeonDotprod,
 }
 
 impl CpuCompute {
@@ -114,7 +122,7 @@ impl CpuCompute {
         let mut y = Array2::<f32>::zeros((n, out));
 
         #[cfg(target_arch = "x86_64")]
-        if self.tier == CpuSimd::Avx512Vnni
+        if matches!(self.tier, CpuSimd::Avx512Vnni | CpuSimd::AvxVnni)
             && q.kind() == QuantKind::Q8_0
             && cols.is_multiple_of(crate::quant::QK8_0)
         {
@@ -129,16 +137,21 @@ impl CpuCompute {
             for j in 0..out {
                 let wblocks = q.row_block_bytes(j);
                 for (i, ablocks) in act_blocks.iter().enumerate() {
-                    // Safety: tier == Avx512Vnni proves the target features are
-                    // present on this CPU (checked once in detect()).
-                    y[[i, j]] = unsafe { dot_q8_0_avx512_vnni(ablocks, wblocks) };
+                    // Safety: the tier proves the target features of the
+                    // matching function are present on this CPU (checked once
+                    // in detect()).
+                    y[[i, j]] = if self.tier == CpuSimd::Avx512Vnni {
+                        unsafe { dot_q8_0_avx512_vnni(ablocks, wblocks) }
+                    } else {
+                        unsafe { dot_q8_0_avx_vnni(ablocks, wblocks) }
+                    };
                 }
             }
             return y;
         }
 
         #[cfg(target_arch = "aarch64")]
-        if self.tier == CpuSimd::Neon
+        if matches!(self.tier, CpuSimd::Neon | CpuSimd::NeonDotprod)
             && q.kind() == QuantKind::Q8_0
             && cols.is_multiple_of(crate::quant::QK8_0)
         {
@@ -152,7 +165,13 @@ impl CpuCompute {
             for j in 0..out {
                 let wblocks = q.row_block_bytes(j);
                 for (i, ablocks) in act_blocks.iter().enumerate() {
-                    y[[i, j]] = dot_q8_0_neon(ablocks, wblocks);
+                    y[[i, j]] = if self.tier == CpuSimd::NeonDotprod {
+                        // Safety: the tier proves the dot-product extension
+                        // is present on this CPU (checked once in detect()).
+                        unsafe { dot_q8_0_neon_dotprod(ablocks, wblocks) }
+                    } else {
+                        dot_q8_0_neon(ablocks, wblocks)
+                    };
                 }
             }
             return y;
@@ -184,8 +203,12 @@ impl ExpertCompute for CpuCompute {
             CpuSimd::Scalar => "cpu",
             #[cfg(target_arch = "x86_64")]
             CpuSimd::Avx512Vnni => "cpu-avx512-vnni",
+            #[cfg(target_arch = "x86_64")]
+            CpuSimd::AvxVnni => "cpu-avx-vnni",
             #[cfg(target_arch = "aarch64")]
             CpuSimd::Neon => "cpu-neon",
+            #[cfg(target_arch = "aarch64")]
+            CpuSimd::NeonDotprod => "cpu-neon-dotprod",
         }
     }
 }
@@ -197,35 +220,129 @@ fn detect_cpu_simd() -> CpuSimd {
         if is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512vnni")
             && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
         {
             return CpuSimd::Avx512Vnni;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("avxvnni") {
+            return CpuSimd::AvxVnni;
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON is mandatory in ARMv8-A, so unlike the x86 tier there is nothing
-        // to probe — every aarch64 target reaching this code has it.
+        // NEON is mandatory in ARMv8-A, so every aarch64 target reaching this
+        // code has it; the dot-product extension is probed.
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return CpuSimd::NeonDotprod;
+        }
         return CpuSimd::Neon;
     }
     #[allow(unreachable_code)]
     CpuSimd::Scalar
 }
 
-/// Dot product of two Q8_0-block rows via AVX-512-VNNI `vpdpbusd`.
+/// Dot product of two Q8_0-block rows with the `vpdpbusd` instruction, in the
+/// encoding the CPU has: EVEX on AVX-512-VNNI parts (Xeon, Zen 4 and later),
+/// VEX on AVX-VNNI parts (Intel client cores without AVX-512).
 ///
 /// Both `a` and `b` are concatenated Q8_0 blocks (`[f16 scale | 32×i8]`,
 /// 34 bytes each) of equal length. Per block: widen both quant vectors,
-/// accumulate `Σ aᵢ·bᵢ` as i32 via VNNI, then scale by `d_a · d_b`.
+/// accumulate `Σ aᵢ·bᵢ` as i32, then scale by `d_a · d_b`. The two encodings
+/// compute the same integers, so the tiers agree bit for bit.
+#[cfg(target_arch = "x86_64")]
+macro_rules! dot_q8_0_vnni {
+    ($name:ident, $features:literal, $dpbusd:ident) => {
+        /// # Safety
+        /// Caller must ensure the CPU supports the target features this
+        /// function is compiled for (guaranteed by the detected tier), and
+        /// that `a` and `b` are the same number of whole Q8_0 blocks.
+        #[target_feature(enable = $features)]
+        unsafe fn $name(a: &[u8], b: &[u8]) -> f32 {
+            use half::f16;
+            use std::arch::x86_64::*;
+
+            const BB: usize = crate::quant::Q8_0_BLOCK_BYTES; // 34
+            debug_assert_eq!(a.len(), b.len());
+            debug_assert_eq!(a.len() % BB, 0);
+
+            let mut acc = 0.0f32;
+            let nblocks = a.len() / BB;
+            for blk in 0..nblocks {
+                let ab = &a[blk * BB..(blk + 1) * BB];
+                let bb = &b[blk * BB..(blk + 1) * BB];
+                let da = f16::from_le_bytes([ab[0], ab[1]]).to_f32();
+                let db = f16::from_le_bytes([bb[0], bb[1]]).to_f32();
+
+                let raw = unsafe {
+                    // 32 i8 quants per block. Load as __m256i (32 bytes).
+                    let qa = _mm256_loadu_si256(ab.as_ptr().add(2) as *const __m256i);
+                    let qb = _mm256_loadu_si256(bb.as_ptr().add(2) as *const __m256i);
+
+                    // vpdpbusd wants u8 × i8. Q8_0 quants are signed i8; make the `a`
+                    // side unsigned by adding 128 and correct the bias afterward:
+                    //   Σ (aᵢ+128)·bᵢ = Σ aᵢ·bᵢ + 128·Σ bᵢ
+                    // so subtract 128·Σ bᵢ.
+                    let bias = _mm256_set1_epi8(-128i8 as u8 as i8);
+                    let qa_u = _mm256_sub_epi8(qa, bias); // aᵢ + 128, as u8 bit-pattern
+
+                    let mut dot = _mm256_setzero_si256();
+                    dot = $dpbusd(dot, qa_u, qb);
+
+                    // Σ bᵢ via vpdpbusd of ones(u8) · b(i8).
+                    let ones = _mm256_set1_epi8(1);
+                    let mut sum_b = _mm256_setzero_si256();
+                    sum_b = $dpbusd(sum_b, ones, qb);
+
+                    // Horizontal-sum both i32x8 accumulators.
+                    let dot_sum = hsum_i32x8(dot);
+                    let b_sum = hsum_i32x8(sum_b);
+
+                    dot_sum - 128 * b_sum
+                };
+                acc += (raw as f32) * da * db;
+            }
+            acc
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+dot_q8_0_vnni!(dot_q8_0_avx512_vnni, "avx512f,avx512bw,avx512vl,avx512vnni", _mm256_dpbusd_epi32);
+#[cfg(target_arch = "x86_64")]
+dot_q8_0_vnni!(dot_q8_0_avx_vnni, "avx2,avxvnni", _mm256_dpbusd_avx_epi32);
+
+/// Horizontal sum of an `__m256i` interpreted as 8×i32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32x8(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256(v, 1);
+    let s = _mm_add_epi32(lo, hi);
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01));
+    _mm_cvtsi128_si32(s)
+}
+
+/// Dot product of two Q8_0-block rows with the Armv8.2 dot-product
+/// extension (`SDOT`).
+///
+/// Both `a` and `b` are concatenated Q8_0 blocks (`[f16 scale | 32×i8]`,
+/// 34 bytes each) of equal length. Per block: two `vdotq_s32` accumulations
+/// cover the 32 quants as 2×16 lanes, horizontally sum to i32, then scale by
+/// `d_a · d_b`. `SDOT` is signed × signed, so the Q8_0 i8 quants feed it
+/// directly and no bias correction is needed. The integers are the ones the
+/// widening-multiply tier computes, so the two agree bit for bit.
 ///
 /// # Safety
-/// Caller must ensure the CPU supports `avx512f`, `avx512bw`, and
-/// `avx512vnni` (guaranteed by `CpuSimd::Avx512Vnni`), and that `a` and `b`
-/// are the same number of whole Q8_0 blocks.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-unsafe fn dot_q8_0_avx512_vnni(a: &[u8], b: &[u8]) -> f32 {
+/// Caller must ensure the CPU has the dot-product extension (guaranteed by
+/// `CpuSimd::NeonDotprod`) and that `a` and `b` are the same number of whole
+/// Q8_0 blocks.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q8_0_neon_dotprod(a: &[u8], b: &[u8]) -> f32 {
     use half::f16;
-    use std::arch::x86_64::*;
+    use std::arch::aarch64::*;
 
     const BB: usize = crate::quant::Q8_0_BLOCK_BYTES; // 34
     debug_assert_eq!(a.len(), b.len());
@@ -239,76 +356,31 @@ unsafe fn dot_q8_0_avx512_vnni(a: &[u8], b: &[u8]) -> f32 {
         let da = f16::from_le_bytes([ab[0], ab[1]]).to_f32();
         let db = f16::from_le_bytes([bb[0], bb[1]]).to_f32();
 
+        // Safety: both slices are indexed within the 34-byte block bounds
+        // asserted above.
         let raw = unsafe {
-            // 32 i8 quants per block. Load as __m256i (32 bytes).
-            let qa = _mm256_loadu_si256(ab.as_ptr().add(2) as *const __m256i);
-            let qb = _mm256_loadu_si256(bb.as_ptr().add(2) as *const __m256i);
-
-            // vpdpbusd wants u8 × i8. Q8_0 quants are signed i8; make the `a`
-            // side unsigned by adding 128 and correct the bias afterward:
-            //   Σ (aᵢ+128)·bᵢ = Σ aᵢ·bᵢ + 128·Σ bᵢ
-            // so subtract 128·Σ bᵢ.
-            let bias = _mm256_set1_epi8(-128i8 as u8 as i8);
-            let qa_u = _mm256_sub_epi8(qa, bias); // aᵢ + 128, as u8 bit-pattern
-
-            let mut dot = _mm256_setzero_si256();
-            dot = _mm256_dpbusd_epi32(dot, qa_u, qb);
-
-            // Σ bᵢ via vpdpbusd of ones(u8) · b(i8).
-            let ones = _mm256_set1_epi8(1);
-            let mut sum_b = _mm256_setzero_si256();
-            sum_b = _mm256_dpbusd_epi32(sum_b, ones, qb);
-
-            // Horizontal-sum both i32x8 accumulators.
-            let dot_sum = hsum_i32x8(dot);
-            let b_sum = hsum_i32x8(sum_b);
-
-            dot_sum - 128 * b_sum
+            let qa0 = vld1q_s8(ab.as_ptr().add(2) as *const i8);
+            let qa1 = vld1q_s8(ab.as_ptr().add(2 + 16) as *const i8);
+            let qb0 = vld1q_s8(bb.as_ptr().add(2) as *const i8);
+            let qb1 = vld1q_s8(bb.as_ptr().add(2 + 16) as *const i8);
+            let sum = vdotq_s32(vdotq_s32(vdupq_n_s32(0), qa0, qb0), qa1, qb1);
+            vaddvq_s32(sum)
         };
         acc += (raw as f32) * da * db;
     }
     acc
 }
 
-/// Horizontal sum of an `__m256i` interpreted as 8×i32.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-unsafe fn hsum_i32x8(v: std::arch::x86_64::__m256i) -> i32 {
-    use std::arch::x86_64::*;
-    let lo = _mm256_castsi256_si128(v);
-    let hi = _mm256_extracti128_si256(v, 1);
-    let s = _mm_add_epi32(lo, hi);
-    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
-    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01));
-    _mm_cvtsi128_si32(s)
-}
-
-/// Dot product of two Q8_0-block rows via the Armv8.2 NEON dot-product
-/// extension (`SDOT`).
+/// Dot product of two Q8_0-block rows with baseline NEON, for cores without
+/// the dot-product extension.
 ///
-/// Both `a` and `b` are concatenated Q8_0 blocks (`[f16 scale | 32×i8]`,
-/// 34 bytes each) of equal length. Per block: two `vdotq_s32` accumulations
-/// cover the 32 quants as 2×16 lanes, horizontally sum to i32, then scale by
-/// `d_a · d_b`.
-///
-/// Unlike the AVX-512 path, no bias correction is needed: the NEON widening
-/// multiply is *signed*, so the Q8_0 i8 quants feed it directly, whereas
-/// `vpdpbusd` requires one operand to be unsigned and a `128·Σb` correction
-/// afterwards.
-///
-/// Implementation note: this uses `vmull_s8` + `vpaddlq_s16` rather than the
-/// Armv8.2 `SDOT` instruction. `vdotq_s32` is still unstable in Rust
-/// (`stdarch_neon_dotprod`) as of 1.97 and the workspace pins stable, so the
-/// widening-multiply form is the portable equivalent — it is exactly the
-/// fallback the vendored llama.cpp uses when `__ARM_FEATURE_DOTPROD` is absent
-/// (`ggml/src/ggml-cpu/ggml-cpu-impl.h`, `ggml_vdotq_s32`). It also has the
-/// advantage of needing no runtime feature probe: NEON is mandatory in ARMv8-A,
-/// so every aarch64 part takes this path. When `vdotq_s32` stabilizes, swapping
-/// the inner two lines for a pair of `SDOT` accumulations is the only change
-/// required.
-///
-/// Per-lane grouping differs from `SDOT`, but the horizontal sum is identical,
-/// which is all this function returns.
+/// Same blocks and result as [`dot_q8_0_neon_dotprod`], computed with
+/// `vmull_s8` + `vpaddlq_s16`: the widening-multiply form the vendored
+/// llama.cpp falls back to when `__ARM_FEATURE_DOTPROD` is absent
+/// (`ggml/src/ggml-cpu/ggml-cpu-impl.h`, `ggml_vdotq_s32`). It needs no
+/// runtime probe: NEON is mandatory in ARMv8-A. Per-lane grouping differs
+/// from `SDOT`, but the horizontal sum is identical, which is all this
+/// function returns.
 ///
 /// # Safety
 /// Caller must ensure `a` and `b` are the same number of whole Q8_0 blocks.
@@ -391,12 +463,28 @@ impl ComputeBackend {
 }
 
 /// The GPUs visible to this process, as the host detected them.
+///
+/// Build it from the machine: `Gpus::from(&Machine::detect())`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gpus {
     /// An NVIDIA GPU is visible.
     pub nvidia: bool,
     /// A GPU from any other vendor is visible.
     pub other: bool,
+}
+
+impl From<&praecise_hardware::Machine> for Gpus {
+    /// The GPUs of `machine`. Neural processors and data-centre accelerator
+    /// cards are not counted: the expert kernels run on CUDA or through wgpu,
+    /// and wgpu drives GPUs only.
+    fn from(machine: &praecise_hardware::Machine) -> Self {
+        use praecise_hardware::{Kind, Vendor};
+        let gpus = || machine.accelerators().iter().filter(|a| a.kind == Kind::Gpu);
+        Self {
+            nvidia: gpus().any(|a| a.vendor == Vendor::Nvidia),
+            other: gpus().any(|a| a.vendor != Vendor::Nvidia),
+        }
+    }
 }
 
 impl Gpus {
@@ -453,6 +541,59 @@ mod tests {
 
     fn ref_matmul_xt(x: &Array2<f32>, w: &Array2<f32>) -> Array2<f32> {
         x.dot(&w.t())
+    }
+
+    /// The dot-product tier and the baseline tier compute the same integers.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_tiers_agree_bit_for_bit() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let row = |seed: f32| -> Vec<u8> {
+            let v: Vec<f32> = (0..96).map(|i| ((i as f32) * seed).sin() * 1.7).collect();
+            crate::quant::quantize_row_q8_0(&v)
+        };
+        let (a, b) = (row(0.37), row(1.13));
+        // Safety: the dot-product extension was detected above.
+        let fast = unsafe { dot_q8_0_neon_dotprod(&a, &b) };
+        assert_eq!(fast.to_bits(), dot_q8_0_neon(&a, &b).to_bits());
+    }
+
+    /// The EVEX and VEX encodings of `vpdpbusd` compute the same integers.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vnni_tiers_agree_bit_for_bit() {
+        let avx512 = is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512vnni");
+        let avx = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("avxvnni");
+        if !(avx512 && avx) {
+            return;
+        }
+        let row = |seed: f32| -> Vec<u8> {
+            let v: Vec<f32> = (0..96).map(|i| ((i as f32) * seed).sin() * 1.7).collect();
+            crate::quant::quantize_row_q8_0(&v)
+        };
+        let (a, b) = (row(0.37), row(1.13));
+        // Safety: both feature sets were detected above.
+        let (evex, vex) = unsafe { (dot_q8_0_avx512_vnni(&a, &b), dot_q8_0_avx_vnni(&a, &b)) };
+        assert_eq!(evex.to_bits(), vex.to_bits());
+    }
+
+    #[test]
+    fn the_machine_names_its_gpus() {
+        use praecise_hardware::{Accelerator, Kind, Machine, Vendor};
+        let acc = |vendor, kind| Accelerator { vendor, kind };
+        let mixed = Machine::with([acc(Vendor::Nvidia, Kind::Gpu), acc(Vendor::Amd, Kind::Gpu)]);
+        assert_eq!(Gpus::from(&mixed), Gpus { nvidia: true, other: true });
+        let intel = Machine::with([acc(Vendor::Intel, Kind::Gpu), acc(Vendor::Intel, Kind::Npu)]);
+        assert_eq!(Gpus::from(&intel), Gpus { nvidia: false, other: true });
+        // a neural processor or an accelerator card alone is nothing wgpu can drive
+        let npu = Machine::with([acc(Vendor::Huawei, Kind::Npu), acc(Vendor::Intel, Kind::Accelerator)]);
+        assert_eq!(Gpus::from(&npu), Gpus::default());
+        assert!(!Gpus::from(&Machine::cpu_only()).any());
     }
 
     #[test]

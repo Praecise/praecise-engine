@@ -7,6 +7,7 @@ description = "Praecise Engine diffusion family: native flow-matching image, vid
 
 [dependencies]
 llama-cpp-sys-2 = { path = "../llama-cpp-sys-2", default-features = false }
+praecise-hardware = { path = "../praecise-hardware" }
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -21,8 +22,21 @@ flate2 = "1"
 
 [features]
 default = []
+# One per ggml backend that registers a device the generation graph can run
+# on, under the same names as praecise-runtime.
 cuda = ["llama-cpp-sys-2/cuda"]
+rocm = ["llama-cpp-sys-2/rocm"]
 metal = ["llama-cpp-sys-2/metal"]
+vulkan = ["llama-cpp-sys-2/vulkan"]
+sycl = ["llama-cpp-sys-2/sycl"]
+openvino = ["llama-cpp-sys-2/openvino"]
+opencl = ["llama-cpp-sys-2/opencl"]
+hexagon = ["llama-cpp-sys-2/hexagon"]
+cann = ["llama-cpp-sys-2/cann"]
+musa = ["llama-cpp-sys-2/musa"]
+webgpu = ["llama-cpp-sys-2/webgpu"]
+zdnn = ["llama-cpp-sys-2/zdnn"]
+et = ["llama-cpp-sys-2/et"]
 
 [lints]
 workspace = true
