@@ -4,26 +4,35 @@
 //! segmentation, text-prompted segmentation, detection and speech) builds its
 //! [`Session`] through [`build_onnx_session`].
 //!
-//! Execution providers are chosen from the GPUs the host declares through
-//! [`install`], never from per-model configuration:
-//! - On a machine with an NVIDIA GPU every session runs on CUDA, with
-//!   TensorRT ahead of it when the linked ONNX Runtime carries the TensorRT
-//!   provider and the TensorRT library is installed. A binary that cannot
-//!   do that (built without the `cuda` feature, or linked against an ONNX
-//!   Runtime without the CUDA provider) refuses: [`verify_accelerators`]
-//!   fails at startup and every model load fails with the cause.
-//! - On a machine with an AMD GPU every session runs on MIGraphX and/or
-//!   ROCm, whichever the linked ONNX Runtime lists. A binary built without
-//!   the `rocm` feature, or linked against an ONNX Runtime with neither
-//!   provider, refuses the same way.
-//! - ONNX Runtime has no Vulkan execution provider, so on a machine whose
-//!   only GPU is another Vulkan-class device (Intel and others) sessions run
-//!   on the CPU provider. A build with the `vulkan` feature (and not the
-//!   matching `cuda` or `rocm` one) refuses ONNX models on an NVIDIA or AMD
-//!   GPU, naming the build that accelerates them.
+//! Execution providers are chosen from the accelerators the host declares
+//! through [`install`], never from per-model configuration. One rule holds
+//! for every vendor: a machine with a GPU runs its sessions on that GPU, and
+//! a binary that cannot do so refuses instead of running them on the CPU.
+//! [`verify_accelerators`] fails at startup and every model load fails with
+//! the cause, which names the build that would work.
+//!
+//! | GPU | Provider, by the feature the binary was built with |
+//! |---|---|
+//! | NVIDIA | `cuda`: TensorRT (when its library is installed), then CUDA |
+//! | AMD | `rocm`: MIGraphX |
+//! | Intel | `openvino`: OpenVINO on the GPU |
+//! | Qualcomm | `qnn`: QNN on the Adreno GPU |
+//! | Huawei Ascend | `cann`: CANN |
+//! | Apple | `coreml`: CoreML |
+//! | any of them | `directml` (Windows) or `webgpu`, when the vendor's own feature is not built |
+//!
+//! - ONNX Runtime removed its ROCm provider in 1.23; MIGraphX is the AMD
+//!   provider, and the `rocm` feature builds it.
+//! - ONNX Runtime has no Vulkan execution provider. A build with the `vulkan`
+//!   feature and no ONNX provider for the machine's GPU refuses ONNX models,
+//!   naming the build that accelerates them. `webgpu` is the portable
+//!   provider that runs on any vendor's GPU.
+//! - Neural processors take quantized, static-shape models, so one is used
+//!   only when the operator asks for it ([`OnnxConfig::npu`]): OpenVINO on an
+//!   Intel NPU, Vitis AI on an AMD NPU, QNN on a Qualcomm NPU. It is
+//!   registered ahead of the GPU's provider, which takes what it leaves.
 //! - A provider that is expected and fails to register is an error. The
 //!   model does not load, rather than silently running on the CPU.
-//! - On Apple builds with `coreml`, sessions run on CoreML.
 //! - Without an accelerator, sessions run on ONNX Runtime's CPU provider.
 //!
 //! Thread pools are bounded: intra-op and inter-op threads default to a
@@ -34,19 +43,32 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+#[cfg(feature = "cann")]
+use ort::ep::CANN;
 #[cfg(feature = "coreml")]
 use ort::ep::CoreML;
+#[cfg(feature = "directml")]
+use ort::ep::DirectML;
+#[cfg(feature = "rocm")]
+use ort::ep::MIGraphX;
+#[cfg(feature = "openvino")]
+use ort::ep::OpenVINO;
+#[cfg(feature = "qnn")]
+use ort::ep::QNN;
+#[cfg(feature = "vitis")]
+use ort::ep::Vitis;
+#[cfg(feature = "webgpu")]
+use ort::ep::WebGPU;
 #[cfg(feature = "cuda")]
 use ort::ep::{CUDA, TensorRT};
 use ort::ep::{CPU, ExecutionProvider};
-#[cfg(feature = "rocm")]
-use ort::ep::{MIGraphX, ROCm};
 use ort::environment::Environment;
 use ort::session::Session;
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+pub use crate::plan::{Accelerator, Gpus, ProviderFacts, plan_providers};
 
 /// Operator settings applied to every ONNX session in the process. Every
 /// field is optional; unset fields are derived from the detected core count.
@@ -62,6 +84,10 @@ pub struct OnnxConfig {
     /// busy.
     #[serde(default)]
     pub queue_depth: Option<u32>,
+    /// Run sessions on the machine's neural processor ahead of its GPU. Off
+    /// unless set: an NPU takes quantized, static-shape models only.
+    #[serde(default)]
+    pub npu: Option<bool>,
 }
 
 /// Resolved ONNX serving limits for this process.
@@ -73,6 +99,8 @@ pub struct OnnxSettings {
     pub concurrency: u32,
     /// Waiting requests per ONNX runtime before new ones are refused as busy.
     pub queue_depth: u32,
+    /// Whether sessions go to the machine's neural processor first.
+    pub npu: bool,
 }
 
 impl OnnxSettings {
@@ -96,6 +124,7 @@ impl OnnxSettings {
             threads,
             concurrency,
             queue_depth,
+            npu: config.npu.unwrap_or(false),
         }
     }
 
@@ -122,16 +151,6 @@ pub fn set_admission(check: Admission) -> bool {
     ADMISSION.set(check).is_ok()
 }
 
-/// The GPUs visible to this process, as the host detected them. The
-/// execution providers follow from these; the engine does not guess them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Gpus {
-    /// An NVIDIA GPU is visible.
-    pub nvidia: bool,
-    /// An AMD GPU is visible.
-    pub amd: bool,
-}
-
 /// Install the operator's ONNX settings and the machine's GPUs for this
 /// process. Called once at startup, before any model loads. Returns `false`
 /// when they were already fixed, in which case the earlier ones stay in force.
@@ -146,139 +165,8 @@ pub fn settings() -> OnnxSettings {
     *SETTINGS.get_or_init(OnnxSettings::detected)
 }
 
-/// A hardware execution provider an ONNX session registers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Accelerator {
-    TensorRt,
-    Cuda,
-    MiGraphX,
-    Rocm,
-    CoreMl,
-}
-
-impl Accelerator {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::TensorRt => "TensorRT",
-            Self::Cuda => "CUDA",
-            Self::MiGraphX => "MIGraphX",
-            Self::Rocm => "ROCm",
-            Self::CoreMl => "CoreML",
-        }
-    }
-}
-
-/// What this process has to accelerate ONNX sessions with.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ProviderFacts {
-    /// An NVIDIA GPU was detected on this machine.
-    pub cuda_gpu: bool,
-    /// This binary was built with the `cuda` feature.
-    pub cuda_build: bool,
-    /// The linked ONNX Runtime lists the CUDA execution provider.
-    pub cuda_provider: bool,
-    /// The linked ONNX Runtime lists the TensorRT execution provider.
-    pub tensorrt_provider: bool,
-    /// The TensorRT runtime library can be loaded.
-    pub tensorrt_runtime: bool,
-    /// This binary was built with the `vulkan` feature.
-    pub vulkan_build: bool,
-    /// An AMD GPU was detected on this machine.
-    pub amd_gpu: bool,
-    /// This binary was built with the `rocm` feature.
-    pub rocm_build: bool,
-    /// The linked ONNX Runtime lists the ROCm execution provider.
-    pub rocm_provider: bool,
-    /// The linked ONNX Runtime lists the MIGraphX execution provider.
-    pub migraphx_provider: bool,
-    /// This binary was built with the `coreml` feature.
-    pub coreml_build: bool,
-    /// The linked ONNX Runtime lists the CoreML execution provider.
-    pub coreml_provider: bool,
-}
-
-/// Decide which execution providers every session registers, or why this
-/// binary cannot serve ONNX models on this machine.
-pub fn plan_providers(facts: &ProviderFacts) -> std::result::Result<Vec<Accelerator>, String> {
-    if facts.cuda_gpu {
-        if !facts.cuda_build && facts.vulkan_build {
-            return Err("this is a Vulkan build: it runs GGUF models on \
-                        this NVIDIA GPU, but ONNX Runtime has no Vulkan execution provider, so \
-                        it does not serve ONNX models here; install the CUDA build to serve them"
-                .to_string());
-        }
-        if !facts.cuda_build {
-            return Err(
-                "this machine has an NVIDIA GPU but this binary was built without the \
-                        `cuda` feature, so its ONNX runtimes cannot use it; install the CUDA \
-                        build"
-                    .to_string(),
-            );
-        }
-        if !facts.cuda_provider {
-            return Err(
-                "this binary was built with the `cuda` feature and this machine has an \
-                        NVIDIA GPU, but the linked ONNX Runtime has no CUDA execution provider; \
-                        rebuild against a CUDA-enabled ONNX Runtime (set ORT_LIB_LOCATION to its \
-                        install prefix)"
-                    .to_string(),
-            );
-        }
-        let mut plan = Vec::with_capacity(2);
-        if facts.tensorrt_provider && facts.tensorrt_runtime {
-            plan.push(Accelerator::TensorRt);
-        }
-        plan.push(Accelerator::Cuda);
-        return Ok(plan);
-    }
-    if facts.amd_gpu {
-        if !facts.rocm_build && facts.vulkan_build {
-            return Err("this is a Vulkan build: it runs GGUF models on \
-                        this AMD GPU, but ONNX Runtime has no Vulkan execution provider, so it \
-                        does not serve ONNX models here; install the ROCm build to serve them"
-                .to_string());
-        }
-        if !facts.rocm_build {
-            return Err(
-                "this machine has an AMD GPU but this binary was built without the \
-                        `rocm` feature, so its ONNX runtimes cannot use it; install the ROCm \
-                        build"
-                    .to_string(),
-            );
-        }
-        let mut plan = Vec::with_capacity(2);
-        if facts.migraphx_provider {
-            plan.push(Accelerator::MiGraphX);
-        }
-        if facts.rocm_provider {
-            plan.push(Accelerator::Rocm);
-        }
-        if plan.is_empty() {
-            return Err(
-                "this binary was built with the `rocm` feature and this machine has an \
-                        AMD GPU, but the linked ONNX Runtime has neither the MIGraphX nor the \
-                        ROCm execution provider; rebuild against a ROCm-enabled ONNX Runtime \
-                        (set ORT_LIB_LOCATION to its install prefix)"
-                    .to_string(),
-            );
-        }
-        return Ok(plan);
-    }
-    if facts.coreml_build {
-        if !facts.coreml_provider {
-            return Err(
-                "this binary was built with the `coreml` feature but the linked \
-                        ONNX Runtime has no CoreML execution provider"
-                    .to_string(),
-            );
-        }
-        return Ok(vec![Accelerator::CoreMl]);
-    }
-    Ok(Vec::new())
-}
-
 /// Whether the linked ONNX Runtime lists the provider `P`.
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm", feature = "coreml")), allow(dead_code))]
+#[allow(dead_code)]
 fn provider_listed<P: ExecutionProvider>() -> std::result::Result<bool, String> {
     P::is_available()
         .map_err(|e| format!("could not list ONNX Runtime execution providers: {e}"))
@@ -304,41 +192,52 @@ fn tensorrt_runtime_loadable() -> bool {
     false
 }
 
+/// Whether the linked ONNX Runtime lists a provider; `false` in a build
+/// without the provider's feature, where its type does not exist.
+macro_rules! listed {
+    ($feature:literal, $provider:ty) => {{
+        #[cfg(feature = $feature)]
+        let listed = provider_listed::<$provider>()?;
+        #[cfg(not(feature = $feature))]
+        let listed = false;
+        listed
+    }};
+}
+
 fn gather_facts() -> std::result::Result<ProviderFacts, String> {
     let gpus = GPUS.get().copied().unwrap_or_default();
-    let cuda_gpu = gpus.nvidia;
-    let amd_gpu = gpus.amd;
-    let cuda_build = cfg!(feature = "cuda");
-    let rocm_build = cfg!(feature = "rocm");
-    let vulkan_build = cfg!(feature = "vulkan");
-    let coreml_build = cfg!(feature = "coreml");
-    // the provider types exist only in a build with their feature
-    #[cfg(feature = "cuda")]
-    let (cuda_provider, tensorrt_provider) = (provider_listed::<CUDA>()?, provider_listed::<TensorRT>()?);
-    #[cfg(not(feature = "cuda"))]
-    let (cuda_provider, tensorrt_provider) = (false, false);
-    let tensorrt_runtime = tensorrt_provider && tensorrt_runtime_loadable();
-    #[cfg(feature = "rocm")]
-    let (rocm_provider, migraphx_provider) = (provider_listed::<ROCm>()?, provider_listed::<MIGraphX>()?);
-    #[cfg(not(feature = "rocm"))]
-    let (rocm_provider, migraphx_provider) = (false, false);
-    #[cfg(feature = "coreml")]
-    let coreml_provider = provider_listed::<CoreML>()?;
-    #[cfg(not(feature = "coreml"))]
-    let coreml_provider = false;
+    let tensorrt_provider = listed!("cuda", TensorRT);
     Ok(ProviderFacts {
-        cuda_gpu,
-        cuda_build,
-        cuda_provider,
+        cuda_gpu: gpus.nvidia,
+        cuda_build: cfg!(feature = "cuda"),
+        cuda_provider: listed!("cuda", CUDA),
         tensorrt_provider,
-        tensorrt_runtime,
-        vulkan_build,
-        amd_gpu,
-        rocm_build,
-        rocm_provider,
-        migraphx_provider,
-        coreml_build,
-        coreml_provider,
+        tensorrt_runtime: tensorrt_provider && tensorrt_runtime_loadable(),
+        vulkan_build: cfg!(feature = "vulkan"),
+        amd_gpu: gpus.amd,
+        rocm_build: cfg!(feature = "rocm"),
+        migraphx_provider: listed!("rocm", MIGraphX),
+        intel_gpu: gpus.intel,
+        intel_npu: gpus.intel_npu,
+        openvino_build: cfg!(feature = "openvino"),
+        openvino_provider: listed!("openvino", OpenVINO),
+        qualcomm_gpu: gpus.qualcomm,
+        qualcomm_npu: gpus.qualcomm_npu,
+        qnn_build: cfg!(feature = "qnn"),
+        qnn_provider: listed!("qnn", QNN),
+        huawei_npu: gpus.huawei,
+        cann_build: cfg!(feature = "cann"),
+        cann_provider: listed!("cann", CANN),
+        amd_npu: gpus.amd_npu,
+        vitis_build: cfg!(feature = "vitis"),
+        vitis_provider: listed!("vitis", Vitis),
+        directml_build: cfg!(feature = "directml"),
+        directml_provider: listed!("directml", DirectML),
+        webgpu_build: cfg!(feature = "webgpu"),
+        webgpu_provider: listed!("webgpu", WebGPU),
+        coreml_build: cfg!(feature = "coreml"),
+        coreml_provider: listed!("coreml", CoreML),
+        npu: settings().npu,
     })
 }
 
@@ -391,10 +290,17 @@ pub fn verify_accelerators() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(
-    not(any(feature = "cuda", feature = "rocm", feature = "coreml")),
-    allow(unused_variables)
-)]
+/// The file name of a QNN backend library on this platform.
+#[cfg(feature = "qnn")]
+fn qnn_backend(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.dll")
+    } else {
+        format!("lib{name}.so")
+    }
+}
+
+#[allow(unused_variables)]
 fn register(
     accelerator: Accelerator,
     builder: &mut SessionBuilder,
@@ -406,10 +312,24 @@ fn register(
         Accelerator::Cuda => CUDA::default().register(builder),
         #[cfg(feature = "rocm")]
         Accelerator::MiGraphX => MIGraphX::default().register(builder),
-        #[cfg(feature = "rocm")]
-        Accelerator::Rocm => ROCm::default().register(builder),
+        #[cfg(feature = "openvino")]
+        Accelerator::OpenVinoGpu => OpenVINO::default().with_device_type("GPU").register(builder),
+        #[cfg(feature = "openvino")]
+        Accelerator::OpenVinoNpu => OpenVINO::default().with_device_type("NPU").register(builder),
+        #[cfg(feature = "qnn")]
+        Accelerator::QnnGpu => QNN::default().with_backend_path(qnn_backend("QnnGpu")).register(builder),
+        #[cfg(feature = "qnn")]
+        Accelerator::QnnHtp => QNN::default().with_backend_path(qnn_backend("QnnHtp")).register(builder),
+        #[cfg(feature = "cann")]
+        Accelerator::Cann => CANN::default().register(builder),
+        #[cfg(feature = "vitis")]
+        Accelerator::VitisAi => Vitis::default().register(builder),
         #[cfg(feature = "coreml")]
         Accelerator::CoreMl => CoreML::default().register(builder),
+        #[cfg(feature = "directml")]
+        Accelerator::DirectMl => DirectML::default().register(builder),
+        #[cfg(feature = "webgpu")]
+        Accelerator::WebGpu => WebGPU::default().register(builder),
         // the plan only names providers of this build
         #[allow(unreachable_patterns)]
         other => Err(ort::Error::new(format!(
@@ -427,7 +347,10 @@ fn register(
 /// arena keeps the largest working set it ever reached for the life of the
 /// session, so one long input (a video of several thousand tokens) would
 /// hold its peak for as long as the model stays loaded.
-fn session_builder(settings: &OnnxSettings) -> Result<SessionBuilder> {
+///
+/// DirectML supports neither memory-pattern planning nor parallel graph
+/// execution, so a session that registers it (`directml`) turns both off.
+fn session_builder(settings: &OnnxSettings, directml: bool) -> Result<SessionBuilder> {
     let builder_error = |e: &dyn std::fmt::Display| Error::InvalidModel(format!("ORT session builder: {e}"));
     let mut builder = Session::builder(ort_environment()?)
         .map_err(|e| builder_error(&e))?
@@ -437,6 +360,13 @@ fn session_builder(settings: &OnnxSettings) -> Result<SessionBuilder> {
         .map_err(|e| builder_error(&e))?
         .with_inter_threads(settings.threads)
         .map_err(|e| builder_error(&e))?;
+    if directml {
+        builder = builder
+            .with_memory_pattern(false)
+            .map_err(|e| builder_error(&e))?
+            .with_parallel_execution(false)
+            .map_err(|e| builder_error(&e))?;
+    }
     CPU::default()
         .with_arena_allocator(false)
         .register(&mut builder)
@@ -453,7 +383,7 @@ fn session_builder(settings: &OnnxSettings) -> Result<SessionBuilder> {
 /// installed [`Admission`] check refuses the file.
 pub fn build_onnx_session(path: impl AsRef<Path>, what: &str) -> Result<Session> {
     let plan = accelerators()?;
-    let mut builder = session_builder(&settings())?;
+    let mut builder = session_builder(&settings(), plan.contains(&Accelerator::DirectMl))?;
     for accelerator in plan {
         register(*accelerator, &mut builder).map_err(|e| {
             Error::ProviderNotAvailable(format!(
@@ -502,155 +432,6 @@ mod tests {
         ));
     }
 
-    fn cuda_machine() -> ProviderFacts {
-        ProviderFacts {
-            cuda_gpu: true,
-            cuda_build: true,
-            cuda_provider: true,
-            ..ProviderFacts::default()
-        }
-    }
-
-    #[test]
-    fn cuda_machine_runs_every_session_on_cuda() {
-        assert_eq!(plan_providers(&cuda_machine()), Ok(vec![Accelerator::Cuda]));
-    }
-
-    #[test]
-    fn tensorrt_leads_only_when_listed_and_installed() {
-        let listed_not_installed = ProviderFacts {
-            tensorrt_provider: true,
-            ..cuda_machine()
-        };
-        assert_eq!(
-            plan_providers(&listed_not_installed),
-            Ok(vec![Accelerator::Cuda])
-        );
-        let installed = ProviderFacts {
-            tensorrt_provider: true,
-            tensorrt_runtime: true,
-            ..cuda_machine()
-        };
-        assert_eq!(
-            plan_providers(&installed),
-            Ok(vec![Accelerator::TensorRt, Accelerator::Cuda])
-        );
-    }
-
-    #[test]
-    fn cuda_build_with_cpu_only_onnx_runtime_refuses() {
-        let facts = ProviderFacts {
-            cuda_provider: false,
-            ..cuda_machine()
-        };
-        let cause = plan_providers(&facts).unwrap_err();
-        assert!(cause.contains("no CUDA execution provider"), "{cause}");
-    }
-
-    #[test]
-    fn cpu_build_on_a_gpu_machine_refuses() {
-        let facts = ProviderFacts {
-            cuda_gpu: true,
-            ..ProviderFacts::default()
-        };
-        let cause = plan_providers(&facts).unwrap_err();
-        assert!(cause.contains("without the `cuda` feature"), "{cause}");
-    }
-
-    #[test]
-    fn vulkan_build_refuses_onnx_on_a_gpu_another_build_accelerates() {
-        for (gpu, build) in [
-            (
-                ProviderFacts {
-                    cuda_gpu: true,
-                    ..ProviderFacts::default()
-                },
-                "CUDA build",
-            ),
-            (
-                ProviderFacts {
-                    amd_gpu: true,
-                    ..ProviderFacts::default()
-                },
-                "ROCm build",
-            ),
-        ] {
-            let facts = ProviderFacts {
-                vulkan_build: true,
-                ..gpu
-            };
-            let cause = plan_providers(&facts).unwrap_err();
-            assert!(
-                cause.contains("Vulkan build") && cause.contains(build),
-                "{cause}"
-            );
-        }
-        let intel = ProviderFacts {
-            vulkan_build: true,
-            ..ProviderFacts::default()
-        };
-        assert_eq!(plan_providers(&intel), Ok(Vec::new()));
-    }
-
-    #[test]
-    fn amd_machine_refuses_the_cpu() {
-        let cpu_build = ProviderFacts {
-            amd_gpu: true,
-            ..ProviderFacts::default()
-        };
-        let cause = plan_providers(&cpu_build).unwrap_err();
-        assert!(cause.contains("without the `rocm` feature"), "{cause}");
-
-        let no_provider = ProviderFacts {
-            rocm_build: true,
-            ..cpu_build
-        };
-        let cause = plan_providers(&no_provider).unwrap_err();
-        assert!(
-            cause.contains("neither the MIGraphX nor the ROCm"),
-            "{cause}"
-        );
-
-        let rocm = ProviderFacts {
-            rocm_provider: true,
-            ..no_provider
-        };
-        assert_eq!(plan_providers(&rocm), Ok(vec![Accelerator::Rocm]));
-        let both = ProviderFacts {
-            migraphx_provider: true,
-            ..rocm
-        };
-        assert_eq!(
-            plan_providers(&both),
-            Ok(vec![Accelerator::MiGraphX, Accelerator::Rocm])
-        );
-    }
-
-    #[test]
-    fn machine_without_a_gpu_runs_on_the_cpu() {
-        let cuda_build_no_gpu = ProviderFacts {
-            cuda_gpu: false,
-            ..cuda_machine()
-        };
-        assert_eq!(plan_providers(&cuda_build_no_gpu), Ok(Vec::new()));
-        assert_eq!(plan_providers(&ProviderFacts::default()), Ok(Vec::new()));
-    }
-
-    #[test]
-    fn coreml_build_needs_the_coreml_provider() {
-        let missing = ProviderFacts {
-            coreml_build: true,
-            ..ProviderFacts::default()
-        };
-        assert!(plan_providers(&missing).is_err());
-        let present = ProviderFacts {
-            coreml_build: true,
-            coreml_provider: true,
-            ..ProviderFacts::default()
-        };
-        assert_eq!(plan_providers(&present), Ok(vec![Accelerator::CoreMl]));
-    }
-
     #[test]
     fn threads_default_to_a_quarter_of_the_cores() {
         assert_eq!(
@@ -667,6 +448,7 @@ mod tests {
             threads: Some(3),
             concurrency: Some(2),
             queue_depth: Some(5),
+            npu: Some(true),
         };
         let s = OnnxSettings::resolve(&config, 56);
         assert_eq!(
@@ -674,7 +456,8 @@ mod tests {
             OnnxSettings {
                 threads: 3,
                 concurrency: 2,
-                queue_depth: 5
+                queue_depth: 5,
+                npu: true,
             }
         );
     }
@@ -696,6 +479,6 @@ mod tests {
             8,
         );
         assert_eq!(s.threads, 2);
-        session_builder(&s).expect("the builder accepts the configured thread bounds");
+        session_builder(&s, false).expect("the builder accepts the configured thread bounds");
     }
 }

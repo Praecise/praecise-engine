@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "Praecise Engine ONNX model families: speech-to-text, object detection, promptable and text-prompted segmentation, image encoders, time-series forecasting and text embedding, on ONNX Runtime with the execution provider the machine's GPU needs."
 
 [dependencies]
+praecise-hardware = { path = "../praecise-hardware" }
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -54,12 +55,30 @@ tempfile = "3"
 default = []
 # NVIDIA: the CUDA and TensorRT execution providers.
 cuda = ["ort/cuda", "ort/tensorrt", "dep:libloading"]
-# AMD: the ROCm and MIGraphX execution providers (needs a ROCm-built ONNX
-# Runtime through ORT_LIB_LOCATION).
-rocm = ["ort/rocm", "ort/migraphx"]
+# AMD: the MIGraphX execution provider. ONNX Runtime removed its ROCm
+# provider in 1.23, so MIGraphX is the one that runs on ROCm.
+rocm = ["ort/migraphx"]
+# Intel: the OpenVINO execution provider, on the GPU and, when asked for, the
+# NPU.
+openvino = ["ort/openvino"]
+# Qualcomm: the QNN execution provider, on the Adreno GPU and, when asked
+# for, the Hexagon NPU (needs a QNN-built ONNX Runtime through
+# ORT_LIB_LOCATION).
+qnn = ["ort/qnn"]
+# Huawei: the CANN execution provider for Ascend NPUs (needs a CANN-built
+# ONNX Runtime through ORT_LIB_LOCATION).
+cann = ["ort/cann"]
+# AMD: the Vitis AI execution provider for the XDNA NPU, used when the NPU is
+# asked for (needs a Vitis-AI-built ONNX Runtime through ORT_LIB_LOCATION).
+vitis = ["ort/vitis"]
+# Windows: DirectML, on any vendor's DirectX 12 GPU.
+directml = ["ort/directml"]
+# WebGPU, on any vendor's GPU: the provider for a GPU whose own feature is
+# not built.
+webgpu = ["ort/webgpu"]
 # Marks a build whose GPU path is Vulkan. ONNX Runtime has no Vulkan
-# provider, so such a build refuses ONNX models on an NVIDIA or AMD GPU
-# instead of running them on the CPU.
+# provider, so such a build refuses ONNX models on a GPU instead of running
+# them on the CPU, unless a provider for that GPU is built too.
 vulkan = []
 # Apple: the CoreML execution provider.
 coreml = ["ort/coreml"]

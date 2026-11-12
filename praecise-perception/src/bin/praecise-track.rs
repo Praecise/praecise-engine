@@ -134,10 +134,8 @@ fn run(a: &Args) -> Result<serde_json::Value, String> {
     let gpus = if a.cpu {
         Gpus::default()
     } else {
-        Gpus {
-            nvidia: std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists(),
-            amd: std::path::Path::new("/dev/kfd").exists(),
-        }
+        // every vendor's accelerators, or the ones PRAECISE_ACCELERATORS declares
+        Gpus::from(&praecise_hardware::Machine::from_env_or_detect()?)
     };
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     session::install(OnnxSettings::resolve(&OnnxConfig { threads: a.threads, ..OnnxConfig::default() }, cores), gpus);
