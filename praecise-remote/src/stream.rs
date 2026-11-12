@@ -65,19 +65,29 @@ impl Reply {
             self.done = true;
             return Ok(None);
         }
-        let event: Value = serde_json::from_str(data).map_err(|e| format!("an event that is not JSON ({e})"))?;
+        let event: Value =
+            serde_json::from_str(data).map_err(|e| format!("an event that is not JSON ({e})"))?;
         if let Some(error) = event.get("error") {
-            let message = error.get("message").and_then(Value::as_str).map_or_else(|| error.to_string(), str::to_string);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| error.to_string(), str::to_string);
             return Err(format!("the provider reported an error: {message}"));
         }
         // Usage arrives on a final event of its own, on the event that ends
         // the choice, or under a provider's own key.
-        for usage in [event.get("usage"), event.pointer("/x_groq/usage")].into_iter().flatten() {
+        for usage in [event.get("usage"), event.pointer("/x_groq/usage")]
+            .into_iter()
+            .flatten()
+        {
             if let (Some(prompt), Some(completion)) = (
                 usage.get("prompt_tokens").and_then(Value::as_u64),
                 usage.get("completion_tokens").and_then(Value::as_u64),
             ) {
-                self.usage = Some(Usage { prompt_tokens: prompt, completion_tokens: completion });
+                self.usage = Some(Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                });
             }
         }
         let Some(choice) = event.pointer("/choices/0") else {
@@ -95,7 +105,10 @@ impl Reply {
                 self.thinking.push_str(piece);
             }
         }
-        let piece = delta.and_then(|d| d.get("content")).and_then(Value::as_str).unwrap_or_default();
+        let piece = delta
+            .and_then(|d| d.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         self.text.push_str(piece);
         Ok(Some(piece.to_string()))
     }
@@ -126,7 +139,13 @@ mod tests {
         ]);
         assert_eq!(reply.text, "Hello");
         assert_eq!(reply.finish, Some(Finish::Length));
-        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 2 }));
+        assert_eq!(
+            reply.usage,
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 2
+            })
+        );
         assert!(reply.done());
     }
 
@@ -135,11 +154,23 @@ mod tests {
         let on_last_choice = read(&[
             r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
         ]);
-        assert_eq!(on_last_choice.usage, Some(Usage { prompt_tokens: 3, completion_tokens: 1 }));
+        assert_eq!(
+            on_last_choice.usage,
+            Some(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 1
+            })
+        );
         let vendor_key = read(&[
             r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"x_groq":{"usage":{"prompt_tokens":4,"completion_tokens":6}}}"#,
         ]);
-        assert_eq!(vendor_key.usage, Some(Usage { prompt_tokens: 4, completion_tokens: 6 }));
+        assert_eq!(
+            vendor_key.usage,
+            Some(Usage {
+                prompt_tokens: 4,
+                completion_tokens: 6
+            })
+        );
         // a null usage on the early events is not a count
         let null = read(&[r#"data: {"choices":[{"delta":{"content":"x"}}],"usage":null}"#]);
         assert_eq!(null.usage, None);
@@ -158,8 +189,15 @@ mod tests {
     #[test]
     fn a_broken_event_and_a_provider_error_are_errors() {
         let mut reply = Reply::default();
-        assert!(reply.push_line("data: {not json").unwrap_err().contains("not JSON"));
-        let e = reply.push_line(r#"data: {"error":{"message":"model overloaded"}}"#).unwrap_err();
+        assert!(
+            reply
+                .push_line("data: {not json")
+                .unwrap_err()
+                .contains("not JSON")
+        );
+        let e = reply
+            .push_line(r#"data: {"error":{"message":"model overloaded"}}"#)
+            .unwrap_err();
         assert!(e.contains("model overloaded"), "{e}");
         assert_eq!(reply.push_line("data: [DONE]"), Ok(None));
     }

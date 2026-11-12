@@ -1,7 +1,7 @@
 //! Generation on an inference API outside the machine.
 //!
 //! Some inference silicon is not sold as a device. Groq's LPU, Cerebras's
-//! wafer-scale engine and SambaNova's RDU are reached over a network API and
+//! wafer-scale engine and `SambaNova`'s RDU are reached over a network API and
 //! no other way. This crate is the one route the engine has to them: a
 //! client for an OpenAI-compatible chat-completions endpoint that answers in
 //! the runtime's own types, so a remote model returns the same
@@ -92,7 +92,7 @@ pub enum Provider {
     Groq,
     /// Cerebras: the wafer-scale engine.
     Cerebras,
-    /// SambaNova: the reconfigurable dataflow unit.
+    /// `SambaNova`: the reconfigurable dataflow unit.
     SambaNova,
 }
 
@@ -171,7 +171,12 @@ impl Endpoint {
     }
 
     fn scheme_and_host(&self) -> Result<(&str, String)> {
-        let bad = || Error::Refused(format!("{}: {:?} is not an http(s) URL with a host", self.name, self.base_url));
+        let bad = || {
+            Error::Refused(format!(
+                "{}: {:?} is not an http(s) URL with a host",
+                self.name, self.base_url
+            ))
+        };
         let (scheme, rest) = self.base_url.split_once("://").ok_or_else(bad)?;
         if scheme != "https" && scheme != "http" {
             return Err(bad());
@@ -179,7 +184,10 @@ impl Endpoint {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         // credentials in a URL would end up in logs; they are not accepted
         if authority.contains('@') {
-            return Err(Error::Refused(format!("{}: the base URL carries credentials", self.name)));
+            return Err(Error::Refused(format!(
+                "{}: the base URL carries credentials",
+                self.name
+            )));
         }
         let host = if let Some(bracketed) = authority.strip_prefix('[') {
             bracketed.split(']').next().unwrap_or("")
@@ -203,8 +211,11 @@ impl Allow {
     /// Permit exactly these hosts.
     #[must_use]
     pub fn hosts<S: AsRef<str>>(hosts: impl IntoIterator<Item = S>) -> Self {
-        let mut hosts: Vec<String> =
-            hosts.into_iter().map(|h| h.as_ref().trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect();
+        let mut hosts: Vec<String> = hosts
+            .into_iter()
+            .map(|h| h.as_ref().trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
         hosts.sort();
         hosts.dedup();
         Self { hosts }
@@ -213,7 +224,7 @@ impl Allow {
     /// The hosts named in [`ALLOW_ENV`]; none when it is unset.
     #[must_use]
     pub fn from_env() -> Self {
-        std::env::var(ALLOW_ENV).map(|v| Self::hosts(v.split(','))).unwrap_or_default()
+        std::env::var(ALLOW_ENV).map_or_default(|v| Self::hosts(v.split(',')))
     }
 
     /// Whether `host` is permitted. A host is matched whole: permitting
@@ -253,13 +264,19 @@ impl Remote {
             )));
         }
         if scheme != "https" && !is_loopback(&host) {
-            return Err(Error::Refused(format!("{}: {host} is reached without TLS", endpoint.name)));
+            return Err(Error::Refused(format!(
+                "{}: {host} is reached without TLS",
+                endpoint.name
+            )));
         }
         let key = if endpoint.key_env.is_empty() {
             None
         } else {
             Some(std::env::var(&endpoint.key_env).map_err(|_| {
-                Error::Refused(format!("{}: the API key variable {} is not set", endpoint.name, endpoint.key_env))
+                Error::Refused(format!(
+                    "{}: the API key variable {} is not set",
+                    endpoint.name, endpoint.key_env
+                ))
             })?)
         };
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -267,7 +284,11 @@ impl Remote {
             .timeout_connect(Some(Duration::from_secs(20)))
             .build()
             .into();
-        Ok(Self { endpoint, key, agent })
+        Ok(Self {
+            endpoint,
+            key,
+            agent,
+        })
     }
 
     /// The endpoint this model is on.
@@ -292,13 +313,25 @@ impl Remote {
     ) -> Result<InferenceResult> {
         let started = Instant::now();
         let body = request(&self.endpoint, messages, config)?;
-        let transport = |cause: String| Error::Transport { endpoint: self.endpoint.name.clone(), cause };
-        let url = format!("{}/chat/completions", self.endpoint.base_url.trim_end_matches('/'));
-        let mut call = self.agent.post(&url).header("Content-Type", "application/json").header("Accept", "text/event-stream");
+        let transport = |cause: String| Error::Transport {
+            endpoint: self.endpoint.name.clone(),
+            cause,
+        };
+        let url = format!(
+            "{}/chat/completions",
+            self.endpoint.base_url.trim_end_matches('/')
+        );
+        let mut call = self
+            .agent
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
         if let Some(key) = &self.key {
             call = call.header("Authorization", &format!("Bearer {key}"));
         }
-        let mut response = call.send(body.to_string()).map_err(|e| transport(e.to_string()))?;
+        let mut response = call
+            .send(body.to_string())
+            .map_err(|e| transport(e.to_string()))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             let body = response.body_mut().read_to_string().unwrap_or_default();
@@ -311,13 +344,15 @@ impl Remote {
         let mut reply = Reply::default();
         for line in BufReader::new(response.body_mut().as_reader()).lines() {
             let line = line.map_err(|e| transport(e.to_string()))?;
-            let piece = reply
-                .push_line(&line)
-                .map_err(|cause| Error::Reply { endpoint: self.endpoint.name.clone(), cause })?;
-            if let Some(piece) = piece {
-                if !piece.is_empty() && !on_text(&piece) {
-                    return Err(transport("the caller went away".to_string()));
-                }
+            let piece = reply.push_line(&line).map_err(|cause| Error::Reply {
+                endpoint: self.endpoint.name.clone(),
+                cause,
+            })?;
+            if let Some(piece) = piece
+                && !piece.is_empty()
+                && !on_text(&piece)
+            {
+                return Err(transport("the caller went away".to_string()));
             }
             if reply.done() {
                 break;
@@ -328,14 +363,23 @@ impl Remote {
 }
 
 /// The chat-completions request for `messages` under `config`.
-fn request(endpoint: &Endpoint, messages: &[ChatMessage], config: &GenerationConfig) -> Result<Value> {
+fn request(
+    endpoint: &Endpoint,
+    messages: &[ChatMessage],
+    config: &GenerationConfig,
+) -> Result<Value> {
     if config.commitment_k.is_some() {
-        return Err(Error::Refused("a remote model does not produce inference commitments".into()));
+        return Err(Error::Refused(
+            "a remote model does not produce inference commitments".into(),
+        ));
     }
     if messages.is_empty() {
-        return Err(Error::Refused("a remote model is asked with chat turns, and none were given".into()));
+        return Err(Error::Refused(
+            "a remote model is asked with chat turns, and none were given".into(),
+        ));
     }
-    let messages = serde_json::to_value(messages).map_err(|e| Error::Refused(format!("the chat turns: {e}")))?;
+    let messages = serde_json::to_value(messages)
+        .map_err(|e| Error::Refused(format!("the chat turns: {e}")))?;
     let mut req = json!({
         "model": endpoint.model,
         "messages": messages,
@@ -356,10 +400,16 @@ fn request(endpoint: &Endpoint, messages: &[ChatMessage], config: &GenerationCon
 }
 
 /// The finished stream read back as an [`InferenceResult`].
-fn result(endpoint: &Endpoint, reply: Reply, config: &GenerationConfig, elapsed: Duration) -> Result<InferenceResult> {
+fn result(
+    endpoint: &Endpoint,
+    reply: Reply,
+    config: &GenerationConfig,
+    elapsed: Duration,
+) -> Result<InferenceResult> {
     let usage = reply.usage.ok_or_else(|| Error::Reply {
         endpoint: endpoint.name.clone(),
-        cause: "the reply carried no token usage; it is refused rather than metered as free".to_string(),
+        cause: "the reply carried no token usage; it is refused rather than metered as free"
+            .to_string(),
     })?;
     let output_tokens = u32::try_from(usage.completion_tokens).unwrap_or(u32::MAX);
     let stop_reason = match reply.finish {
@@ -369,11 +419,19 @@ fn result(endpoint: &Endpoint, reply: Reply, config: &GenerationConfig, elapsed:
     };
     Ok(InferenceResult {
         text: reply.text,
-        thinking: if reply.thinking.is_empty() { None } else { Some(reply.thinking) },
+        thinking: if reply.thinking.is_empty() {
+            None
+        } else {
+            Some(reply.thinking)
+        },
         input_tokens: u32::try_from(usage.prompt_tokens).unwrap_or(u32::MAX),
         output_tokens,
         generation_time_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-        tokens_per_second: if elapsed.is_zero() { 0.0 } else { f64::from(output_tokens) / elapsed.as_secs_f64() },
+        tokens_per_second: if elapsed.is_zero() {
+            0.0
+        } else {
+            f64::from(output_tokens) / elapsed.as_secs_f64()
+        },
         stop_reason,
         commitment: None,
         cached_tokens: 0,
@@ -403,23 +461,45 @@ mod tests {
     #[test]
     fn nothing_is_permitted_until_the_operator_names_it() {
         let groq = Provider::Groq.endpoint("llama");
-        let e = Remote::open(groq.clone(), &Allow::default()).unwrap_err().to_string();
+        let e = Remote::open(groq.clone(), &Allow::default())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("api.groq.com") && e.contains(ALLOW_ENV), "{e}");
         // a preset is an address, not a permission; neither is a parent domain
-        assert!(Remote::open(groq.clone(), &Allow::hosts(["groq.com", "api.cerebras.ai"])).is_err());
+        assert!(
+            Remote::open(groq.clone(), &Allow::hosts(["groq.com", "api.cerebras.ai"])).is_err()
+        );
         assert!(Allow::hosts([" API.Groq.com "]).permits("api.groq.com"));
     }
 
     #[test]
     fn a_permitted_endpoint_still_needs_tls_and_its_key() {
-        let plain = Endpoint { base_url: "http://api.example.com/v1".into(), ..local("m", 1) };
-        let e = Remote::open(plain, &Allow::hosts(["api.example.com"])).unwrap_err().to_string();
+        let plain = Endpoint {
+            base_url: "http://api.example.com/v1".into(),
+            ..local("m", 1)
+        };
+        let e = Remote::open(plain, &Allow::hosts(["api.example.com"]))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("without TLS"), "{e}");
-        let keyed = Endpoint { key_env: "PRAECISE_REMOTE_TEST_KEY_THAT_IS_NOT_SET".into(), ..Provider::Cerebras.endpoint("m") };
-        let e = Remote::open(keyed, &Allow::hosts(["api.cerebras.ai"])).unwrap_err().to_string();
+        let keyed = Endpoint {
+            key_env: "PRAECISE_REMOTE_TEST_KEY_THAT_IS_NOT_SET".into(),
+            ..Provider::Cerebras.endpoint("m")
+        };
+        let e = Remote::open(keyed, &Allow::hosts(["api.cerebras.ai"]))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("is not set"), "{e}");
-        let creds = Endpoint { base_url: "https://user:pw@api.example.com/v1".into(), ..local("m", 1) };
-        assert!(Remote::open(creds, &Allow::hosts(["api.example.com"])).unwrap_err().to_string().contains("credentials"));
+        let creds = Endpoint {
+            base_url: "https://user:pw@api.example.com/v1".into(),
+            ..local("m", 1)
+        };
+        assert!(
+            Remote::open(creds, &Allow::hosts(["api.example.com"]))
+                .unwrap_err()
+                .to_string()
+                .contains("credentials")
+        );
     }
 
     #[test]
@@ -430,10 +510,27 @@ mod tests {
             ("http://127.0.0.1:8080/v1", "127.0.0.1"),
             ("http://[::1]:8080/v1", "::1"),
         ] {
-            assert_eq!(Endpoint { base_url: url.into(), ..local("m", 1) }.host().unwrap(), want, "{url}");
+            assert_eq!(
+                Endpoint {
+                    base_url: url.into(),
+                    ..local("m", 1)
+                }
+                .host()
+                .unwrap(),
+                want,
+                "{url}"
+            );
         }
         for url in ["api.groq.com/v1", "ftp://api.groq.com", "https:///v1"] {
-            assert!(Endpoint { base_url: url.into(), ..local("m", 1) }.host().is_err(), "{url}");
+            assert!(
+                Endpoint {
+                    base_url: url.into(),
+                    ..local("m", 1)
+                }
+                .host()
+                .is_err(),
+                "{url}"
+            );
         }
         for p in Provider::ALL {
             assert!(p.base_url().starts_with("https://"));
@@ -451,14 +548,25 @@ mod tests {
             stop: vec!["END".into()],
             ..Default::default()
         };
-        let req = request(&Provider::Groq.endpoint("llama"), &[ChatMessage::new("user", "hi")], &config).unwrap();
+        let req = request(
+            &Provider::Groq.endpoint("llama"),
+            &[ChatMessage::new("user", "hi")],
+            &config,
+        )
+        .unwrap();
         assert_eq!(req["model"], "llama");
         assert_eq!(req["messages"][0]["content"], "hi");
-        assert_eq!((req["max_tokens"].as_u64(), req["seed"].as_u64()), (Some(16), Some(7)));
+        assert_eq!(
+            (req["max_tokens"].as_u64(), req["seed"].as_u64()),
+            (Some(16), Some(7))
+        );
         assert_eq!(req["stream"], true);
         assert_eq!(req["stream_options"]["include_usage"], true);
         assert_eq!(req["stop"][0], "END");
-        let newer = Endpoint { max_tokens_field: "max_completion_tokens".into(), ..Provider::Groq.endpoint("m") };
+        let newer = Endpoint {
+            max_tokens_field: "max_completion_tokens".into(),
+            ..Provider::Groq.endpoint("m")
+        };
         let req = request(&newer, &[ChatMessage::new("user", "hi")], &config).unwrap();
         assert_eq!(req["max_completion_tokens"], 16);
         assert!(req.get("max_tokens").is_none());
@@ -467,7 +575,10 @@ mod tests {
     #[test]
     fn a_commitment_and_an_empty_chat_are_refused() {
         let endpoint = Provider::Groq.endpoint("m");
-        let config = GenerationConfig { commitment_k: Some(4), ..Default::default() };
+        let config = GenerationConfig {
+            commitment_k: Some(4),
+            ..Default::default()
+        };
         assert!(request(&endpoint, &[ChatMessage::new("user", "x")], &config).is_err());
         assert!(request(&endpoint, &[], &GenerationConfig::default()).is_err());
     }
@@ -477,7 +588,10 @@ mod tests {
     fn serve_once(status: &str, body: &'static str) -> (u16, std::thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let head = format!("HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
         let handle = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut seen = Vec::new();
@@ -490,7 +604,11 @@ mod tests {
                 if let Some((head, body)) = text.split_once("\r\n\r\n") {
                     let want = head
                         .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
                         .unwrap_or(0);
                     if body.len() >= want {
                         break;
@@ -519,7 +637,10 @@ mod tests {
         let (port, server) = serve_once("200 OK", STREAM);
         let remote = Remote::open(local("test-model", port), &Allow::hosts(["127.0.0.1"])).unwrap();
         let mut pieces = Vec::new();
-        let config = GenerationConfig { max_tokens: 32, ..Default::default() };
+        let config = GenerationConfig {
+            max_tokens: 32,
+            ..Default::default()
+        };
         let r = remote
             .generate(&[ChatMessage::new("user", "hi")], &config, |p| {
                 pieces.push(p.to_string());
@@ -527,27 +648,51 @@ mod tests {
             })
             .unwrap();
         assert_eq!(pieces, ["Hel", "lo"]);
-        assert_eq!((r.text.as_str(), r.input_tokens, r.output_tokens), ("Hello", 9, 2));
+        assert_eq!(
+            (r.text.as_str(), r.input_tokens, r.output_tokens),
+            ("Hello", 9, 2)
+        );
         assert_eq!(r.thinking.as_deref(), Some("thinking"));
         assert_eq!(r.stop_reason, StopReason::Eos);
         let sent = server.join().unwrap();
         assert!(sent.starts_with("POST /v1/chat/completions "), "{sent}");
         assert!(sent.contains("\"model\":\"test-model\""), "{sent}");
-        assert!(!sent.to_ascii_lowercase().contains("authorization"), "an endpoint without a key sends none");
+        assert!(
+            !sent.to_ascii_lowercase().contains("authorization"),
+            "an endpoint without a key sends none"
+        );
     }
 
     #[test]
     fn an_error_status_and_a_reply_without_usage_are_refused() {
-        let (port, server) = serve_once("429 Too Many Requests", "{\"error\":{\"message\":\"rate limited\"}}");
+        let (port, server) = serve_once(
+            "429 Too Many Requests",
+            "{\"error\":{\"message\":\"rate limited\"}}",
+        );
         let remote = Remote::open(local("m", port), &Allow::hosts(["127.0.0.1"])).unwrap();
-        let e = remote.generate(&[ChatMessage::new("user", "hi")], &GenerationConfig::default(), |_| true).unwrap_err();
+        let e = remote
+            .generate(
+                &[ChatMessage::new("user", "hi")],
+                &GenerationConfig::default(),
+                |_| true,
+            )
+            .unwrap_err();
         assert!(matches!(e, Error::Status { status: 429, .. }), "{e}");
         assert!(e.to_string().contains("rate limited"));
         server.join().unwrap();
 
-        let (port, server) = serve_once("200 OK", "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n");
+        let (port, server) = serve_once(
+            "200 OK",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n",
+        );
         let remote = Remote::open(local("m", port), &Allow::hosts(["127.0.0.1"])).unwrap();
-        let e = remote.generate(&[ChatMessage::new("user", "hi")], &GenerationConfig::default(), |_| true).unwrap_err();
+        let e = remote
+            .generate(
+                &[ChatMessage::new("user", "hi")],
+                &GenerationConfig::default(),
+                |_| true,
+            )
+            .unwrap_err();
         assert!(e.to_string().contains("no token usage"), "{e}");
         server.join().unwrap();
     }
@@ -556,7 +701,13 @@ mod tests {
     fn a_caller_that_goes_away_abandons_the_request() {
         let (port, server) = serve_once("200 OK", STREAM);
         let remote = Remote::open(local("m", port), &Allow::hosts(["127.0.0.1"])).unwrap();
-        let e = remote.generate(&[ChatMessage::new("user", "hi")], &GenerationConfig::default(), |_| false).unwrap_err();
+        let e = remote
+            .generate(
+                &[ChatMessage::new("user", "hi")],
+                &GenerationConfig::default(),
+                |_| false,
+            )
+            .unwrap_err();
         assert!(e.to_string().contains("went away"), "{e}");
         server.join().unwrap();
     }

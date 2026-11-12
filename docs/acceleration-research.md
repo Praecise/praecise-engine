@@ -1,6 +1,7 @@
 # Acceleration research — what Praecise Engine should implement
 
-Surveyed August 2026 against llama.cpp, vLLM, SGLang and unsloth. Every claim
+Surveyed August 2026 against llama.cpp, vLLM, SGLang and unsloth, with a
+November 2026 addendum at the end. Every claim
 below was checked against source, release notes or a paper at the time of
 writing; version-specific numbers are labelled as such, because several of them
 have already moved once and will move again.
@@ -313,3 +314,77 @@ is the same conclusion the host-overhead numbers reach from the other direction.
 **Halve NVIDIA's headline tensor figures unless they say dense.** The GB200 page
 states the convention in plain text: the large number is sparse, and dense is
 half of it.
+
+## November 2026: what moved, and what did not
+
+Surveyed 2026-11-13 against llama.cpp 0.7.0 to 0.9.0, vLLM, SGLang and the
+papers named below. The question was narrow: is there a technique, new since
+the August survey, that makes decode faster and that this engine can adopt.
+
+**No new batch-1 decode kernel was found.** Nothing published since August
+reads fewer bytes per token from a 4-bit model without losing quality. The
+levers that pay are still the ones this document already ranks: more tokens
+per pass (speculation), and a model class that emits many tokens per pass
+(diffusion). The upstream release notes for 0.8.0 and 0.9.0 carry no benchmark
+figures, so every gain attributed to them below has to be measured here.
+
+Each entry says which of two things it does, because decode here is
+memory-bandwidth-bound: **fewer bytes per token**, **more tokens per pass**,
+or neither.
+
+| # | Technique | Published gain | Lossless | Where it lands here | Bandwidth effect |
+|---|---|---|---|---|---|
+| 1 | llama.cpp 0.8.0 and 0.9.0 (ggml 0.28, 0.29): CUDA chunked graph launches, faster low-bit mat-vec, Metal MXFP4 mat-vec, Vulkan split-K on RDNA3/4, Arm SVE Q8_0/Q6_K/MXFP4, SYCL flash attention over a quantised KV cache, the n-gram cache saved to a file | None published | Yes | Linked route, by syncing the fork (see the silicon charter, item D) | Neither; launch cost and kernel efficiency |
+| 2 | LiLiCorr: a two-layer transformer rescoring a top-K lattice of DFlash drafts | Acceptance length +7 to +19% over DFlash at about 3% overhead per block (arXiv 2608.20530, abstract; models and hardware not stated there) | ⚠ Not addressed in the abstract | The speculation policy layer; needs a trained checkpoint per target model | More tokens per pass |
+| 3 | DFlash drafts in SGLang Spec V2 | Over 4.3x baseline and 1.5x MTP on Qwen 3.5 397B-A17B, HumanEval, concurrency 1, 8xB200; the overlap scheduler alone takes Qwen3-8B from about 11.4 to 15.3 ktok/s at concurrency 32 on one B200 | Yes, under greedy verification | Hosted SGLang route, a configuration change | More tokens per pass |
+| 4 | MoE expert cache on the GPU (`--moe-cache-mib`), for models that do not fit in VRAM | 25.0 to about 40 t/s on an RTX 4090 and 30.8 to 67.8 t/s on an RTX 5090, Qwen3.8-Flash-Next Q4_0 | ⚠ Bit-identity not stated | The runtime sets the cache size on discrete GPUs | Neither; it removes the PCIe path |
+| 5 | Diffusion language models (DiffusionGemma 26B-A3.8B, Apache 2.0) | ⚠ 1,008 tok/s on H100 and 1,288 on H200, FP8, batch 1, in vLLM (trade press; the model card was not reachable) | No: a different model, and its maker recommends the autoregressive one for quality | Hosted vLLM route. The linked route has only a draft upstream pull request | More tokens per pass; the largest such lever |
+| 6 | ZipServ (ASPLOS 2026): lossless weight compression decoded inside the matrix product | Up to 30% smaller weights, 1.22x over vLLM on average at batch 8 and 32, RTX 4090 and L40S | Yes, bit-exact | Hosted BF16 serving only; a port, not a setting | **Fewer bytes per token**, the only new lossless technique found that does this |
+| 7 | CUDA graphs kept on for MoE (upstream pull request 26802) | 1.13x at 16 sequences, 1.08x at 32, flat at batch 1 (Qwen3-30B-A3B Q4_K_M, RTX 5090, secondary write-up) | Yes | Already in the fork | Neither |
+| 8 | Arm SME2 matrix products for Q4_K and Q6_K through KleidiAI | None in the release notes | Yes | `kleidiai` feature; a prefill gain is the expectation | Neither |
+
+**Negative results**, recorded so they are not tried twice:
+
+- **The MoE expert cache has made a machine slower.** One report on two
+  Radeon R9700 cards under Vulkan fell from 23 to 18.1 t/s. On unified memory
+  (GB10, Apple, Strix Halo) no expert is host-resident, so the cache should
+  have nothing to do; that is an inference from the design, not a
+  measurement.
+- **Diffusion decoding is poor off NVIDIA today.** The draft upstream pull
+  request reports about 27 tok/s on a Radeon R9700 under Vulkan and no Metal
+  result. llama.cpp 0.9.0 runs the one diffusion model it loads in
+  autoregressive mode only.
+- **ZipServ has no batch-1 result**, covers BF16 weights only, and its authors
+  report it can lose to cuBLAS on A100 and H800 and to lossy FP8.
+- **Native 4-bit floating point is still a prefill feature upstream**, not a
+  decode one.
+- **Lossy KV eviction and 3-bit KV quantisation** were not adopted. The
+  eviction work reports 1.69x over vLLM but gives up accuracy, and it is a
+  preprint read through an aggregator. ⚠ The 3-bit KV reports were not opened.
+- **Nothing new for early exit, ternary weights or sub-4-bit weights** with a
+  measured 2026 decode figure was found.
+- ⚠ **Matrix extensions (AMX, SME, Qualcomm's) for decode** were not verified;
+  the one figure seen, about 1.05x at four threads, came from a search
+  snippet. It agrees with the bandwidth ceiling this repository measures.
+
+**Two leads not yet read to the source.** llama.cpp 0.7.0 lists "MXFP4 MoE
+with arithmetic decoding and reordering" for SYCL; if that is entropy-coded
+weights, it is a shipped reduction in bytes per token on Intel, and worth one
+reading of the pull request. ⚠ OpenVINO GenAI is said to have extended its
+speculative decoding to CPU, GPU and NPU; the release notes were not opened.
+
+### What this changes in the roadmap
+
+1. Sync the fork (item 1), then measure decode before and after on the GB10.
+   Until that measurement exists, no gain is claimed for it.
+2. Let the speculation policy layer choose a DFlash corrector where a
+   checkpoint exists (item 2), and refuse where none does.
+3. Size the MoE expert cache from the hardware layer: on for a discrete GPU
+   whose VRAM is smaller than the model, off on unified memory (item 4).
+4. Treat a diffusion model as a hosted-route model until the linked route can
+   run one (item 5). `BatchEngine` still refuses them, which is correct.
+
+Sources: llama.cpp release notes for 0.6.0 to 0.9.0 (read through a release
+mirror); upstream pull requests 29887, 24423 and 26802; arXiv 2608.20530,
+2603.17435 and 2606.16332; the vLLM speculative decoding documentation; the
+SGLang DFlash write-up of 2026-06-15.

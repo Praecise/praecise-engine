@@ -43,10 +43,10 @@ pprof = "0.15.0"
 # they are formatted by rustfmt when it is installed and left as emitted
 # otherwise.
 bindgen = { version = "0.73.2", default-features = false, features = ["logging", "runtime"] }
-cc = "1.10.0"
+cc = "1.11.1"
 anyhow = "1.0.104"
 clap = "4.6.7"
-encoding_rs = "0.8.42"
+encoding_rs = "0.8.44"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 
 [workspace.lints.rust]

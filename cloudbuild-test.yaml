@@ -36,7 +36,7 @@ steps:
   # rustup components are installed into it too. Anything written to / here
   # (apt packages, a default rustup home) is gone by the next step.
   - id: deps
-    name: rust:1-bookworm
+    name: rust:1-trixie
     entrypoint: bash
     env:
       - CARGO_HOME=/workspace/.cargo-home
@@ -50,7 +50,7 @@ steps:
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends \
           cmake clang libclang-dev pkg-config git
-        # rust:1-bookworm ships neither rustfmt nor clippy, and each build step
+        # rust:1-trixie ships neither rustfmt nor clippy, and each build step
         # is a fresh container off the image — only /workspace persists. So seed
         # a workspace RUSTUP_HOME from the image's own and add the components
         # there, where later steps will find them.
@@ -77,7 +77,7 @@ steps:
   # message) once the tree is clean; that is a deliberate one-off commit, not
   # something to smuggle in alongside a feature.
   - id: fmt
-    name: rust:1-bookworm
+    name: rust:1-trixie
     entrypoint: bash
     env:
       - CARGO_HOME=/workspace/.cargo-home
@@ -98,7 +98,7 @@ steps:
   # catalogue. It has no dependencies and makes no vendor call, so every rule
   # runs here against described machines, whatever this worker is.
   - id: hardware-test
-    name: rust:1-bookworm
+    name: rust:1-trixie
     entrypoint: bash
     env:
       - CARGO_HOME=/workspace/.cargo-home
@@ -117,7 +117,7 @@ steps:
   # so this needs neither the submodule nor a GPU — it is the part of the engine
   # that is genuinely architecture-independent.
   - id: runtime-clippy
-    name: rust:1-bookworm
+    name: rust:1-trixie
     entrypoint: bash
     env:
       - CARGO_HOME=/workspace/.cargo-home
@@ -133,7 +133,7 @@ steps:
   # `cargo check` can still report SUCCESS, and "Finished ... RC=0" is not
   # evidence that a single test executed — so make the count visible in the log.
   - id: runtime-test
-    name: rust:1-bookworm
+    name: rust:1-trixie
     entrypoint: bash
     env:
       - CARGO_HOME=/workspace/.cargo-home
@@ -185,7 +185,7 @@ steps:
   # Not `--all-targets`: the unit tests above already ran, and this step exists
   # to prove the gated code compiles at all.
   - id: bundled-check
-    name: rust:1-bookworm
+    name: rust:1-trixie
     entrypoint: bash
     env:
       - CARGO_HOME=/workspace/.cargo-home

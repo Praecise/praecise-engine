@@ -24,7 +24,7 @@ sysinfo = "0.40"
 # run time.
 cudarc = { version = "0.19.10", optional = true, default-features = false, features = ["std", "cublas", "driver", "dynamic-loading"] }
 # Any other GPU: WGSL compute through wgpu.
-wgpu = { version = "30.0.1", optional = true }
+wgpu = { version = "30.0.2", optional = true }
 pollster = { version = "1", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 
