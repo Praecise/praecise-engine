@@ -31,6 +31,13 @@
 //! [`crate::hardware`], so a model is never assigned an engine that has no
 //! way onto the machine's silicon.
 //!
+//! - **Remote** ([`Integration::Remote`]) — the model runs on a provider's
+//!   machines and is reached over a network API (the `praecise-remote`
+//!   crate). Nothing runs here and the prompt leaves the machine, which no
+//!   other backend does, so it exists only in a build that asks for it and
+//!   only for hosts the operator names. It is the one route to silicon sold
+//!   as a service and not as a device: Groq, Cerebras, SambaNova.
+//!
 //! That distinction is load-bearing. Against a hosted backend, this engine's
 //! speculation is **not** available — the runtime does its own, with its own
 //! drafters. Reporting a speculation plan for such a backend would be a lie
@@ -64,6 +71,8 @@ pub enum Backend {
     Transformers,
     /// OpenVINO GenAI, hosted: Intel CPUs, GPUs and NPUs.
     OpenVino,
+    /// An inference API outside the machine, through `praecise-remote`.
+    Remote,
 }
 
 /// How the engine reaches a backend — see the module docs on why this decides
@@ -75,6 +84,9 @@ pub enum Integration {
     /// A confined child process the application supervises; the runtime owns
     /// its own decode loop.
     Hosted,
+    /// A provider's machines, reached over a network API; the prompt leaves
+    /// this one.
+    Remote,
 }
 
 /// What a backend can and cannot do.
@@ -109,6 +121,7 @@ impl Backend {
             Backend::TensorRtLlm,
             Backend::Transformers,
             Backend::OpenVino,
+            Backend::Remote,
         ]
     }
 
@@ -122,6 +135,7 @@ impl Backend {
             Backend::TensorRtLlm => "tensorrt-llm",
             Backend::Transformers => "transformers",
             Backend::OpenVino => "openvino",
+            Backend::Remote => "remote",
         }
     }
 
@@ -138,6 +152,7 @@ impl Backend {
             "tensorrt.llm" | "tensorrtllm" | "trtllm" | "tensorrt" => Ok(Backend::TensorRtLlm),
             "transformers" | "hf" => Ok(Backend::Transformers),
             "openvino" | "openvino.genai" | "ov" => Ok(Backend::OpenVino),
+            "remote" | "api" => Ok(Backend::Remote),
             _ => Err(Error::BackendUnknown {
                 name: s.to_string(),
                 known: Backend::all().iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", "),
@@ -171,6 +186,15 @@ impl Backend {
                 structured_output: false,
                 implemented: cfg!(target_os = "linux"),
             },
+            // A provider's API returns text and counts. The decode loop, the
+            // weights and the hardware are the provider's.
+            Backend::Remote => Capabilities {
+                integration: Integration::Remote,
+                engine_speculation: false,
+                logit_access: false,
+                structured_output: false,
+                implemented: cfg!(feature = "remote"),
+            },
         }
     }
 
@@ -193,6 +217,8 @@ impl Backend {
             Backend::Transformers => route::torch_device(accelerator).is_some(),
             Backend::TensorRtLlm => accelerator == Accelerator { vendor: Vendor::Nvidia, kind: Kind::Gpu },
             Backend::OpenVino => accelerator.vendor == Vendor::Intel && accelerator.kind != Kind::Accelerator,
+            // it runs on none of this machine's silicon
+            Backend::Remote => false,
         }
     }
 
@@ -209,7 +235,8 @@ impl Backend {
     /// [`Error::BackendUnreachable`] when the machine has accelerators and
     /// the backend reaches none of them, naming the backends that do.
     pub fn ensure_reaches(self, machine: &Machine) -> Result<()> {
-        if machine.is_cpu_only() || !self.reachable(machine).is_empty() {
+        // a remote backend runs elsewhere, so the machine does not bear on it
+        if self == Backend::Remote || machine.is_cpu_only() || !self.reachable(machine).is_empty() {
             return Ok(());
         }
         let able: Vec<&str> =
@@ -243,6 +270,10 @@ impl Backend {
                  backend the host application already links"
             }
             Integration::Hosted => "runtime hosts need Linux namespaces, Landlock and seccomp",
+            Integration::Remote => {
+                "a remote backend sends prompts off this machine and is opt-in; build with the \
+                 `praecise-remote` crate to enable it"
+            }
         };
         Err(Error::BackendUnavailable { backend: self.as_str(), reason })
     }
@@ -304,6 +335,31 @@ mod tests {
             assert!(able.len() >= 3, "{vendor}: {able:?}");
             assert!(able.contains(&"llama.cpp"), "{vendor}: {able:?}");
         }
+    }
+
+    #[test]
+    fn the_remote_backend_is_off_unless_built_in_and_uses_no_local_silicon() {
+        let c = Backend::Remote.supports();
+        assert_eq!(c.integration, Integration::Remote);
+        assert!(!c.engine_speculation && !c.logit_access);
+        assert_eq!(Backend::Remote.is_available(), cfg!(feature = "remote"));
+        if !cfg!(feature = "remote") {
+            assert!(Backend::Remote.ensure_available().unwrap_err().to_string().contains("opt-in"));
+        }
+        assert_eq!(Backend::parse("remote").unwrap(), Backend::Remote);
+        // it reaches no accelerator here, and no machine rules it out
+        for vendor in Vendor::ALL {
+            assert!(!Backend::Remote.reaches(acc(*vendor, Kind::Gpu)));
+        }
+        Backend::Remote.ensure_reaches(&Machine::with([acc(Vendor::Amd, Kind::Gpu)])).unwrap();
+        let plan = plan_for(
+            Backend::Remote,
+            &ModelProfile::dense(),
+            &LoadState::idle(),
+            &GenerationConfig { max_tokens: 256, ..Default::default() },
+            &SpecPolicy::default(),
+        );
+        assert!(!plan.speculates());
     }
 
     #[test]
@@ -448,8 +504,8 @@ mod tests {
             let c = b.supports();
             match c.integration {
                 Integration::Linked => assert!(c.logit_access, "{b}: linked implies logit access"),
-                Integration::Hosted => {
-                    assert!(!c.engine_speculation, "{b}: hosted cannot host our speculation");
+                Integration::Hosted | Integration::Remote => {
+                    assert!(!c.engine_speculation, "{b}: only a linked backend hosts our speculation");
                 }
             }
         }

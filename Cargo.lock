@@ -3420,6 +3420,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "praecise-remote"
+version = "0.1.0"
+dependencies = [
+ "praecise-runtime",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "praecise-runtime"
 version = "0.1.0"
 dependencies = [

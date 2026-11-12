@@ -35,6 +35,9 @@ libc = "0.2"
 
 [features]
 default = []
+# Marks a build that carries the remote backend. Set by the `praecise-remote`
+# crate, which holds the client; nothing in this crate opens a connection.
+remote = []
 # Bundle and build the llama.cpp backend for standalone use. Omit when the host
 # application already provides llama-cpp-2.
 bundled-llama = ["dep:llama-cpp-2"]

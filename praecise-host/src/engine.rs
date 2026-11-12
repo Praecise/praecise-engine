@@ -59,7 +59,7 @@ impl EngineEnv {
     /// When `backend` is linked, not hosted.
     pub fn adapter(backend: Backend, root: &Path, digest: &str) -> Result<Self> {
         if backend.supports().integration != Integration::Hosted {
-            return Err(Error::Refused(format!("{backend} is linked into the process, not hosted")));
+            return Err(Error::Refused(format!("{backend} does not run in a runtime host")));
         }
         Ok(Self {
             kind: backend.as_str().to_string(),

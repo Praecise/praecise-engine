@@ -5,6 +5,7 @@ members = [
   "praecise-runtime",
   "praecise-ffi",
   "praecise-host",
+  "praecise-remote",
   "praecise-diffusion",
   "praecise-codec",
   "praecise-onnx",
