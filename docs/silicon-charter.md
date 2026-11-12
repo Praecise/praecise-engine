@@ -72,6 +72,8 @@ Version-specific facts are dated, because they move.
 | 18 | No test ran on ARM, macOS or Windows for the hardware paths | `silicon-coverage` workflow: four host platforms, every ONNX provider, and ZenDNN, KleidiAI and Metal linked into a binary (see open item I) |
 | 19 | No figure for non-NVIDIA systems | `praecise_hardware::silicon`: memory and bandwidth of 17 systems across six vendors, each tagged with its source and whether it ships; `praecise-hw catalogue` |
 | 20 | Bandwidth was inferred from a part's name | `praecise-hw measure` measures what the CPU threads of the machine reach |
+| 21 | Silicon sold only as a service had no route at all | `praecise-remote`: an opt-in client for OpenAI-compatible inference APIs (Groq, Cerebras, SambaNova or any other), answering in the runtime's types. It exists only in a build that depends on it and sends only to hosts the operator names in `PRAECISE_REMOTE_ALLOW` |
+| 22 | bindgen did not compile from the workspace lockfile, so nothing that links llama.cpp built | bindgen is built without its `prettyplease` feature (bindgen 0.73 parses with syn 2; prettyplease 0.3 moved to syn 3) |
 
 ### Open: needs the hardware
 
@@ -88,13 +90,18 @@ hidden behind a passing check.
 | F | Static links for vendor-SDK backends are unproven | A build of `sycl`, `openvino`, `cann`, `musa`, `zdnn`, `webgpu`, `hexagon` and `et` on a machine with each SDK. Until then a static build leaves the vendor runtime to the final crate and a `dynamic-link` build carries it |
 | G | The Windows compute-accelerator device class is unchecked on an NPU | A run of `praecise-hw` on a Windows machine with an NPU |
 | H | Cambricon's torch device is unconfirmed from a primary source | Its `torch_mlu` package; until then Cambricon is reached through its vLLM plugin only |
-| I | The `silicon-coverage` workflow has not run | Its first green run. Until then `zendnn`, `kleidiai`, `metal` and the AVX-512 options are `wired`, not `built`, and the ONNX providers are compiled on one build host only (Windows x86-64, with every provider feature on) |
+| I | The `silicon-coverage` workflow has not run | Its first green run. The CPU build of llama.cpp and every crate above it were built and type-checked once, on Windows x86-64 with MinGW; nothing was built on Linux, AArch64 or macOS. Until the workflow runs, `zendnn`, `kleidiai`, `metal` and the AVX-512 options are `wired`, not `built`, and the ONNX providers are compiled on that one build host only |
+
+| J | The remote backend has not met a real provider | A run against Groq, Cerebras and SambaNova with a key. It is tested against a local server speaking the same protocol; whether each provider returns usage in a stream, and which length field each takes, is read from their client libraries and not from a response |
+| K | Quantum jobs simulate on NVIDIA GPUs or the CPU only, and no quantum processor is reachable | A simulation program on a simulator with an AMD path (Qiskit Aer on ROCm, `lightning.kokkos` or QuEST with HIP), run on that hardware; and, for a real device, an opted-in network route for jobs. See "Quantum" below |
 
 ### Out of scope, by design
 
-- **API-only silicon.** Cerebras, GroqCloud, SambaNova Cloud, Microsoft Maia,
-  Meta MTIA and OpenAI's own chips are reached over a network or not at all.
-  A runtime host has no network, deliberately.
+- **Silicon with no public interface.** Microsoft Maia, Meta MTIA and
+  OpenAI's own chips are not reachable by a third party at all.
+- **A network inside a runtime host.** Hosts and jobs stay without one. The
+  remote backend is not a host: it is a separate crate, off unless built in,
+  and it sends only where the operator permits.
 - **Job engines.** Warp, Sionna, Cosmos, PhysicsNeMo and CUDA-Q are NVIDIA's
   own systems. The ones built on torch run on ROCm, which presents as `cuda`;
   the rest are CUDA programs. An equivalent on another vendor's stack is a
@@ -161,6 +168,41 @@ point for the rest; SGLang 0.5.23 with a device argument for `cuda`, `xpu`,
 `hpu`, `npu` and `musa`; PyTorch 2.15 with `torch.accelerator` as the
 vendor-neutral device API (memory information from 2.10).
 
+## Quantum
+
+Surveyed 2026-11-12. ⚠ marks what came from secondary coverage.
+
+- **No quantum processor accelerates language-model inference.** The one
+  demonstration on record (Multiverse Computing and IBM, arXiv:2605.05914,
+  May 2026) put small quantum-circuit adapters into Llama 3.1 8B and ran
+  inference end to end on a 156-qubit IBM Heron r2. It improved perplexity by
+  1.4% and its authors claim no quantum advantage; ⚠ one report puts a
+  129-token reply at about 90 minutes. A quantum processor is not an
+  inference device, and this engine does not treat it as one.
+- **The traffic runs the other way.** Classical accelerators serve quantum
+  hardware: CUDA-Q QEC 0.6 (April 2026) decodes error correction on GPUs in
+  real time over NVQLink, and circuits are simulated on GPUs. That is work
+  this engine's job engines are the right shape for.
+- **What the engine has.** Two job programs on NVIDIA CUDA-Q (0.16.0,
+  2026-09-12): `cudaq.ghz` samples a GHZ state and `cudaq.maxcut` runs QAOA on
+  a graph. Each takes a simulator target. `qpp-cpu` is a CPU state-vector
+  simulator and runs on any machine; `nvidia` and `tensornet` need an NVIDIA
+  GPU, and CUDA-Q's GPU simulation is NVIDIA-only in practice.
+- **Vendor-neutral simulation exists, outside CUDA-Q.** Qiskit Aer has a
+  ROCm build for AMD GPUs (⚠ `qiskit-aer-gpu-rocm`), PennyLane's
+  `lightning.kokkos` builds with HIP for AMD, qsim has a HIP backend for
+  Instinct, and QuEST builds with CUDA or HIP. None is confirmed on Intel or
+  Apple GPUs. A simulation program on one of these is the way to a quantum
+  job that does not need NVIDIA; none is written yet (open item K).
+- **Real devices.** Quantinuum Helios, IonQ Tempo and IBM's systems are
+  reached through a provider's cloud, with credentials; some are also sold
+  for installation on site (IQM reports 23 systems), and Google's Willow is
+  open to selected researchers only. Whether any can be driven without a
+  network by third-party software is not established. A job is confined
+  without a network, so reaching a device is the same decision as the remote
+  backend, for jobs: a separate, opted-in route that names its hosts. It is
+  not built (open item K).
+
 ## Staying ahead
 
 What to watch, and the change each would call for. None is built on
@@ -180,6 +222,9 @@ speculation; each is a note of where the next gap will open.
 
 ## Changelog
 
+- **2026-11-12.** Remote backend (`praecise-remote`) added as an opt-in
+  route to API-only silicon. Quantum section added; open items J and K
+  recorded. bindgen built without `prettyplease` so the workspace builds.
 - **2026-11-12.** Charter written. Hardware layer, backend reach, OpenVINO
   hosted backend, vendor-neutral host adapter and confinement, six ONNX
   providers, five ggml features, CPU kernel tiers, the silicon catalogue, the

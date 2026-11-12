@@ -26,8 +26,8 @@ each and how far each claim has been proved;
                    │  pluggable backends
      ┌─────────────┴───────────────┐
      ▼                             ▼
-  llama.cpp                vLLM · SGLang · transformers
-  linked (FFI)             TensorRT-LLM · OpenVINO GenAI
+  llama.cpp                vLLM · SGLang · transformers        an inference API
+  linked (FFI)             TensorRT-LLM · OpenVINO GenAI       remote (opt-in)
                            hosted (confined runtime host)
      │                             │
      └──────────────┬──────────────┘
@@ -92,6 +92,7 @@ what acceleration is available at all:
 | TensorRT-LLM | hosted | no | no |
 | transformers | hosted (CPU or GPU) | no | no |
 | OpenVINO GenAI | hosted (Intel CPU, GPU or NPU) | no | no |
+| an inference API | remote (opt-in) | no — the provider owns the decode loop | no |
 
 A *linked* backend is compiled in, so the engine can propose a draft block,
 verify it, and read per-position logits. A *hosted* backend runs in a runtime
@@ -99,6 +100,20 @@ host: the engine chooses the model and the sampling parameters, but there is no
 seam at which to interpose on token-by-token decoding. Speculation against a
 hosted backend is therefore not merely unimplemented — it is impossible by
 construction, and those runtimes do their own instead.
+
+A *remote* backend runs nowhere on this machine: `praecise-remote` asks an
+OpenAI-compatible inference API (Groq, Cerebras, SambaNova or any other) and
+answers in the same types. It is the one route to silicon sold as a service,
+and the one backend whose prompts leave the machine, so it is opt-in twice:
+the application has to depend on the crate, and the operator has to name each
+host in `PRAECISE_REMOTE_ALLOW`. Runtime hosts still have no network.
+
+```rust
+use praecise_remote::{Allow, Provider, Remote};
+
+let groq = Remote::open(Provider::Groq.endpoint(model), &Allow::from_env())?;
+let reply = groq.generate(&messages, &config, |text| { print!("{text}"); true })?;
+```
 
 An unknown backend name is an error listing the valid ones, never a quiet
 fallback: a typo that silently ran on a different runtime would invalidate any
@@ -129,6 +144,7 @@ Backend::Vllm.ensure_reaches(&machine)?;        // refuses, naming the backends 
 | Arm CPUs, Mali | `kleidiai`, `vulkan` | WebGPU | none |
 | Huawei Ascend | `cann` | CANN | vLLM, SGLang, transformers |
 | Google TPU, AWS Trainium, Moore Threads, Cambricon and others | `musa` for Moore Threads | none | vLLM through the vendor's plugin |
+| Groq, Cerebras, SambaNova | none | none | none; remote, opt-in (`praecise-remote`) |
 
 `praecise-hw` prints the accelerators of the machine it runs on, the build
 features that machine needs, and the route to each device. Only the NVIDIA
@@ -350,6 +366,10 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `praecise-host` — runtime hosts and the engine set: confined, supervised
   engines, one per model, within one memory budget; job engines and the
   `praecise-job` binary.
+- `praecise-remote` — generation on an inference API outside the machine
+  (Groq, Cerebras, SambaNova or any OpenAI-compatible endpoint), in the
+  runtime's types. Opt-in: nothing opens a connection unless the application
+  depends on this crate and the operator permits the host.
 - `praecise-ffi` — the stable C ABI over the runtime's backend-agnostic types
   (config, result, stop reason, error), for callers in other languages.
 - `praecise-diffusion` — flow-matching image, video, audio and 3D generation on

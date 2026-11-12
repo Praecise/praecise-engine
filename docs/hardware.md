@@ -25,7 +25,9 @@ The `silicon-coverage` workflow builds the routes that need no vendor SDK
 (ZenDNN, KleidiAI, Metal, the AVX-512 options) and compiles every ONNX
 provider on each change. A row moves from `wired` to `built` when that
 workflow has built it; until its first run the rows it covers stay `wired`
-([silicon-charter.md](silicon-charter.md), open item I).
+([silicon-charter.md](silicon-charter.md), open item I). The default CPU
+build and the crates above it have been built once by hand, on Windows
+x86-64.
 
 ## What a machine has
 
@@ -61,6 +63,11 @@ compute-accelerator class on none.
    families (speech, detection, segmentation, embedding, forecasting).
 3. **Hosted**: vLLM, SGLang, transformers, TensorRT-LLM or OpenVINO GenAI in
    a confined runtime host. The runtime owns its decode loop.
+
+A fourth route leaves the machine. **Remote** (`praecise-remote`) asks an
+inference API for the reply. It is the only way to silicon sold as a service,
+and it is off unless the application is built with it and the operator names
+each host prompts may go to (`PRAECISE_REMOTE_ALLOW`).
 
 `praecise_runtime::Backend::reaches` answers, per accelerator, whether a
 backend has a route onto it, and `ensure_reaches` refuses a backend with
@@ -99,6 +106,7 @@ Feature names are the same on `praecise-runtime`, `praecise-diffusion`,
 | Esperanto | ET-SoC | `et` wired | none | none |
 | RISC-V | RVV, SpacemiT | CPU backend; RVV options default on | CPU provider | none |
 | LoongArch | LSX, LASX | CPU backend; LSX and LASX default on | CPU provider | none |
+| Groq, Cerebras, SambaNova | LPU, wafer-scale engine, RDU | none | none | none; remote only (`praecise-remote`, opt-in), compiled and tested against a local server, not against the provider |
 | any GPU | DirectX 12 or WebGPU | `webgpu` wired | DirectML (`directml`), WebGPU (`webgpu`) compiled | none |
 
 Notes that qualify the table:
@@ -123,9 +131,13 @@ Notes that qualify the table:
   with them.
 - **Hosted engines need Linux.** Confinement is namespaces, Landlock and
   seccomp. On macOS and Windows only the linked and ONNX routes exist.
-- **API-only silicon.** Cerebras, Groq, SambaNova and the hyperscalers'
-  internal chips are reached over a network API. A runtime host has no
-  network by design, so they are outside this engine.
+- **API-only silicon.** Groq, Cerebras and SambaNova are reached over a
+  network API and no other way. A runtime host has no network by design, so
+  they are reached through `praecise-remote` and not through a host: a
+  separate crate, with an allow-list of hosts and no default. The provider
+  owns the decode loop and the hardware, so there is no speculation, no
+  logit access and nothing to measure but the reply. The hyperscalers'
+  internal chips have no public interface at all.
 
 ## NVIDIA CUDA (llama.cpp backend)
 

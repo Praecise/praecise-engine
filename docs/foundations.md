@@ -146,8 +146,9 @@ reading came from.
 
 Wafer-scale and SRAM-centric parts (Cerebras, Groq, d-Matrix) hold weights in
 on-chip memory, so their bound is capacity and compute, not DRAM bandwidth.
-They are reached over an API today and are outside this engine
-([silicon-charter.md](silicon-charter.md)). If one becomes locally
+They are reached over an API today, which this engine does only through its
+opt-in remote backend ([silicon-charter.md](silicon-charter.md)), where the
+provider's hardware cannot be measured or steered. If one becomes locally
 addressable it is a different class of device: small, latency-critical
 models, such as a drafter for speculation, are what it is for.
 
