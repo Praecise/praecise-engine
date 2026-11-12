@@ -36,7 +36,12 @@ tracing-core = "0.1"
 hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"] }
 criterion = "0.8.2"
 pprof = "0.15.0"
-bindgen = "0.73.2"
+# Without its `prettyplease` feature: bindgen 0.73 parses with syn 2 and
+# accepts prettyplease up to 0.3, which moved to syn 3, so with both in the
+# lockfile bindgen does not compile. The generated bindings are the same;
+# they are formatted by rustfmt when it is installed and left as emitted
+# otherwise.
+bindgen = { version = "0.73.2", default-features = false, features = ["logging", "runtime"] }
 cc = "1.10.0"
 anyhow = "1.0.104"
 clap = "4.6.7"
