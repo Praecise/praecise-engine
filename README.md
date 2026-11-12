@@ -7,6 +7,13 @@ up token generation — through speculative decoding, hardware-aware tuning, and
 uniform serving surface — without the application needing to know which backend
 is underneath. **llama.cpp is the first supported backend.**
 
+It is as agnostic about silicon as it is about backends. NVIDIA, AMD, Intel,
+Apple, Qualcomm, Arm, Huawei and the rest are each reached by a route that is
+named, built and tested as far as it can be without the device, and none is
+the default. [docs/hardware.md](docs/hardware.md) says what is supported on
+each and how far each claim has been proved;
+[docs/silicon-charter.md](docs/silicon-charter.md) is the plan behind it.
+
 ## Design
 
 ```
@@ -19,9 +26,15 @@ is underneath. **llama.cpp is the first supported backend.**
                    │  pluggable backends
      ┌─────────────┴───────────────┐
      ▼                             ▼
-  llama.cpp                vLLM · SGLang
-  linked (FFI)             TensorRT-LLM · transformers
+  llama.cpp                vLLM · SGLang · transformers
+  linked (FFI)             TensorRT-LLM · OpenVINO GenAI
                            hosted (confined runtime host)
+     │                             │
+     └──────────────┬──────────────┘
+                    ▼
+   praecise-hardware: which accelerators the machine has,
+   which backend drives each, what a confined engine needs
+   to reach them, and the decode ceiling their memory sets
 ```
 
 Praecise Engine is the acceleration layer — not a model server on its own, and
@@ -78,6 +91,7 @@ what acceleration is available at all:
 | SGLang | hosted | no | no |
 | TensorRT-LLM | hosted | no | no |
 | transformers | hosted (CPU or GPU) | no | no |
+| OpenVINO GenAI | hosted (Intel CPU, GPU or NPU) | no | no |
 
 A *linked* backend is compiled in, so the engine can propose a draft block,
 verify it, and read per-position logits. A *hosted* backend runs in a runtime
@@ -89,6 +103,38 @@ construction, and those runtimes do their own instead.
 An unknown backend name is an error listing the valid ones, never a quiet
 fallback: a typo that silently ran on a different runtime would invalidate any
 measurement taken against it, with nothing in the output to show it.
+
+## Any vendor's silicon
+
+A backend is not a vendor. llama.cpp reaches every accelerator a ggml backend
+is built for; vLLM, SGLang and transformers reach whichever one the packages
+of their environment drive; TensorRT-LLM is NVIDIA's and OpenVINO is Intel's.
+The engine asks which is which before it assigns a model:
+
+```rust
+use praecise_runtime::hardware::Machine;
+use praecise_runtime::Backend;
+
+let machine = Machine::from_env_or_detect()?;   // every vendor, read from the OS
+Backend::Vllm.ensure_reaches(&machine)?;        // refuses, naming the backends that do
+```
+
+| Silicon | Linked (ggml feature) | ONNX provider | Hosted |
+|---|---|---|---|
+| NVIDIA GPUs | `cuda`, `vulkan` | TensorRT, CUDA | vLLM, SGLang, TensorRT-LLM, transformers |
+| AMD Radeon, Instinct, Ryzen | `rocm`, `vulkan`; `zendnn` on Zen CPUs | MIGraphX; Vitis AI on the NPU | vLLM, SGLang, transformers |
+| Intel Arc, Xe, Core Ultra NPU, Gaudi | `sycl`, `openvino`, `vulkan` | OpenVINO | vLLM, SGLang, transformers, OpenVINO GenAI |
+| Apple M-series | `metal` | CoreML | none (hosts need Linux) |
+| Qualcomm Adreno, Hexagon | `opencl`, `hexagon` | QNN | none |
+| Arm CPUs, Mali | `kleidiai`, `vulkan` | WebGPU | none |
+| Huawei Ascend | `cann` | CANN | vLLM, SGLang, transformers |
+| Google TPU, AWS Trainium, Moore Threads, Cambricon and others | `musa` for Moore Threads | none | vLLM through the vendor's plugin |
+
+`praecise-hw` prints the accelerators of the machine it runs on, the build
+features that machine needs, and the route to each device. Only the NVIDIA
+rows have been run on their silicon; the rest are compiled or wired and wait
+for a run on the device. The full table, with what each word means, is
+in [docs/hardware.md](docs/hardware.md).
 
 ## Running several engines: `praecise-host`
 
@@ -119,11 +165,16 @@ it: llama.cpp in its own process, and any hosted backend in a **runtime host**.
   restarted in the background from the same verified environment, while every
   other engine keeps serving. After three failures in a row it is left stopped
   and reported, until the model is released and served again.
-- **GPU or refusal.** On a machine with a GPU, an engine that cannot use it
-  refuses to load rather than falling back to the CPU.
+- **Accelerator or refusal.** On a machine with an accelerator of any
+  vendor, an engine that cannot use it refuses to load rather than falling
+  back to the CPU. A host is given the device nodes of every vendor (NVIDIA,
+  AMD, the kernel's DRM and compute-accelerator classes, Ascend, Neuron and
+  the rest), the vendor runtime directories, and the device-selection
+  variables the operator set.
 
 The hosted backends are driven through their offline Python engine APIs (vLLM
-`AsyncLLM`, SGLang `Engine`, TensorRT-LLM `LLM`, transformers) by one adapter,
+`AsyncLLM`, SGLang `Engine`, TensorRT-LLM `LLM`, transformers, OpenVINO GenAI
+`LLMPipeline`) by one adapter,
 `praecise-host/adapters/praecise_adapter.py`, which `engine::install_adapter`
 writes into a provisioned environment before it is pinned. No engine opens an
 HTTP server. `praecise_host::generation` maps `GenerationConfig` and
@@ -166,7 +217,9 @@ output on failure); on a machine with a GPU a program refuses rather than run
 on the CPU. Parameters are checked against each program's declaration (type
 and range) before anything starts, and again by the program.
 
-The programs drive NVIDIA's open simulation systems:
+The programs drive NVIDIA's open simulation systems. They are NVIDIA's own
+products and run on CUDA; the ones built on torch also run on AMD ROCm, which
+presents as `cuda`:
 
 | Program | System | Out |
 |---|---|---|
@@ -289,6 +342,10 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `llama-cpp-sys-2` — low-level FFI; pulls the llama.cpp backend (the Praecise
   fork, synced with upstream llama.cpp 7790a9231 of 2026-10-25).
 - `llama-cpp-2` — safe Rust bindings, including the speculative-decode primitives.
+- `praecise-hardware` — the hardware layer: which accelerators a machine has
+  (every vendor, read from the operating system), which backend drives each,
+  what a confined engine needs to reach them, the memory and bandwidth of the
+  systems worth planning for, and the `praecise-hw` binary. No dependencies.
 - `praecise-runtime` — the backend-agnostic acceleration runtime and inference API.
 - `praecise-host` — runtime hosts and the engine set: confined, supervised
   engines, one per model, within one memory budget; job engines and the
@@ -310,12 +367,15 @@ is only as right as its assumptions, and the only test of those is measurement.
 - `praecise-onnx` — the ONNX model families: speech-to-text, object
   detection, promptable and text-prompted segmentation, image encoders,
   time-series forecasting and text embedding. Sessions register the execution
-  provider the machine's GPU needs (CUDA/TensorRT, ROCm/MIGraphX, CoreML) and
-  refuse a model they cannot accelerate rather than running it on the CPU.
+  provider the machine's GPU needs (CUDA and TensorRT, MIGraphX, OpenVINO,
+  QNN, CANN, CoreML, or DirectML and WebGPU on any vendor's GPU) and refuse a
+  model they cannot accelerate rather than running it on the CPU. A neural
+  processor is used when the operator asks for it.
 - `praecise-moe` — expert-parallel mixture-of-experts execution: expert FFNs
   and gating from safetensors blobs, GGUF block-quantized expert weights, a
-  memory and disk residency cache, and the combine step, on the CPU, CUDA or
-  any other GPU through wgpu. The `cuda` feature builds for the CUDA toolkit
+  memory and disk residency cache, and the combine step, on the CPU
+  (AVX-512-VNNI, AVX-VNNI, the Arm dot-product extension), CUDA or any other
+  GPU through wgpu. The `cuda` feature builds for the CUDA toolkit
   that nvcc reports (12 or 13); `cuda-12` and `cuda-13` pin the version on a
   build host without a toolkit.
 
@@ -335,10 +395,17 @@ llama.cpp or a GPU.
 gcloud builds submit --config cloudbuild-test.yaml --project <project> .
 ```
 
-Runs fmt, clippy and the test suite on the backend-agnostic runtime, plus a
-compile check of the backend-gated code. It validates *correctness* on x86 — not
-an aarch64 artifact, and nothing about CUDA kernels or GB10-specific tuning,
-which need real hardware.
+Runs fmt, clippy and the test suite on the hardware layer and the
+backend-agnostic runtime, plus a compile check of the backend-gated code. It
+validates *correctness* on x86 — not an aarch64 artifact, and nothing about
+CUDA kernels or GB10-specific tuning, which need real hardware.
+
+The `silicon-coverage` workflow covers what can be proved about hardware
+without the hardware, on x86-64 and AArch64 Linux, macOS and Windows: the
+hardware layer and the decisions made from it, every ONNX execution provider
+compiled against ONNX Runtime, and the ggml builds that need no vendor SDK
+(ZenDNN, KleidiAI, Metal) linked into a binary. It proves that a route
+builds, not that a device runs.
 
 ## License
 
