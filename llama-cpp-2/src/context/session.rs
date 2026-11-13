@@ -167,7 +167,7 @@ impl LlamaContext<'_> {
         let cstr = CString::new(path)?;
 
         if unsafe {
-            llama_cpp_sys_2::llama_save_session_file(
+            llama_cpp_sys_2::llama_state_save_file(
                 self.context.as_ptr(),
                 cstr.as_ptr(),
                 tokens.as_ptr().cast::<llama_cpp_sys_2::llama_token>(),
@@ -210,7 +210,7 @@ impl LlamaContext<'_> {
         let tokens_out = tokens.as_mut_ptr().cast::<llama_cpp_sys_2::llama_token>();
 
         let load_session_success = unsafe {
-            llama_cpp_sys_2::llama_load_session_file(
+            llama_cpp_sys_2::llama_state_load_file(
                 self.context.as_ptr(),
                 cstr.as_ptr(),
                 tokens_out,
@@ -447,7 +447,7 @@ impl LlamaContext<'_> {
     /// and `kv_cache`) - will often be smaller after compacting tokens
     #[must_use]
     pub fn get_state_size(&self) -> usize {
-        unsafe { llama_cpp_sys_2::llama_get_state_size(self.context.as_ptr()) }
+        unsafe { llama_cpp_sys_2::llama_state_get_size(self.context.as_ptr()) }
     }
 
     /// Copies the state to the specified destination address.
@@ -456,9 +456,13 @@ impl LlamaContext<'_> {
     ///
     /// # Safety
     ///
-    /// Destination needs to have allocated enough memory.
+    /// Destination needs to have allocated enough memory: at least
+    /// [`Self::get_state_size`] bytes, which is the bound handed to the backend.
     pub unsafe fn copy_state_data(&self, dest: *mut u8) -> usize {
-        unsafe { llama_cpp_sys_2::llama_copy_state_data(self.context.as_ptr(), dest) }
+        unsafe {
+            let size = llama_cpp_sys_2::llama_state_get_size(self.context.as_ptr());
+            llama_cpp_sys_2::llama_state_get_data(self.context.as_ptr(), dest, size)
+        }
     }
 
     /// Set the state reading from the specified address
@@ -468,7 +472,7 @@ impl LlamaContext<'_> {
     ///
     /// help wanted: not entirely sure what the safety requirements are here.
     pub unsafe fn set_state_data(&mut self, src: &[u8]) -> usize {
-        unsafe { llama_cpp_sys_2::llama_set_state_data(self.context.as_ptr(), src.as_ptr()) }
+        unsafe { llama_cpp_sys_2::llama_state_set_data(self.context.as_ptr(), src.as_ptr(), src.len()) }
     }
 
     /// Get the size of the state for a single sequence with optional flags.

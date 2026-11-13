@@ -356,8 +356,8 @@ is only as right as its assumptions, and the only test of those is measurement.
 ## Crates
 
 - `llama-cpp-sys-2` — low-level FFI; pulls the llama.cpp backend (the Praecise
-  fork, synced with upstream llama.cpp 0.9.0 of 2026-11-04; built and tested
-  on the CPU, not yet on a GPU).
+  fork, synced in source with upstream llama.cpp 1.0.0 of 2026-11-13; that
+  sync has not been compiled or built yet, on the CPU or on a GPU).
 - `llama-cpp-2` — safe Rust bindings, including the speculative-decode primitives.
 - `praecise-hardware` — the hardware layer: which accelerators a machine has
   (every vendor, read from the operating system), which backend drives each,

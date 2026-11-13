@@ -508,25 +508,21 @@ impl LlamaContextParams {
         self.context_params.yarn_orig_ctx
     }
 
-    /// Set the KV cache defragmentation threshold
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use llama_cpp_2::context::params::LlamaContextParams;
-    /// let params = LlamaContextParams::default().with_defrag_thold(0.1);
-    /// assert_eq!(params.defrag_thold(), 0.1);
-    /// ```
+    /// Formerly set the KV cache defragmentation threshold. llama.cpp 1.0.0
+    /// removed the parameter, so the value is ignored.
+    #[deprecated(note = "llama.cpp 1.0.0 removed defrag_thold; the value is ignored")]
     #[must_use]
-    pub fn with_defrag_thold(mut self, defrag_thold: f32) -> Self {
-        self.context_params.defrag_thold = defrag_thold;
+    pub fn with_defrag_thold(self, _defrag_thold: f32) -> Self {
         self
     }
 
-    /// Get the KV cache defragmentation threshold
+    /// Formerly the KV cache defragmentation threshold. llama.cpp 1.0.0
+    /// removed the parameter; this returns `-1.0`, the value that meant
+    /// "disabled".
+    #[deprecated(note = "llama.cpp 1.0.0 removed defrag_thold; this always returns -1.0")]
     #[must_use]
     pub fn defrag_thold(&self) -> f32 {
-        self.context_params.defrag_thold
+        -1.0
     }
 
     /// Set the KV cache data type for K
@@ -746,5 +742,53 @@ impl LlamaContextParams {
     #[must_use]
     pub fn kv_unified(&self) -> bool {
         self.context_params.kv_unified
+    }
+
+    /// Set the size in bytes of the device cache for the experts of a
+    /// mixture-of-experts model that are kept in host memory. The cache is
+    /// split among the devices like the layers; `0` disables it. Experimental
+    /// in llama.cpp.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use llama_cpp_2::context::params::LlamaContextParams;
+    /// let params = LlamaContextParams::default().with_moe_cache_size(1 << 30);
+    /// assert_eq!(params.moe_cache_size(), 1 << 30);
+    /// ```
+    #[must_use]
+    pub fn with_moe_cache_size(mut self, moe_cache_size: usize) -> Self {
+        self.context_params.moe_cache_size = moe_cache_size;
+        self
+    }
+
+    /// Get the size in bytes of the device cache for host-memory experts
+    /// (`0` when disabled).
+    #[must_use]
+    pub fn moe_cache_size(&self) -> usize {
+        self.context_params.moe_cache_size
+    }
+
+    /// Set the share of the expert cache misses that is computed on the CPU
+    /// instead of uploaded to the device; `0.0` uploads all of them.
+    /// Experimental in llama.cpp.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use llama_cpp_2::context::params::LlamaContextParams;
+    /// let params = LlamaContextParams::default().with_moe_cache_cpu_share(0.25);
+    /// assert_eq!(params.moe_cache_cpu_share(), 0.25);
+    /// ```
+    #[must_use]
+    pub fn with_moe_cache_cpu_share(mut self, moe_cache_cpu_share: f32) -> Self {
+        self.context_params.moe_cache_cpu_share = moe_cache_cpu_share;
+        self
+    }
+
+    /// Get the share of the expert cache misses computed on the CPU.
+    #[must_use]
+    pub fn moe_cache_cpu_share(&self) -> f32 {
+        self.context_params.moe_cache_cpu_share
     }
 }

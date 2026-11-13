@@ -1088,7 +1088,7 @@ impl Graph {
         let m = mask.map_or(ptr::null_mut(), |m| m.0);
         let t = unsafe { sys::ggml_flash_attn_ext(self.ctx, q.0, k.0, v.0, m, scale, 0.0, 0.0) };
         if f32_scores {
-            unsafe { sys::ggml_flash_attn_ext_set_prec(t, sys::GGML_PREC_F32) };
+            unsafe { sys::ggml_prec_set_acc(t, sys::GGML_PREC_F32) };
         }
         Tn(t)
     }

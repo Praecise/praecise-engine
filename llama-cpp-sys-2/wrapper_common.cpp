@@ -188,8 +188,14 @@ extern "C" int llama_rs_fit_params(
     size_t * margins,
     uint32_t n_ctx_min,
     enum ggml_log_level log_level) {
+    if (!path_model) {
+        return static_cast<int>(COMMON_PARAMS_FIT_STATUS_ERROR);
+    }
+    // llama.cpp takes the model as a list of files (the model and any separate shards); this
+    // entry point fits a single file.
+    const std::vector<std::string> paths_model = { path_model };
     return static_cast<int>(common_fit_params(
-        path_model,
+        paths_model,
         mparams,
         cparams,
         tensor_split,
