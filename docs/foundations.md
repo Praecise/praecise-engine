@@ -123,8 +123,8 @@ contradict it.
 5. **Block-scaled 4-bit is a family, not a type.** A tensor has to carry its
    block size and scale encoding so that one artefact can be converted at
    load for the device it lands on.
-6. **FP8 E4M3 is the interchange type** between vendors; the fork gains it
-   with the next upstream sync (charter item D).
+6. **FP8 E4M3 is the interchange type** between vendors; the fork has it
+   since its sync with llama.cpp 0.9.0.
 7. **CPU detection covers what ships.** `praecise_hardware::cpu` reports
    AVX-512, AVX-VNNI and AMX, the Arm dot-product, int8-matmul, SVE and SME
    families, RISC-V vector and LoongArch LSX/LASX. AVX10.2, APX and ACE are
@@ -147,7 +147,7 @@ reading came from.
 Wafer-scale and SRAM-centric parts (Cerebras, Groq, d-Matrix) hold weights in
 on-chip memory, so their bound is capacity and compute, not DRAM bandwidth.
 They are reached over an API today, which this engine does only through its
-opt-in remote backend ([silicon-charter.md](silicon-charter.md)), where the
+opt-in remote backend ([silicon-coverage.md](silicon-coverage.md)), where the
 provider's hardware cannot be measured or steered. If one becomes locally
 addressable it is a different class of device: small, latency-critical
 models, such as a drafter for speculation, are what it is for.

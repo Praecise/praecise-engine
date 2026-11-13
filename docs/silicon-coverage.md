@@ -1,9 +1,9 @@
-# Silicon charter
+# Silicon coverage
 
 Praecise Engine is described as backend-agnostic. Until November 2026 that
 was true of its backends and not of its hardware: every route that touched a
-device assumed NVIDIA, with AMD and Apple as partial exceptions. This charter
-is the list that closes the difference: what the engine had, every gap found,
+device assumed NVIDIA, with AMD and Apple as partial exceptions. This page
+is the account of that difference: what the engine had, every gap found,
 what was done about each, and what remains that cannot be done without the
 hardware.
 
@@ -48,52 +48,51 @@ Version-specific facts are dated, because they move.
 
 ## Gaps, and what was done
 
-### Closed in this change
+### Closed
 
-| # | Gap | What exists now |
-|---|---|---|
-| 1 | No single account of a machine's accelerators | `praecise-hardware`: detection for 21 vendors from PCI ids, kernel driver bindings and device nodes; Linux, Windows and macOS; `PRAECISE_ACCELERATORS` to declare a machine; tested against described machines |
-| 2 | No account of which software drives which silicon | `praecise_hardware::route`: ggml backend, torch device and vLLM platform per accelerator; `praecise-hw` prints the build a machine needs |
-| 3 | A backend could be assigned to silicon it cannot reach | `Backend::reaches`, `reachable` and `ensure_reaches`; a refusal names the backends that do reach the machine |
-| 4 | Intel silicon had no hosted route of its own | `Backend::OpenVino`: OpenVINO GenAI on Intel CPUs, GPUs and NPUs, as a hosted engine |
-| 5 | Hosted engines ran only on CUDA | The adapter takes the accelerator the environment drives: torch `cuda` (NVIDIA, ROCm), `xpu`, `mps`, `hpu`, `npu`, `musa`; vLLM's own platform, including every vendor plugin; SGLang's device argument. TensorRT-LLM tells ROCm from CUDA and refuses it |
-| 6 | The memory cap was read from `torch.cuda` | Read from the device that is present; an engine whose platform reports no size takes `memory_fraction` from the operator or refuses |
-| 7 | A confined host could open only NVIDIA and AMD devices | Device nodes of every vendor; vendor runtime directories; every vendor's device-selection variables |
-| 8 | ONNX models ran on the CPU on Intel, Qualcomm and Huawei machines | OpenVINO, QNN, CANN, Vitis AI, DirectML and WebGPU providers, with the same refuse-or-accelerate planning; NPUs on request |
-| 9 | The ROCm execution provider no longer exists in ONNX Runtime (removed in 1.23) | The `rocm` feature builds MIGraphX; the dead provider is gone |
-| 10 | Five ggml backends in the fork had no feature | `hexagon`, `zendnn`, `et`, `virtgpu`, `kleidiai` |
-| 11 | Ten ggml backends could not be selected from `praecise-runtime` | Every backend is a feature of `praecise-runtime` and `praecise-diffusion` |
-| 12 | AVX-512 foundation and AMX were never passed to ggml | Mapped from the Rust target features; AVX-512 only when all five subsets are present |
-| 13 | A published `llama-cpp-sys-2` crate dropped the sources of ten backends | The package include list names every backend directory |
-| 14 | MoE kernels ignored AVX-VNNI and the Arm dot-product extension | AVX-VNNI tier for Intel client cores; `SDOT` tier for Armv8.2 and later; tiers proved equal bit for bit where the CPU has both |
-| 15 | Diffusion refused the CPU only on NVIDIA, AMD and Apple machines | The refusal covers every accelerator a ggml backend can drive |
-| 16 | Training recognised four device families | Every backend's devices are recognised and a run is held to its device; deterministic mode refuses them until audited |
-| 17 | `praecise-track` detected NVIDIA and AMD itself | Reads the machine from the hardware layer |
-| 18 | No test ran on ARM, macOS or Windows for the hardware paths | `silicon-coverage` workflow: four host platforms, every ONNX provider, and ZenDNN, KleidiAI and Metal linked into a binary (see open item I) |
-| 19 | No figure for non-NVIDIA systems | `praecise_hardware::silicon`: memory and bandwidth of 17 systems across six vendors, each tagged with its source and whether it ships; `praecise-hw catalogue` |
-| 20 | Bandwidth was inferred from a part's name | `praecise-hw measure` measures what the CPU threads of the machine reach |
-| 21 | Silicon sold only as a service had no route at all | `praecise-remote`: an opt-in client for OpenAI-compatible inference APIs (Groq, Cerebras, SambaNova or any other), answering in the runtime's types. It exists only in a build that depends on it and sends only to hosts the operator names in `PRAECISE_REMOTE_ALLOW` |
-| 22 | bindgen did not compile from the workspace lockfile, so nothing that links llama.cpp built | bindgen is built without its `prettyplease` feature (bindgen 0.73 parses with syn 2; prettyplease 0.3 moved to syn 3) |
+| Gap | What exists now |
+|---|---|
+| No single account of a machine's accelerators | `praecise-hardware`: detection for 21 vendors from PCI ids, kernel driver bindings and device nodes; Linux, Windows and macOS; `PRAECISE_ACCELERATORS` to declare a machine; tested against described machines |
+| No account of which software drives which silicon | `praecise_hardware::route`: ggml backend, torch device and vLLM platform per accelerator; `praecise-hw` prints the build a machine needs |
+| A backend could be assigned to silicon it cannot reach | `Backend::reaches`, `reachable` and `ensure_reaches`; a refusal names the backends that do reach the machine |
+| Intel silicon had no hosted route of its own | `Backend::OpenVino`: OpenVINO GenAI on Intel CPUs, GPUs and NPUs, as a hosted engine |
+| Hosted engines ran only on CUDA | The adapter takes the accelerator the environment drives: torch `cuda` (NVIDIA, ROCm), `xpu`, `mps`, `hpu`, `npu`, `musa`; vLLM's own platform, including every vendor plugin; SGLang's device argument. TensorRT-LLM tells ROCm from CUDA and refuses it |
+| The memory cap was read from `torch.cuda` | Read from the device that is present; an engine whose platform reports no size takes `memory_fraction` from the operator or refuses |
+| A confined host could open only NVIDIA and AMD devices | Device nodes of every vendor; vendor runtime directories; every vendor's device-selection variables |
+| ONNX models ran on the CPU on Intel, Qualcomm and Huawei machines | OpenVINO, QNN, CANN, Vitis AI, DirectML and WebGPU providers, with the same refuse-or-accelerate planning; NPUs on request |
+| The ROCm execution provider no longer exists in ONNX Runtime (removed in 1.23) | The `rocm` feature builds MIGraphX; the dead provider is gone |
+| Five ggml backends in the fork had no feature | `hexagon`, `zendnn`, `et`, `virtgpu`, `kleidiai` |
+| Ten ggml backends could not be selected from `praecise-runtime` | Every backend is a feature of `praecise-runtime` and `praecise-diffusion` |
+| AVX-512 foundation and AMX were never passed to ggml | Mapped from the Rust target features; AVX-512 only when all five subsets are present |
+| A published `llama-cpp-sys-2` crate dropped the sources of ten backends | The package include list names every backend directory |
+| MoE kernels ignored AVX-VNNI and the Arm dot-product extension | AVX-VNNI tier for Intel client cores; `SDOT` tier for Armv8.2 and later; tiers proved equal bit for bit where the CPU has both |
+| Diffusion refused the CPU only on NVIDIA, AMD and Apple machines | The refusal covers every accelerator a ggml backend can drive |
+| Training recognised four device families | Every backend's devices are recognised and a run is held to its device; deterministic mode refuses them until audited |
+| `praecise-track` detected NVIDIA and AMD itself | Reads the machine from the hardware layer |
+| No test ran on ARM, macOS or Windows for the hardware paths | `silicon-coverage` workflow: four host platforms, every ONNX provider, and ZenDNN, KleidiAI and Metal linked into a binary. The workflow has not run yet (see the open gaps below) |
+| No figure for non-NVIDIA systems | `praecise_hardware::silicon`: memory and bandwidth of 17 systems across six vendors, each tagged with its source and whether it ships; `praecise-hw catalogue` |
+| Bandwidth was inferred from a part's name | `praecise-hw measure` measures what the CPU threads of the machine reach |
+| Silicon sold only as a service had no route at all | `praecise-remote`: an opt-in client for OpenAI-compatible inference APIs (Groq, Cerebras, SambaNova or any other), answering in the runtime's types. It exists only in a build that depends on it and sends only to hosts the operator names in `PRAECISE_REMOTE_ALLOW` |
+| bindgen did not compile from the workspace lockfile, so nothing that links llama.cpp built | bindgen is built without its `prettyplease` feature (bindgen 0.73 parses with syn 2; prettyplease 0.3 moved to syn 3) |
 
 ### Open: needs the hardware
 
 Each of these is a real gap that cannot be closed from a build host. None is
 hidden behind a passing check.
 
-| # | Gap | What closing it takes |
-|---|---|---|
-| A | Every non-NVIDIA row is unverified | A run on the silicon, recorded in [hardware.md](hardware.md). In rough order of reach: AMD Instinct and Radeon (HIP, Vulkan), Apple M-series (Metal), Intel Arc (SYCL, OpenVINO), Ryzen AI and Core Ultra NPUs, Ascend, Snapdragon |
-| B | Per-hardware, per-quantization dispatch tables exist only for NVIDIA | Pinned-clock sweeps on each architecture (`gfx942`, `gfx950`, `gfx1151`, Apple, Arc), as [acceleration-research.md](acceleration-research.md) describes for NVIDIA |
-| C | No deterministic kernel set off CPU and CUDA | An audit of reduction order per backend on its own device. HIP and MUSA compile the CUDA kernel sources but use hipBLAS and muBLAS and split by a different device, so the CUDA audit does not carry over |
-| D | The fork trails upstream llama.cpp | A sync of `Praecise/llama.cpp` past 0.9.0 (ggml 0.29), which adds the OCP FP8 E4M3 tensor type, with the fork's patches re-validated on hardware |
-| E | No hosted engines on macOS | Confinement for macOS written and tested on a Mac. Until then Apple is reached through linked Metal and CoreML, and MLX and vllm-metal are not hosted |
-| F | Static links for vendor-SDK backends are unproven | A build of `sycl`, `openvino`, `cann`, `musa`, `zdnn`, `webgpu`, `hexagon` and `et` on a machine with each SDK. Until then a static build leaves the vendor runtime to the final crate and a `dynamic-link` build carries it |
-| G | The Windows compute-accelerator device class is unchecked on an NPU | A run of `praecise-hw` on a Windows machine with an NPU |
-| H | Cambricon's torch device is unconfirmed from a primary source | Its `torch_mlu` package; until then Cambricon is reached through its vLLM plugin only |
-| I | The `silicon-coverage` workflow has not run | Its first green run. The CPU build of llama.cpp and every crate above it were built and type-checked once, on Windows x86-64 with MinGW; nothing was built on Linux, AArch64 or macOS. Until the workflow runs, `zendnn`, `kleidiai`, `metal` and the AVX-512 options are `wired`, not `built`, and the ONNX providers are compiled on that one build host only |
-
-| J | The remote backend has not met a real provider | A run against Groq, Cerebras and SambaNova with a key. It is tested against a local server speaking the same protocol; whether each provider returns usage in a stream, and which length field each takes, is read from their client libraries and not from a response |
-| K | Quantum jobs simulate on NVIDIA GPUs or the CPU only, and no quantum processor is reachable | A simulation program on a simulator with an AMD path (Qiskit Aer on ROCm, `lightning.kokkos` or QuEST with HIP), run on that hardware; and, for a real device, an opted-in network route for jobs. See "Quantum" below |
+| Gap | What closing it takes |
+|---|---|
+| Every non-NVIDIA row is unverified | A run on the silicon, recorded in [hardware.md](hardware.md). In rough order of reach: AMD Instinct and Radeon (HIP, Vulkan), Apple M-series (Metal), Intel Arc (SYCL, OpenVINO), Ryzen AI and Core Ultra NPUs, Ascend, Snapdragon |
+| Per-hardware, per-quantization dispatch tables exist only for NVIDIA | Pinned-clock sweeps on each architecture (`gfx942`, `gfx950`, `gfx1151`, Apple, Arc), as [acceleration-research.md](acceleration-research.md) describes for NVIDIA |
+| No deterministic kernel set off CPU and CUDA | An audit of reduction order per backend on its own device. HIP and MUSA compile the CUDA kernel sources but use hipBLAS and muBLAS and split by a different device, so the CUDA audit does not carry over |
+| The fork's sync with llama.cpp 0.9.0 is proved on the CPU only | The fork is synced with upstream 0.9.0 (ggml 0.29), which brings the OCP FP8 E4M3 tensor type. It builds on the CPU, where the architecture and gradient tests pass. The CUDA attention kernels were merged by reading and have not been compiled, and no GPU backend has run the synced tree. Closing this takes a CUDA build, the backend comparison tests on each backend, and the fork's patches re-validated on hardware |
+| No hosted engines on macOS | Confinement for macOS written and tested on a Mac. Until then Apple is reached through linked Metal and CoreML, and MLX and vllm-metal are not hosted |
+| Static links for vendor-SDK backends are unproven | A build of `sycl`, `openvino`, `cann`, `musa`, `zdnn`, `webgpu`, `hexagon` and `et` on a machine with each SDK. Until then a static build leaves the vendor runtime to the final crate and a `dynamic-link` build carries it |
+| The Windows compute-accelerator device class is unchecked on an NPU | A run of `praecise-hw` on a Windows machine with an NPU |
+| Cambricon's torch device is unconfirmed from a primary source | Its `torch_mlu` package; until then Cambricon is reached through its vLLM plugin only |
+| The `silicon-coverage` workflow has not run | Its first green run. The CPU build of llama.cpp and every crate above it were built and type-checked once, on Windows x86-64 with MinGW; nothing was built on Linux, AArch64 or macOS. Until the workflow runs, `zendnn`, `kleidiai`, `metal` and the AVX-512 options are `wired`, not `built`, and the ONNX providers are compiled on that one build host only |
+| The remote backend has not met a real provider | A run against Groq, Cerebras and SambaNova with a key. It is tested against a local server speaking the same protocol; whether each provider returns usage in a stream, and which length field each takes, is read from their client libraries and not from a response |
+| Quantum jobs simulate on NVIDIA GPUs or the CPU only, and no quantum processor is reachable | A simulation program on a simulator with an AMD path (Qiskit Aer on ROCm, `lightning.kokkos` or QuEST with HIP), run on that hardware; and, for a real device, an opted-in network route for jobs. See "Quantum" below |
 
 ### Out of scope, by design
 
@@ -193,7 +192,7 @@ Surveyed 2026-11-12. ⚠ marks what came from secondary coverage.
   `lightning.kokkos` builds with HIP for AMD, qsim has a HIP backend for
   Instinct, and QuEST builds with CUDA or HIP. None is confirmed on Intel or
   Apple GPUs. A simulation program on one of these is the way to a quantum
-  job that does not need NVIDIA; none is written yet (open item K).
+  job that does not need NVIDIA; none is written yet.
 - **Real devices.** Quantinuum Helios, IonQ Tempo and IBM's systems are
   reached through a provider's cloud, with credentials; some are also sold
   for installation on site (IQM reports 23 systems), and Google's Willow is
@@ -201,7 +200,7 @@ Surveyed 2026-11-12. ⚠ marks what came from secondary coverage.
   network by third-party software is not established. A job is confined
   without a network, so reaching a device is the same decision as the remote
   backend, for jobs: a separate, opted-in route that names its hosts. It is
-  not built (open item K).
+  not built.
 
 ## Staying ahead
 
@@ -213,7 +212,7 @@ speculation; each is a note of where the next gap will open.
 | ONNX Runtime plugin execution providers | Providers stop being compile-time features of one runtime binary | Register provider libraries at run time; keep the planning rules |
 | Windows ML execution-provider catalogue | The system, not the application, supplies providers on Windows | Enumerate the catalogue instead of DirectML |
 | Core AI on macOS 27 | The Neural Engine's new front door; no ONNX path yet | A provider, when ONNX Runtime has one |
-| OCP FP8 E4M3 in ggml | A new tensor type the fork lacks | Open item D |
+| OCP FP8 E4M3 in ggml | The interchange type between vendors; the fork has it since the sync with 0.9.0 | Converters and loaders that carry it, once a model ships in it |
 | Block-scaled 4-bit formats diverging | MXFP4 (blocks of 32, E8M0 scale) and NVFP4 (blocks of 16, E4M3 scale) are not interchangeable; x86 ACE defines its own | Carry block size and scale format with a tensor, convert at load |
 | x86 AVX10.2, APX, ACE | Matrix and block-scaled arithmetic on CPUs from 2026 to 2029 | Detection in `praecise_hardware::cpu` once the standard library or CPUID leaf is settled |
 | A ratified RISC-V matrix extension | None is ratified; three proposals overlap | No path until one is |
@@ -222,6 +221,17 @@ speculation; each is a note of where the next gap will open.
 
 ## Changelog
 
+- **2026-11-13.** The llama.cpp fork is synced with upstream 0.9.0 (ggml
+  0.29). Upstream's row-list attention and the fork's banded attention read
+  the same tensor slot, and each reader now tells them apart by operation.
+  Inkling and DiffusionGemma moved to upstream's attention-mask type. Built
+  on the CPU (Windows x86-64, MinGW): the architecture test passes 152 of
+  152 and the gradient test passes. The crates that link llama.cpp
+  type-check against it and the runtime's 272 library tests pass. Not
+  compiled: any GPU backend, including the CUDA attention kernels the merge
+  touched. Not run: the backend comparison tests, which need a second
+  backend. Upstream publishes no speed figures for 0.8.0 or 0.9.0, and none
+  was measured here.
 - **2026-11-13.** Versions refreshed: the lockfile and the four crates that
   had a newer release (`cc`, `encoding_rs`, `openh264`, `wgpu`); the cloud
   build image moved from Debian 12 to Debian 13; the CUDA test image moved
@@ -232,10 +242,10 @@ speculation; each is a note of where the next gap will open.
   speedups was added to [acceleration-research.md](acceleration-research.md):
   no new batch-1 kernel was found.
 - **2026-11-12.** Remote backend (`praecise-remote`) added as an opt-in
-  route to API-only silicon. Quantum section added; open items J and K
-  recorded. bindgen built without `prettyplease` so the workspace builds.
-- **2026-11-12.** Charter written. Hardware layer, backend reach, OpenVINO
+  route to API-only silicon. Quantum section added, with two open gaps: the
+  remote backend against a real provider, and quantum simulation off NVIDIA. bindgen built without `prettyplease` so the workspace builds.
+- **2026-11-12.** Page written. Hardware layer, backend reach, OpenVINO
   hosted backend, vendor-neutral host adapter and confinement, six ONNX
   providers, five ggml features, CPU kernel tiers, the silicon catalogue, the
-  bandwidth measurement and the `silicon-coverage` workflow added. Open items
-  A to I recorded.
+  bandwidth measurement and the `silicon-coverage` workflow added. Nine open
+  gaps recorded.

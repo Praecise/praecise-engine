@@ -2,7 +2,7 @@
 
 Praecise Engine runs on any vendor's silicon, not one. This page is the
 record of what is supported on each, by which route, and how far each claim
-has been proved. The plan behind it is [silicon-charter.md](silicon-charter.md);
+has been proved. The plan behind it is [silicon-coverage.md](silicon-coverage.md);
 the reasoning about memory, packaging and interconnect that shapes it is
 [foundations.md](foundations.md).
 
@@ -25,7 +25,7 @@ The `silicon-coverage` workflow builds the routes that need no vendor SDK
 (ZenDNN, KleidiAI, Metal, the AVX-512 options) and compiles every ONNX
 provider on each change. A row moves from `wired` to `built` when that
 workflow has built it; until its first run the rows it covers stay `wired`
-([silicon-charter.md](silicon-charter.md), open item I). The default CPU
+([silicon-coverage.md](silicon-coverage.md)). The default CPU
 build and the crates above it have been built once by hand, on Windows
 x86-64.
 
