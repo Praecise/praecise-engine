@@ -334,7 +334,7 @@ or neither.
 
 | # | Technique | Published gain | Lossless | Where it lands here | Bandwidth effect |
 |---|---|---|---|---|---|
-| 1 | llama.cpp 0.8.0 and 0.9.0 (ggml 0.28, 0.29): CUDA chunked graph launches, faster low-bit mat-vec, Metal MXFP4 mat-vec, Vulkan split-K on RDNA3/4, Arm SVE Q8_0/Q6_K/MXFP4, SYCL flash attention over a quantised KV cache, the n-gram cache saved to a file | None published | Yes | Linked route, by syncing the fork (see the silicon charter, item D) | Neither; launch cost and kernel efficiency |
+| 1 | llama.cpp 0.8.0 and 0.9.0 (ggml 0.28, 0.29): CUDA chunked graph launches, faster low-bit mat-vec, Metal MXFP4 mat-vec, Vulkan split-K on RDNA3/4, Arm SVE Q8_0/Q6_K/MXFP4, SYCL flash attention over a quantised KV cache, the n-gram cache saved to a file | None published | Yes | Linked route; the fork is synced with 0.9.0, built and tested on the CPU only ([silicon-coverage.md](silicon-coverage.md)) | Neither; launch cost and kernel efficiency |
 | 2 | LiLiCorr: a two-layer transformer rescoring a top-K lattice of DFlash drafts | Acceptance length +7 to +19% over DFlash at about 3% overhead per block (arXiv 2608.20530, abstract; models and hardware not stated there) | ⚠ Not addressed in the abstract | The speculation policy layer; needs a trained checkpoint per target model | More tokens per pass |
 | 3 | DFlash drafts in SGLang Spec V2 | Over 4.3x baseline and 1.5x MTP on Qwen 3.5 397B-A17B, HumanEval, concurrency 1, 8xB200; the overlap scheduler alone takes Qwen3-8B from about 11.4 to 15.3 ktok/s at concurrency 32 on one B200 | Yes, under greedy verification | Hosted SGLang route, a configuration change | More tokens per pass |
 | 4 | MoE expert cache on the GPU (`--moe-cache-mib`), for models that do not fit in VRAM | 25.0 to about 40 t/s on an RTX 4090 and 30.8 to 67.8 t/s on an RTX 5090, Qwen3.8-Flash-Next Q4_0 | ⚠ Bit-identity not stated | The runtime sets the cache size on discrete GPUs | Neither; it removes the PCIe path |
@@ -375,14 +375,15 @@ speculative decoding to CPU, GPU and NPU; the release notes were not opened.
 
 ### What this changes in the roadmap
 
-1. Sync the fork (item 1), then measure decode before and after on the GB10.
-   Until that measurement exists, no gain is claimed for it.
+1. The fork is synced with llama.cpp 0.9.0 and proved on the CPU only. Measure
+   decode before and after on the GB10. Until that measurement exists, no gain
+   is claimed for it.
 2. Let the speculation policy layer choose a DFlash corrector where a
-   checkpoint exists (item 2), and refuse where none does.
+   checkpoint exists, and refuse where none does.
 3. Size the MoE expert cache from the hardware layer: on for a discrete GPU
-   whose VRAM is smaller than the model, off on unified memory (item 4).
+   whose VRAM is smaller than the model, off on unified memory.
 4. Treat a diffusion model as a hosted-route model until the linked route can
-   run one (item 5). `BatchEngine` still refuses them, which is correct.
+   run one. `BatchEngine` still refuses them, which is correct.
 
 Sources: llama.cpp release notes for 0.6.0 to 0.9.0 (read through a release
 mirror); upstream pull requests 29887, 24423 and 26802; arXiv 2608.20530,

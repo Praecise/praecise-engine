@@ -12,7 +12,7 @@ Apple, Qualcomm, Arm, Huawei and the rest are each reached by a route that is
 named, built and tested as far as it can be without the device, and none is
 the default. [docs/hardware.md](docs/hardware.md) says what is supported on
 each and how far each claim has been proved;
-[docs/silicon-charter.md](docs/silicon-charter.md) is the plan behind it.
+[docs/silicon-coverage.md](docs/silicon-coverage.md) is the plan behind it.
 
 ## Design
 
@@ -356,7 +356,8 @@ is only as right as its assumptions, and the only test of those is measurement.
 ## Crates
 
 - `llama-cpp-sys-2` — low-level FFI; pulls the llama.cpp backend (the Praecise
-  fork, synced with upstream llama.cpp 7790a9231 of 2026-10-25).
+  fork, synced with upstream llama.cpp 0.9.0 of 2026-11-04; built and tested
+  on the CPU, not yet on a GPU).
 - `llama-cpp-2` — safe Rust bindings, including the speculative-decode primitives.
 - `praecise-hardware` — the hardware layer: which accelerators a machine has
   (every vendor, read from the operating system), which backend drives each,
