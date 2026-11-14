@@ -1462,6 +1462,8 @@ fn main() {
             .include(llama_src.join("ggml/include"))
             .include(llama_src.join("common"))
             .include(llama_src.join("vendor"))
+            // upstream's CMake target sets this for M_PI; the sources no longer define it themselves
+            .define("_USE_MATH_DEFINES", None)
             .flag_if_supported("-std=c++17")
             .flag_if_supported("-Wno-cast-qual")
             .pic(true);

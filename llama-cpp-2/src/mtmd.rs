@@ -1296,6 +1296,7 @@ impl MtmdGenAudio {
             lang: self.language.as_ref().map_or(std::ptr::null(), |l| l.as_ptr()),
             top_k: input.top_k,
             top_p: input.top_p,
+            temp: -1.0, // the model's default frame temperature
             seed: input.seed,
             out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
             stream: false,
@@ -1334,6 +1335,7 @@ impl MtmdGenAudio {
             lang: std::ptr::null(),
             top_k: cond.top_k,
             top_p: cond.top_p,
+            temp: -1.0, // the model's default frame temperature
             seed: cond.seed,
             out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
             stream: false,

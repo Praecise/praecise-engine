@@ -375,9 +375,9 @@ speculative decoding to CPU, GPU and NPU; the release notes were not opened.
 
 ### What this changes in the roadmap
 
-1. The fork is synced with llama.cpp 0.9.0 and proved on the CPU only. Measure
-   decode before and after on the GB10. Until that measurement exists, no gain
-   is claimed for it.
+1. The fork is synced with llama.cpp 1.0.0 and built on the CPU only; no GPU
+   backend has been compiled against it. Measure decode before and after on the GB10. Until that measurement
+   exists, no gain is claimed for it.
 2. Let the speculation policy layer choose a DFlash corrector where a
    checkpoint exists, and refuse where none does.
 3. Size the MoE expert cache from the hardware layer: on for a discrete GPU
