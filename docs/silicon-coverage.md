@@ -85,7 +85,7 @@ hidden behind a passing check.
 | Every non-NVIDIA row is unverified | A run on the silicon, recorded in [hardware.md](hardware.md). In rough order of reach: AMD Instinct and Radeon (HIP, Vulkan), Apple M-series (Metal), Intel Arc (SYCL, OpenVINO), Ryzen AI and Core Ultra NPUs, Ascend, Snapdragon |
 | Per-hardware, per-quantization dispatch tables exist only for NVIDIA | Pinned-clock sweeps on each architecture (`gfx942`, `gfx950`, `gfx1151`, Apple, Arc), as [acceleration-research.md](acceleration-research.md) describes for NVIDIA |
 | No deterministic kernel set off CPU and CUDA | An audit of reduction order per backend on its own device. HIP and MUSA compile the CUDA kernel sources but use hipBLAS and muBLAS and split by a different device, so the CUDA audit does not carry over |
-| The fork's sync with llama.cpp 1.0.0 has not been compiled | The fork is synced in source with upstream 1.0.0 (ggml 1.0.0), which removes the deprecated API, moves the multimodal code out of `clip` and changes the CUDA attention and quantized-product kernels the fork patches. The merge and the binding changes were made by reading: nothing has been compiled against the synced tree, on the CPU or on any GPU backend, and no test has run. The last tree proved, on the CPU only, is the sync with 0.9.0. Closing this takes a CPU build with the architecture and gradient tests, the crates type-checked and the runtime tests run, then a CUDA build, the backend comparison tests on each backend, and the fork's patches re-validated on hardware |
+| The fork's sync with llama.cpp 1.0.0 is proved on the CPU only | The fork is synced with upstream 1.0.0 (ggml 1.0.0), which removes the deprecated API, moves the multimodal code out of `clip` and changes the CUDA attention and quantized-product kernels the fork patches. Built on an x86-64 CPU: the merged tree, with upstream's architecture test (155 of 155) and gradient test passing; `llama-cpp-sys-2` and `llama-cpp-2` with `mtmd` type-check against it. Nothing has been compiled on any GPU backend, the other crates have not been compiled against it, and the workspace's own tests have not run. Closing this takes the remaining crates type-checked and the runtime tests run, then a CUDA build, the backend comparison tests on each backend, and the fork's patches re-validated on hardware |
 | No hosted engines on macOS | Confinement for macOS written and tested on a Mac. Until then Apple is reached through linked Metal and CoreML, and MLX and vllm-metal are not hosted |
 | Static links for vendor-SDK backends are unproven | A build of `sycl`, `openvino`, `cann`, `musa`, `zdnn`, `webgpu`, `hexagon` and `et` on a machine with each SDK. Until then a static build leaves the vendor runtime to the final crate and a `dynamic-link` build carries it |
 | The Windows compute-accelerator device class is unchecked on an NPU | A run of `praecise-hw` on a Windows machine with an NPU |
@@ -228,10 +228,14 @@ speculation; each is a note of where the next gap will open.
   `defrag_thold` is gone from the context parameters; the MoE cache size and
   its CPU share are now settable from Rust. Upstream dissolved `clip` into
   `mtmd`, and the fork's Inkling towers, Kimi-K3 projector and Qwen3-Omni
-  talker generator moved with it. Not compiled: the merged tree, the crates
-  against it, any GPU backend. Not run: any test. The CUDA attention and
-  quantized-product kernels, which both upstream and the fork changed, were
-  merged by reading. No speed figure is claimed for this release.
+  talker generator moved with it. Built, on an x86-64 CPU with GCC: the merged
+  tree (the library and `mtmd`), with upstream's architecture test passing
+  155 of 155 and its gradient test passing. Compiled: `llama-cpp-sys-2` and
+  `llama-cpp-2` with the `mtmd` feature against it (a type-check, CPU). Not
+  compiled: the other crates in the workspace, any GPU backend. Not run: the
+  workspace's own tests. The CUDA attention and quantized-product kernels,
+  which both upstream and the fork changed, were merged by reading. No speed
+  figure is claimed for this release.
 - **2026-11-13.** The llama.cpp fork is synced with upstream 0.9.0 (ggml
   0.29). Upstream's row-list attention and the fork's banded attention read
   the same tensor slot, and each reader now tells them apart by operation.
