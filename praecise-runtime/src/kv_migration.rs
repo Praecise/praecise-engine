@@ -28,12 +28,27 @@
 //!
 //! ## What the context must provide
 //!
-//! Incremental export and import stage cells through a *scratch* sequence id
-//! that the caller reserves (and never decodes into). The context must be
-//! built with `n_seq_max` above the scratch id and with a unified KV buffer
-//! (`kv_unified = true`), so that copying a position range between sequences
-//! is a metadata update rather than a buffer copy. Both are checked at run
+//! The caller reserves a *scratch* sequence id (and never decodes into it);
+//! the context must be built with `n_seq_max` above it. That is checked at run
 //! time and refused rather than assumed.
+//!
+//! In a unified KV buffer (`kv_unified = true`) a delta carries only its new
+//! positions: they are staged through the scratch id, where copying a position
+//! range between sequences is a metadata update rather than a buffer copy.
+//!
+//! A context with a KV stream per sequence (`kv_unified = false`, as the batch
+//! engine builds) cannot copy a range between streams. There every blob
+//! carries the whole sequence, positions `0 .. end`, read from the sequence's
+//! own stream, while its token list still names only the new positions, so a
+//! chain is ordered and checked the same way. Applying such a blob replaces the
+//! destination sequence. Its payload is written independently of the writer's
+//! stream count (see [`WHOLE_MAGIC`]), so it can be applied in a context with
+//! any number of streams, unified or not. A blob that carries only a position
+//! range cannot be applied in a per-stream context and is refused.
+//!
+//! One model kind is not exported from a per-stream context: attention plus
+//! recurrent layers where the attention uses a sliding window. Its state is not
+//! split here into its parts, and is refused.
 //!
 //! ## Recurrent and hybrid models
 //!
@@ -53,8 +68,26 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"PRKV";
-/// The blob format version this build writes and reads.
-pub const KV_BLOB_VERSION: u16 = 1;
+/// The blob format version this build writes. Version 2 added whole-sequence
+/// payloads; this build reads version 1 too.
+pub const KV_BLOB_VERSION: u16 = 2;
+/// The oldest blob format version this build reads.
+const KV_BLOB_MIN_VERSION: u16 = 1;
+/// A payload that holds a whole sequence, positions `0 .. end`, in a form that
+/// does not depend on how many KV streams the writing context had:
+///
+/// ```text
+/// "PRKW" | part count u32 | per part: kind u8 | length u64 | bytes
+/// ```
+///
+/// A part of kind [`PART_VERBATIM`] is passed to the backend as it is (the
+/// state header, a recurrent state). A part of kind [`PART_ONE_STREAM`] is one
+/// attention cache's entry for the stream that held the sequence: its cell
+/// count, then its cells. The reader writes it back as a cache of its own
+/// stream count with every other stream empty.
+pub const WHOLE_MAGIC: &[u8; 4] = b"PRKW";
+const PART_VERBATIM: u8 = 0;
+const PART_ONE_STREAM: u8 = 1;
 const DIGEST_LEN: usize = 32;
 const HEADER_LEN: usize = 4 + 2 + 2 + DIGEST_LEN + DIGEST_LEN + 4 + 4;
 
@@ -124,7 +157,9 @@ pub struct KvBlob {
     pub base_pos: u32,
     /// Token ids at `base_pos ..`, one per carried position.
     pub tokens: Vec<i32>,
-    /// The backend's serialized cells for exactly those positions.
+    /// The backend's serialized cells for exactly those positions, or, for a
+    /// blob written from a context with a KV stream per sequence, the whole
+    /// sequence in the stream-independent form of [`WHOLE_MAGIC`].
     pub payload: Vec<u8>,
 }
 
@@ -200,9 +235,9 @@ impl KvBlob {
             return Err(bad("not a KV blob (bad magic)"));
         }
         let version = u16::from_le_bytes([body[4], body[5]]);
-        if version != KV_BLOB_VERSION {
+        if !(KV_BLOB_MIN_VERSION..=KV_BLOB_VERSION).contains(&version) {
             return Err(Error::KvBlob(format!(
-                "unsupported KV blob version {version} (this build reads {KV_BLOB_VERSION})"
+                "unsupported KV blob version {version} (this build reads {KV_BLOB_MIN_VERSION} to {KV_BLOB_VERSION})"
             )));
         }
         let mut at = 8;
@@ -233,6 +268,107 @@ impl KvBlob {
         }
         Ok(Self { model: ModelFingerprint(model), prev_digest, base_pos, tokens, payload })
     }
+}
+
+/// Whether a payload holds a whole sequence (see [`WHOLE_MAGIC`]).
+#[must_use]
+pub fn is_whole_payload(payload: &[u8]) -> bool {
+    payload.starts_with(WHOLE_MAGIC)
+}
+
+fn whole_err(m: impl Into<String>) -> Error {
+    Error::KvSequence(m.into())
+}
+
+fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+    b.get(at..at + 4).map(|w| u32::from_le_bytes(w.try_into().expect("4 bytes")))
+}
+
+/// Frame the parts of a whole-sequence payload.
+fn frame_whole(parts: &[(u8, &[u8])]) -> Vec<u8> {
+    let len = 8 + parts.iter().map(|p| 9 + p.1.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(WHOLE_MAGIC);
+    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    for (kind, bytes) in parts {
+        out.push(*kind);
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+/// The parts of a whole-sequence payload, in order.
+fn whole_parts(payload: &[u8]) -> Result<Vec<(u8, &[u8])>> {
+    let bad = || whole_err("malformed whole-sequence payload");
+    if !is_whole_payload(payload) {
+        return Err(bad());
+    }
+    let count = u32_at(payload, 4).ok_or_else(bad)?;
+    let mut at = 8;
+    let mut parts = Vec::new();
+    for _ in 0..count {
+        let kind = *payload.get(at).ok_or_else(bad)?;
+        let len = payload.get(at + 1..at + 9).ok_or_else(bad)?;
+        let len = usize::try_from(u64::from_le_bytes(len.try_into().expect("8 bytes"))).map_err(|_| bad())?;
+        let start = at + 9;
+        let bytes = payload.get(start..start.checked_add(len).ok_or_else(bad)?).ok_or_else(bad)?;
+        if kind != PART_VERBATIM && kind != PART_ONE_STREAM {
+            return Err(whole_err(format!("unknown whole-sequence payload part kind {kind}")));
+        }
+        parts.push((kind, bytes));
+        at = start + len;
+    }
+    if at != payload.len() {
+        return Err(bad());
+    }
+    Ok(parts)
+}
+
+/// One attention cache written for one sequence by a context of `n` streams
+/// (`n u32`, then per stream a cell count and, when it is not zero, the cells)
+/// holds cells in one stream at most. Return that stream's entry alone.
+fn one_stream(cache: &[u8]) -> Result<Vec<u8>> {
+    let n = u32_at(cache, 0).filter(|&n| n >= 1).ok_or_else(|| whole_err("attention cache without streams"))? as usize;
+    let header = 4 + 4 * n;
+    if cache.len() < header {
+        return Err(whole_err("attention cache shorter than its stream counts"));
+    }
+    let Some(k) = (0..n).find(|&s| u32_at(cache, 4 + 4 * s) != Some(0)) else {
+        // No stream holds a cell of this sequence.
+        return if cache.len() == header {
+            Ok(0u32.to_le_bytes().to_vec())
+        } else {
+            Err(whole_err("empty attention cache with trailing bytes"))
+        };
+    };
+    // The streams after the one that holds the cells are empty: a zero count
+    // each, at the very end.
+    let end = cache.len().checked_sub(4 * (n - k - 1)).filter(|&e| e > 4 + 4 * k + 4);
+    let end = end.ok_or_else(|| whole_err("attention cache too short for its streams"))?;
+    if cache[end..].iter().any(|&b| b != 0) {
+        return Err(whole_err("the sequence's cells span more than one KV stream"));
+    }
+    Ok(cache[4 + 4 * k..end].to_vec())
+}
+
+/// Write a whole-sequence payload back in the backend's form for a context of
+/// `streams` attention streams (`None` for a model without an attention cache).
+fn expand_whole(payload: &[u8], streams: Option<u32>) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(payload.len());
+    for (kind, bytes) in whole_parts(payload)? {
+        if kind == PART_VERBATIM {
+            out.extend_from_slice(bytes);
+            continue;
+        }
+        let n = streams.ok_or_else(|| whole_err("the blob carries an attention cache this model does not have"))?;
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(bytes);
+        for _ in 1..n {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+    Ok(out)
 }
 
 /// Import-side chain state: which weights, and how far the sequence has been
@@ -292,7 +428,10 @@ mod backend {
     use llama_cpp_2::context::session::LlamaStateSeqFlags;
     use llama_cpp_2::token::LlamaToken;
 
-    use super::{DIGEST_LEN, ImportChain, KvBlob, ModelFingerprint};
+    use super::{
+        DIGEST_LEN, ImportChain, KvBlob, ModelFingerprint, PART_ONE_STREAM, PART_VERBATIM, expand_whole, frame_whole,
+        is_whole_payload, one_stream,
+    };
     use crate::error::{Error, Result};
 
     fn seq_err(m: impl Into<String>) -> Error {
@@ -333,7 +472,10 @@ mod backend {
 
     /// Serialize one sequence's cells.
     fn seq_state(ctx: &LlamaContext<'_>, seq: i32) -> Result<Vec<u8>> {
-        let flags = LlamaStateSeqFlags::empty();
+        seq_state_with(ctx, seq, LlamaStateSeqFlags::empty())
+    }
+
+    fn seq_state_with(ctx: &LlamaContext<'_>, seq: i32, flags: LlamaStateSeqFlags) -> Result<Vec<u8>> {
         let size = ctx.state_seq_get_size_ext(seq, flags);
         let mut bytes = vec![0u8; size];
         let n = ctx.state_seq_get_data_ext(&mut bytes, seq, flags);
@@ -343,8 +485,10 @@ mod backend {
         Ok(bytes)
     }
 
-    /// Refuse contexts the scratch-sequence technique is not safe on.
-    fn check_context(ctx: &LlamaContext<'_>, seq: i32, scratch: i32) -> Result<()> {
+    /// Refuse contexts the scratch-sequence technique is not safe on, and
+    /// return how many streams the attention cache has (`None` for a purely
+    /// recurrent model, which has no attention cache).
+    fn check_context(ctx: &LlamaContext<'_>, seq: i32, scratch: i32) -> Result<Option<u32>> {
         if seq == scratch || seq < 0 || scratch < 0 {
             return Err(seq_err("sequence and scratch ids must be distinct and non-negative"));
         }
@@ -359,17 +503,64 @@ mod backend {
         }
         // A purely recurrent model has no attention cells to copy by range.
         if ctx.model.is_recurrent() {
-            return Ok(());
+            return Ok(None);
         }
         // An empty sequence's state is a magic and the sequence id, then the
         // attention cache's stream count and an empty cell count per stream. A
         // unified buffer has exactly one stream; per-sequence streams cannot
-        // copy a partial range between sequences (the backend aborts).
+        // copy a partial range between sequences (the backend aborts), so
+        // there a sequence moves whole.
         let bytes = seq_state(ctx, scratch)?;
-        if bytes.len() < 12 || u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) != 1 {
-            return Err(seq_err("context KV buffer is not unified (build it with kv_unified = true)"));
+        match bytes.get(8..12).map(|w| u32::from_le_bytes(w.try_into().expect("4 bytes"))) {
+            Some(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(seq_err("the backend's sequence state has no attention stream count")),
         }
-        Ok(())
+    }
+
+    /// The state header the backend writes before a sequence's memory: a magic
+    /// and the sequence id.
+    const STATE_HEADER: usize = 8;
+
+    /// Sequence `seq`'s whole state, positions `0 ..`, read from its own
+    /// stream and framed so that it does not depend on the stream count.
+    fn whole_state(ctx: &LlamaContext<'_>, seq: i32) -> Result<Vec<u8>> {
+        let full = seq_state(ctx, seq)?;
+        if full.len() < STATE_HEADER {
+            return Err(seq_err("the backend's sequence state is shorter than its header"));
+        }
+        let (head, memory) = full.split_at(STATE_HEADER);
+        let swa = ctx.model.n_swa() > 0;
+        let hybrid = ctx.model.is_hybrid();
+        if swa && hybrid {
+            return Err(seq_err(
+                "a model with recurrent layers and sliding-window attention cannot be exported from a context \
+                 with a KV stream per sequence",
+            ));
+        }
+        // A second part follows the first attention cache: the sliding-window
+        // cache, or the recurrent state. Only it is written when the backend is
+        // asked for the partial state, which measures where it starts.
+        let tail_len = if swa || hybrid {
+            let partial = seq_state_with(ctx, seq, LlamaStateSeqFlags::PARTIAL_ONLY)?;
+            let tail = partial.get(STATE_HEADER..).unwrap_or_default();
+            if !memory.ends_with(tail) {
+                return Err(seq_err("the partial sequence state is not the end of the whole state"));
+            }
+            tail.len()
+        } else {
+            0
+        };
+        let (first, tail) = memory.split_at(memory.len() - tail_len);
+        let first = one_stream(first)?;
+        let swa_cache;
+        let mut parts: Vec<(u8, &[u8])> = vec![(PART_VERBATIM, head), (PART_ONE_STREAM, &first)];
+        if swa {
+            swa_cache = one_stream(tail)?;
+            parts.push((PART_ONE_STREAM, &swa_cache));
+        } else if hybrid {
+            parts.push((PART_VERBATIM, tail));
+        }
+        Ok(frame_whole(&parts))
     }
 
     /// Exports one sequence's KV cache incrementally.
@@ -406,7 +597,7 @@ mod backend {
         /// `tokens` disagrees with the cache, or if the sequence was rewound
         /// below what was already exported (start a new exporter then).
         pub fn export(&mut self, ctx: &mut LlamaContext<'_>, tokens: &[LlamaToken]) -> Result<Vec<u8>> {
-            check_context(ctx, self.seq, self.scratch)?;
+            let streams = check_context(ctx, self.seq, self.scratch)?;
             let n = seq_len(ctx, self.seq)?;
             if tokens.len() != n as usize {
                 return Err(seq_err(format!(
@@ -424,6 +615,8 @@ mod backend {
             let p0 = self.exported_to;
             let payload = if n == p0 {
                 Vec::new()
+            } else if streams.is_some_and(|s| s > 1) {
+                whole_state(ctx, self.seq)?
             } else {
                 ctx.copy_kv_cache_seq(self.seq, self.scratch, Some(p0), Some(n))
                     .map_err(|e| seq_err(e.to_string()))?;
@@ -480,11 +673,13 @@ mod backend {
         /// [`Error::KvBlob`] for a corrupt blob, [`Error::ModelMismatch`] for
         /// other weights, [`Error::KvSequence`] for an out-of-order blob or a
         /// destination that is not in the expected state. On any error the
-        /// destination sequence is unchanged.
+        /// destination sequence is unchanged, except when the backend refuses a
+        /// whole-sequence payload it has started to apply: the sequence is then
+        /// emptied.
         pub fn apply(&mut self, ctx: &mut LlamaContext<'_>, encoded: &[u8]) -> Result<KvBlob> {
             let blob = KvBlob::decode(encoded)?;
             self.chain.check(&blob)?;
-            check_context(ctx, self.seq, self.scratch)?;
+            let streams = check_context(ctx, self.seq, self.scratch)?;
             let have = seq_len(ctx, self.seq)?;
             if have != blob.base_pos {
                 return Err(seq_err(format!(
@@ -492,7 +687,26 @@ mod backend {
                     self.seq, blob.base_pos
                 )));
             }
-            if !blob.tokens.is_empty() {
+            if !blob.tokens.is_empty() && is_whole_payload(&blob.payload) {
+                // The whole sequence, applied in place: the backend empties
+                // the destination sequence first.
+                let bytes = expand_whole(&blob.payload, streams)?;
+                let ok = unsafe { ctx.state_seq_set_data_ext(&bytes, self.seq, LlamaStateSeqFlags::empty()) };
+                let got = (ctx.kv_cache_seq_pos_min(self.seq), ctx.kv_cache_seq_pos_max(self.seq));
+                let want = held_range(ctx, 0, blob.end_pos());
+                if !ok || got != want {
+                    let _ = ctx.clear_kv_cache_seq(Some(self.seq as u32), None, None);
+                    return Err(seq_err(format!(
+                        "backend rejected the whole-sequence payload or restored {got:?} instead of {want:?}; \
+                         the destination sequence was emptied"
+                    )));
+                }
+            } else if !blob.tokens.is_empty() && streams.is_some_and(|s| s > 1) {
+                return Err(seq_err(
+                    "this context keeps a KV stream per sequence and applies only whole-sequence blobs; this blob \
+                     carries a position range",
+                ));
+            } else if !blob.tokens.is_empty() {
                 let ok = unsafe {
                     ctx.state_seq_set_data_ext(&blob.payload, self.scratch, LlamaStateSeqFlags::empty())
                 };
@@ -571,5 +785,54 @@ mod tests {
         // A delta that names a different predecessor is refused.
         assert!(matches!(chain.check(&blob(1, 4, 2, [9; 32])), Err(Error::KvSequence(_))));
         chain.check(&blob(1, 4, 2, d)).unwrap();
+    }
+    /// One sequence's attention cache as a context of `n` streams writes it,
+    /// its cells in stream `k`.
+    fn cache(n: u32, k: u32, cells: &[u8]) -> Vec<u8> {
+        let mut out = n.to_le_bytes().to_vec();
+        for s in 0..n {
+            if s == k {
+                out.extend_from_slice(&3u32.to_le_bytes());
+                out.extend_from_slice(cells);
+            } else {
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_whole_sequence_is_written_back_for_any_stream_count() {
+        let cells = [5u8, 0, 0, 0, 9, 9, 0, 0];
+        let entry = one_stream(&cache(5, 1, &cells)).unwrap();
+        assert_eq!(entry, one_stream(&cache(1, 0, &cells)).unwrap(), "the writer's stream count is gone");
+        assert_eq!(entry, one_stream(&cache(4, 3, &cells)).unwrap());
+        let payload = frame_whole(&[(PART_VERBATIM, b"head"), (PART_ONE_STREAM, &entry), (PART_VERBATIM, b"tail")]);
+        assert!(is_whole_payload(&payload));
+        for n in [1, 2, 33] {
+            let mut want = b"head".to_vec();
+            want.extend_from_slice(&cache(n, 0, &cells));
+            want.extend_from_slice(b"tail");
+            assert_eq!(expand_whole(&payload, Some(n)).unwrap(), want, "{n} streams");
+        }
+        // A model without an attention cache cannot take one.
+        assert!(matches!(expand_whole(&payload, None), Err(Error::KvSequence(_))));
+    }
+
+    #[test]
+    fn a_malformed_whole_sequence_is_refused() {
+        // Cells in two streams are not one sequence's.
+        let mut two = cache(3, 0, &[1, 2, 3, 4]);
+        two[8..12].copy_from_slice(&1u32.to_le_bytes());
+        two.extend_from_slice(&[7, 7, 7, 7]);
+        assert!(one_stream(&two).is_err());
+        assert!(one_stream(&[]).is_err());
+        assert_eq!(one_stream(&cache(2, 9, &[])).unwrap(), 0u32.to_le_bytes(), "an empty cache stays empty");
+        let payload = frame_whole(&[(PART_ONE_STREAM, &[3, 0, 0, 0, 1])]);
+        assert!(expand_whole(&payload[..payload.len() - 1], Some(2)).is_err(), "truncated");
+        let mut unknown = payload.clone();
+        unknown[8] = 7;
+        assert!(expand_whole(&unknown, Some(2)).is_err(), "unknown part kind");
+        assert!(KvBlob::decode(&blob(1, 0, 2, [0; 32]).encode()).is_ok());
     }
 }

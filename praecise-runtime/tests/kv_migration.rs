@@ -121,22 +121,87 @@ fn a_blob_from_other_weights_is_refused() {
     assert_eq!(dst.kv_cache_seq_pos_max(SEQ), -1, "refused import must not touch the sequence");
 }
 
-#[test]
-#[ignore = "needs a small dense GGUF: PRAECISE_TEST_KV_MODEL"]
-fn a_context_without_a_unified_buffer_is_refused() {
-    let path = common::model_path();
-    let fp = fingerprint(&path);
-    let model = common::load(&path);
-    let tokens = model.str_to_token(TEXT, AddBos::Always).expect("tokenize");
+/// A context with a KV stream per sequence, as the batch engine builds one.
+fn per_stream_context(model: &llama_cpp_2::model::LlamaModel, n_seq: u32) -> llama_cpp_2::context::LlamaContext<'_> {
     let params = llama_cpp_2::context::params::LlamaContextParams::default()
-        .with_n_ctx(std::num::NonZeroU32::new(256))
-        .with_n_seq_max(2)
+        .with_n_ctx(std::num::NonZeroU32::new(256 * n_seq))
+        .with_n_batch(512)
+        .with_n_seq_max(n_seq)
         .with_kv_unified(false)
-        .with_n_threads(4);
-    let mut ctx = model.new_context(common::backend(), params).expect("context");
-    common::decode(&mut ctx, SEQ, 0, &tokens[..4]);
-    let err = SequenceExport::new(fp, SEQ, SCRATCH).export(&mut ctx, &tokens[..4]).unwrap_err();
-    assert!(matches!(err, Error::KvSequence(_)), "{err}");
+        .with_n_threads(4)
+        .with_n_threads_batch(4);
+    model.new_context(common::backend(), params).expect("context")
+}
+
+#[test]
+#[ignore = "needs a GGUF: PRAECISE_TEST_KV_MODEL, PRAECISE_TEST_HYBRID_MODEL or PRAECISE_TEST_RECURRENT_MODEL"]
+fn a_sequence_moves_whole_between_contexts_of_any_stream_count() {
+    let models = slot_models();
+    assert!(
+        !models.is_empty(),
+        "set PRAECISE_TEST_KV_MODEL, PRAECISE_TEST_HYBRID_MODEL or PRAECISE_TEST_RECURRENT_MODEL"
+    );
+    for (var, path) in models {
+        let fp = ModelFingerprint::of_file(&path).expect("fingerprint");
+        let model = common::load(&path);
+        let tokens: Vec<LlamaToken> = model.str_to_token(TEXT, AddBos::Always).expect("tokenize");
+        let other: Vec<LlamaToken> = model.str_to_token("A second request shares the batch.", AddBos::Always).expect("tokenize");
+        assert!(tokens.len() >= 26 && other.len() >= 4);
+
+        // Source: four streams, the sequence in slot 1 beside a busy slot 0,
+        // scratch 3. Exported after the prompt, then once more after decoding.
+        let mut src = per_stream_context(&model, 4);
+        decode_rows(&mut src, &[(0, 0, &other[..4]), (1, 0, &tokens[..16])]);
+        let mut exporter = SequenceExport::new(fp, 1, 3);
+        let blob1 = exporter.export(&mut src, &tokens[..16]).expect("first export");
+        for k in 16..24 {
+            decode_rows(&mut src, &[(0, 4 + k - 16, &other[..1]), (1, k, &tokens[k..=k])]);
+        }
+        let blob2 = exporter.export(&mut src, &tokens[..24]).expect("second export");
+        let (b1, b2) = (KvBlob::decode(&blob1).unwrap(), KvBlob::decode(&blob2).unwrap());
+        assert_eq!((b1.base_pos, b1.tokens.len()), (0, 16), "{var}");
+        assert_eq!((b2.base_pos, b2.tokens.len()), (16, 8), "{var}: the token list names only the new positions");
+        assert_eq!(src.kv_cache_seq_pos_max(0), 11, "{var}: the other slot is untouched");
+        let next = tokens[24];
+        let src_logits = common::decode(&mut src, 1, 24, &[next]);
+
+        // Destinations: seven streams, and one unified buffer.
+        let mut seven = per_stream_context(&model, 7);
+        common::decode(&mut seven, 1, 0, &other[..6]);
+        let mut unified = slots_context(&model);
+        for (name, dst, scratch) in [("7 streams", &mut seven, 6), ("unified", &mut unified, 2)] {
+            let mut importer = SequenceImport::new(fp, 0, scratch);
+            importer.apply(dst, &blob1).expect("apply first");
+            assert_eq!(dst.kv_cache_seq_pos_max(0), 15, "{var} {name}");
+            importer.apply(dst, &blob2).expect("apply second");
+            assert_eq!(dst.kv_cache_seq_pos_max(0), 23, "{var} {name}");
+            let dst_logits = common::decode(dst, 0, 24, &[next]);
+            let max_diff = src_logits.iter().zip(&dst_logits).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            eprintln!(
+                "{var} -> {name}: recurrent={} hybrid={} max |diff| = {max_diff:e}, base {} B, second {} B",
+                model.is_recurrent(),
+                model.is_hybrid(),
+                blob1.len(),
+                blob2.len()
+            );
+            assert!(max_diff <= 1e-5, "{var} {name}: moved sequence diverged: max |diff| {max_diff}");
+        }
+        assert_eq!(seven.kv_cache_seq_pos_max(1), 5, "{var}: the destination's other slot is untouched");
+
+        // A blob that carries only a position range cannot be applied where
+        // every sequence has its own stream. A purely recurrent model has no
+        // attention streams and takes it.
+        if !model.is_recurrent() {
+            let mut u = slots_context(&model);
+            common::decode(&mut u, 0, 0, &tokens[..16]);
+            let mut range = SequenceExport::new(fp, 0, 2);
+            let first = range.export(&mut u, &tokens[..16]).expect("unified export");
+            let mut dst = per_stream_context(&model, 4);
+            let err = SequenceImport::new(fp, 0, 3).apply(&mut dst, &first).unwrap_err();
+            assert!(matches!(err, Error::KvSequence(_)), "{var}: {err}");
+            assert_eq!(dst.kv_cache_seq_pos_max(0), -1, "{var}: the refusal leaves the destination untouched");
+        }
+    }
 }
 
 /// Models to run the multi-slot test on: the dense one, and a hybrid

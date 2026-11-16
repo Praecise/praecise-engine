@@ -36,7 +36,10 @@
 //! [`BatchEngine::export_sequence`] returns the positions its slot gained since
 //! the previous export as an encoded [`KvBlob`](crate::KvBlob) (the attention
 //! cells, and on a model with recurrent layers the recurrent state at the last
-//! position), and [`BatchEngine::detach_sequence`] exports the final delta and
+//! position). Each sequence keeps its cache in a KV stream of its own, which
+//! cannot copy a position range out, so every blob's payload holds the whole
+//! sequence read from that stream, while its token list names only the new
+//! positions; a destination of any slot count applies it. Then [`BatchEngine::detach_sequence`] exports the final delta and
 //! takes the sequence out of the engine. [`BatchEngine::resume`] rebuilds it in
 //! a free slot of the destination from the chain of blobs and continues
 //! decoding from the token it had sampled last.
