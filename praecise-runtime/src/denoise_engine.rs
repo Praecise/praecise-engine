@@ -506,6 +506,12 @@ pub(crate) fn scheduler_loop(
             };
             let used: Vec<i32> = running.iter().map(|r| r.seq_id).collect();
             let seq_id = (0..slots as i32).find(|i| !used.contains(i)).unwrap_or(0);
+            if let Some(job) = queued.score {
+                let _ = job.reply.send(Err(crate::error::Error::Other(format!(
+                    "{model_id} decodes by diffusion; a fixed continuation cannot be scored on it"
+                ))));
+                continue;
+            }
             match admit(&model, &plan, queued.req, enable_thinking, seq_id, window as usize, n_ctx.get() as usize) {
                 Ok(r) => running.push(r),
                 Err((tx, e)) => {

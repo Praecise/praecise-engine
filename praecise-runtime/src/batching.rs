@@ -73,7 +73,7 @@ use crate::prefix_cache::{
 };
 use crate::result::{ChatMessage, InferenceResult, StopReason};
 use crate::stream::{ReplyFormat, StopStream};
-use crate::toploc::{InferenceCommitment, StepRecord};
+use crate::toploc::{InferenceCommitment, StepRecord, TopKEntry};
 use llama_cpp_2::context::params::LlamaContextType;
 use llama_cpp_2::speculative::{MtpSpeculativeParams, SpeculativeBatch};
 
@@ -306,6 +306,31 @@ pub struct SequenceResume {
 pub(crate) struct Queued {
     pub(crate) req: BatchRequest,
     pub(crate) ticket: Option<u64>,
+    /// Set for a request that scores a fixed continuation instead of
+    /// generating.
+    pub(crate) score: Option<ScoreJob>,
+}
+
+/// The top-k logits at each position of a fixed continuation, one row per
+/// continuation token, from the logits that would have sampled it.
+pub type ScoreRows = Vec<Vec<TopKEntry>>;
+
+/// A continuation to score, and where its rows go.
+pub(crate) struct ScoreJob {
+    continuation: Vec<LlamaToken>,
+    k: usize,
+    pub(crate) reply: tokio::sync::oneshot::Sender<Result<ScoreRows>>,
+    /// Held so the request's own result channel stays open: a closed one
+    /// reads as a client that has gone.
+    _result_rx: tokio::sync::oneshot::Receiver<Result<InferenceResult>>,
+}
+
+/// A sequence scoring a continuation: rows are taken during its prefill.
+struct Scoring {
+    /// The prompt position whose logits score the first continuation token.
+    from: usize,
+    rows: ScoreRows,
+    job: ScoreJob,
 }
 
 /// Where an export's answer goes.
@@ -661,7 +686,7 @@ impl BatchEngine {
     /// queued behind the running ones, the request is refused with
     /// [`Error::QueueFull`] for the caller to hold or shed.
     pub fn submit(&self, req: BatchRequest) -> Result<()> {
-        self.enqueue(Queued { req, ticket: None })
+        self.enqueue(Queued { req, ticket: None, score: None })
     }
 
     /// [`submit`](Self::submit), returning a ticket that names the sequence
@@ -674,8 +699,44 @@ impl BatchEngine {
     pub fn submit_tracked(&self, req: BatchRequest) -> Result<SequenceTicket> {
         self.migration()?;
         let ticket = self.new_ticket();
-        self.enqueue(Queued { req, ticket: Some(ticket) })?;
+        self.enqueue(Queued { req, ticket: Some(ticket), score: None })?;
         Ok(SequenceTicket(ticket))
+    }
+
+    /// Score a fixed continuation of `prompt`: one prefill of the prompt and
+    /// the continuation in one slot, and for each continuation token the
+    /// top-`k` logits of the position before it, the row a commitment records
+    /// for that token. Nothing is sampled. The prompt is rendered as a
+    /// generating request's would be, so a chat prompt scores against the same
+    /// tokens the provider decoded after. Positions of the continuation are
+    /// always decoded, never taken from a slot's cache.
+    ///
+    /// # Errors
+    /// Immediately for an empty continuation, a `k` of zero, or a full queue;
+    /// through the receiver when the prompt cannot be rendered, prompt and
+    /// continuation do not fit the context, or the model is encoder-decoder
+    /// or decodes by diffusion.
+    pub fn score_continuation(
+        &self,
+        prompt: BatchPrompt,
+        continuation: &[i32],
+        k: usize,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<ScoreRows>>> {
+        if continuation.is_empty() || k == 0 {
+            return Err(Error::Other("scoring needs a continuation of at least one token and k of at least 1".into()));
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let req = BatchRequest {
+            prompt,
+            config: GenerationConfig { temperature: 0.0, max_tokens: 1, commitment_k: None, ..GenerationConfig::default() },
+            token_tx: None,
+            result_tx,
+            media: Vec::new(),
+        };
+        let continuation = continuation.iter().map(|&t| LlamaToken(t)).collect();
+        self.enqueue(Queued { req, ticket: None, score: Some(ScoreJob { continuation, k, reply, _result_rx: result_rx }) })?;
+        Ok(rx)
     }
 
     /// Export the positions the ticket's sequence gained since its previous
@@ -1199,6 +1260,8 @@ struct Sequence {
     /// layers. The rollback selects an earlier recurrent snapshot that only the
     /// next decode applies, so until then the state cannot be copied.
     rollback_pending: bool,
+    /// Set when this sequence scores a fixed continuation.
+    score: Option<Scoring>,
 }
 
 impl Sequence {
@@ -1219,6 +1282,23 @@ impl Sequence {
     /// token, the one that ended it, never reached the cache.
     fn exportable_at_end(&self) -> bool {
         self.pending_prompt.is_none() && !self.rollback_pending && self.n_past as usize == self.resident.len()
+    }
+
+    /// Append a continuation to score to the staged prompt. Returns the
+    /// prompt position whose logits score its first token, which is as far as
+    /// the slot's cache may be reused; the job back when it does not fit.
+    fn start_scoring(&mut self, job: ScoreJob, ctx_size: i32) -> std::result::Result<usize, ScoreJob> {
+        let Some(prompt) = self.pending_prompt.as_mut() else { return Err(job) };
+        let from = prompt.len() - 1;
+        if prompt.len() + job.continuation.len() >= ctx_size as usize {
+            return Err(job);
+        }
+        prompt.extend_from_slice(&job.continuation);
+        self.prompt_ids.extend(job.continuation.iter().map(|t| crate::prefix_cache::text_id(t.0)));
+        self.input_tokens += job.continuation.len() as u32;
+        self.max_pos = ctx_size.min(self.input_tokens as i32 + 1);
+        self.score = Some(Scoring { from, rows: Vec::with_capacity(job.continuation.len()), job });
+        Ok(from)
     }
 
     /// Export the positions gained since this sequence's previous export.
@@ -1696,6 +1776,9 @@ impl Sequence {
     }
 
     fn fail(&mut self, err: Error) {
+        if let Some(sc) = self.score.take() {
+            let _ = sc.job.reply.send(Err(Error::Other(err.to_string())));
+        }
         if let Some(result_tx) = self.result_tx.take() {
             let _ = result_tx.send(Err(err));
         }
@@ -1918,10 +2001,10 @@ fn scheduler_loop(
         // both streaming and non-streaming cancellation. Matches the consumer's
         // verified scheduler.
         for slot_idx in 0..slots.len() {
-            let client_gone = slots[slot_idx]
-                .as_ref()
-                .and_then(|s| s.result_tx.as_ref())
-                .is_some_and(tokio::sync::oneshot::Sender::is_closed);
+            let client_gone = slots[slot_idx].as_ref().is_some_and(|s| {
+                s.result_tx.as_ref().is_some_and(tokio::sync::oneshot::Sender::is_closed)
+                    || s.score.as_ref().is_some_and(|sc| sc.job.reply.is_closed())
+            });
             if client_gone && let Some(seq) = slots[slot_idx].take() {
                 let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
                 draft_seq_rm(&mut draft_ctx, seq.seq_id, None);
@@ -1972,7 +2055,7 @@ fn scheduler_loop(
         }
         // Fill any remaining free slots without blocking.
         while slots.iter().filter(|s| s.is_some()).count() < capacity {
-            let Queued { req, ticket } = match waiting.pop_front() {
+            let Queued { req, ticket, score } = match waiting.pop_front() {
                 Some(q) => q,
                 None => match rx.try_recv() {
                     Ok(q) => q,
@@ -1981,10 +2064,16 @@ fn scheduler_loop(
             };
             tick += 1;
             if policy.kind == Reuse::EncoderOutput {
+                if let Some(job) = score {
+                    let _ = job.reply.send(Err(Error::Other(format!(
+                        "{model_id} is encoder-decoder; a fixed continuation cannot be scored on the batch engine"
+                    ))));
+                    continue;
+                }
                 admit_encoder_decoder(&model, &mut ctx, ctx_size, &mut slots, &mut cached, req, enable_thinking, &mut encoded);
                 continue;
             }
-            if let Some(r) = admit(
+            if let Some(mut r) = admit(
                 &model,
                 ctx_size,
                 &mut slots,
@@ -1998,6 +2087,19 @@ fn scheduler_loop(
                 cached[reuse_slot].last_used = tick;
                 if let Some(seq) = slots[reuse_slot].as_mut() {
                     seq.ticket = ticket;
+                }
+                if let Some(job) = score {
+                    match slots[reuse_slot].as_mut().map(|seq| seq.start_scoring(job, ctx_size)) {
+                        Some(Ok(from)) => r.shared = r.shared.min(from),
+                        Some(Err(job)) => {
+                            slots[reuse_slot] = None;
+                            let _ = job.reply.send(Err(Error::Inference(format!(
+                                "prompt and continuation do not fit the context window {ctx_size}"
+                            ))));
+                            continue;
+                        }
+                        None => {}
+                    }
                 }
                 let held = apply_prefix_reuse(&mut ctx, &mut slots, &mut cached, &policy, r);
                 draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held as u32));
@@ -2075,6 +2177,8 @@ fn scheduler_loop(
         // back to the slot that owns it.
         batch.clear();
         let mut logits_slot: Vec<(i32, usize)> = Vec::with_capacity(n_slots);
+        // Rows a scoring sequence takes from this step, in position order.
+        let mut score_rows: Vec<(i32, usize)> = Vec::new();
         let mut step: Vec<StepRow> = Vec::new();
 
         // Extension first: every running sequence contributes exactly one token,
@@ -2137,13 +2241,18 @@ fn scheduler_loop(
                 continue;
             }
 
+            let score_from = seq.score.as_ref().map_or(usize::MAX, |s| s.from);
             let mut cursor = start;
             while cursor < end {
+                let scored = cursor >= score_from && cursor < last;
                 if batch
-                    .add(prompt[cursor], seq.n_past, &[seq.seq_id], cursor == last)
+                    .add(prompt[cursor], seq.n_past, &[seq.seq_id], cursor == last || scored)
                     .is_err()
                 {
                     break;
+                }
+                if scored {
+                    score_rows.push((batch.n_tokens() - 1, slot_idx));
                 }
                 seq.resident.push(prompt[cursor]);
                 seq.n_past += 1;
@@ -2261,11 +2370,32 @@ fn scheduler_loop(
             }
         }
 
+        for (idx, slot_idx) in score_rows {
+            if let Some(sc) = slots[slot_idx].as_mut().and_then(|s| s.score.as_mut()) {
+                sc.rows.push(crate::toploc::top_k_from_logits(ctx.get_logits_ith(idx), sc.job.k));
+            }
+        }
+
         // Sample each sequence from its own logits index.
         for (logits_idx, slot_idx) in logits_slot {
             // This decode applied any recurrent rollback still pending.
             if let Some(seq) = slots[slot_idx].as_mut() {
                 seq.rollback_pending = false;
+            }
+            // A scoring sequence ends with its prefill, unsampled.
+            if let Some(sc) = slots[slot_idx].as_mut().and_then(|s| s.score.take()) {
+                let rows = if sc.rows.len() == sc.job.continuation.len() {
+                    Ok(sc.rows)
+                } else {
+                    Err(Error::Other(format!(
+                        "scored {} of {} continuation positions",
+                        sc.rows.len(),
+                        sc.job.continuation.len()
+                    )))
+                };
+                let _ = sc.job.reply.send(rows);
+                finalize_and_free(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, policy.kind, slot_idx, &mut draining);
+                continue;
             }
             let block = std::mem::take(&mut drafts[slot_idx]);
             let done = if block.is_empty() {
@@ -2919,6 +3049,7 @@ impl Sequence {
             ticket: None,
             exporter: None,
             rollback_pending: false,
+            score: None,
         }
     }
 }
@@ -3346,6 +3477,7 @@ mod prefix_tests {
             ticket: None,
             exporter: None,
             rollback_pending: false,
+            score: None,
         }
     }
 

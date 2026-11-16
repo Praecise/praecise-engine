@@ -50,6 +50,30 @@ pub const MAX_MEAN_LOGIT_DELTA: f32 = 0.25;
 /// whole to verify.
 pub const MIN_PASSING_STEP_FRACTION: f32 = 0.9;
 
+/// The thresholds a commitment is compared under. A verifier whose numbers
+/// differ from the provider's by more than rounding (another quantisation,
+/// another precision) passes its own; [`Tolerance::default`] is the three
+/// constants above.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Tolerance {
+    /// See [`MIN_INDEX_OVERLAP`].
+    pub min_index_overlap: f32,
+    /// See [`MAX_MEAN_LOGIT_DELTA`].
+    pub max_mean_logit_delta: f32,
+    /// See [`MIN_PASSING_STEP_FRACTION`].
+    pub min_passing_step_fraction: f32,
+}
+
+impl Default for Tolerance {
+    fn default() -> Self {
+        Self {
+            min_index_overlap: MIN_INDEX_OVERLAP,
+            max_mean_logit_delta: MAX_MEAN_LOGIT_DELTA,
+            min_passing_step_fraction: MIN_PASSING_STEP_FRACTION,
+        }
+    }
+}
+
 /// One committed logit: token id and raw (pre-sampler) logit value.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TopKEntry {
@@ -179,6 +203,11 @@ pub fn top_k_from_logits(logits: &[f32], k: usize) -> Vec<TopKEntry> {
 /// the whole commitment tolerates that at the rate
 /// [`MIN_PASSING_STEP_FRACTION`] allows.
 pub fn compare_step(committed: &StepRecord, recomputed: &[TopKEntry]) -> StepComparison {
+    compare_step_with(committed, recomputed, &Tolerance::default())
+}
+
+/// [`compare_step`] under the given thresholds.
+pub fn compare_step_with(committed: &StepRecord, recomputed: &[TopKEntry], tolerance: &Tolerance) -> StepComparison {
     let token_supported = recomputed.iter().any(|r| r.token_id == committed.token_id);
     if committed.top_k.is_empty() {
         return StepComparison {
@@ -202,7 +231,9 @@ pub fn compare_step(committed: &StepRecord, recomputed: &[TopKEntry]) -> StepCom
     } else {
         f32::INFINITY
     };
-    let pass = token_supported && index_overlap >= MIN_INDEX_OVERLAP && mean_logit_delta <= MAX_MEAN_LOGIT_DELTA;
+    let pass = token_supported
+        && index_overlap >= tolerance.min_index_overlap
+        && mean_logit_delta <= tolerance.max_mean_logit_delta;
     StepComparison {
         token_supported,
         index_overlap,
@@ -221,6 +252,15 @@ pub fn verify_commitment(
     committed: &InferenceCommitment,
     recomputed: &[Vec<TopKEntry>],
 ) -> VerificationOutcome {
+    verify_commitment_with(committed, recomputed, &Tolerance::default())
+}
+
+/// [`verify_commitment`] under the given thresholds.
+pub fn verify_commitment_with(
+    committed: &InferenceCommitment,
+    recomputed: &[Vec<TopKEntry>],
+    tolerance: &Tolerance,
+) -> VerificationOutcome {
     let well_formed = (MIN_COMMITMENT_K..=MAX_COMMITMENT_K).contains(&committed.k)
         && committed.steps.iter().all(|s| s.top_k.len() == usize::from(committed.k));
     if !well_formed || committed.steps.is_empty() || committed.steps.len() != recomputed.len() {
@@ -234,7 +274,7 @@ pub fn verify_commitment(
     let mut steps_passed = 0usize;
     let mut failing_steps = Vec::new();
     for (i, (step, rec)) in committed.steps.iter().zip(recomputed.iter()).enumerate() {
-        if compare_step(step, rec).pass {
+        if compare_step_with(step, rec, tolerance).pass {
             steps_passed += 1;
         } else if failing_steps.len() < 32 {
             failing_steps.push(i);
@@ -245,7 +285,7 @@ pub fn verify_commitment(
         steps_total: committed.steps.len(),
         steps_passed,
         failing_steps,
-        pass: fraction >= MIN_PASSING_STEP_FRACTION,
+        pass: fraction >= tolerance.min_passing_step_fraction,
     }
 }
 
@@ -426,5 +466,22 @@ mod tests {
     fn empty_commitment_fails() {
         let committed = commitment_with(Vec::new());
         assert!(!verify_commitment(&committed, &[]).pass);
+    }
+
+    #[test]
+    fn a_wider_tolerance_passes_what_the_default_fails() {
+        let committed = commitment_with(vec![StepRecord {
+            token_id: 1,
+            top_k: vec![entry(1, 9.0), entry(2, 8.0), entry(3, 7.0), entry(4, 6.0)],
+        }]);
+        // Every logit half a unit off: past the default mean delta of 0.25.
+        let recomputed = vec![vec![entry(1, 9.5), entry(2, 8.5), entry(3, 7.5), entry(4, 6.5)]];
+        assert_eq!(Tolerance::default().max_mean_logit_delta, MAX_MEAN_LOGIT_DELTA);
+        assert!(!verify_commitment(&committed, &recomputed).pass);
+        let with_default = verify_commitment_with(&committed, &recomputed, &Tolerance::default());
+        assert_eq!((with_default.pass, with_default.steps_passed), (false, 0));
+        let wide = Tolerance { max_mean_logit_delta: 0.6, ..Tolerance::default() };
+        assert!(verify_commitment_with(&committed, &recomputed, &wide).pass);
+        assert!(compare_step_with(&committed.steps[0], &recomputed[0], &wide).pass);
     }
 }
