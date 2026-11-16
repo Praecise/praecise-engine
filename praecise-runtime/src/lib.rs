@@ -171,7 +171,7 @@ pub use stream::{matched_stop_len, Reply, ReplyFormat, ReplyReader, StopStream};
 
 #[cfg(feature = "bundled-llama")]
 pub use batching::{
-    max_slots, BatchEngine, BatchPrompt, BatchRequest, SequenceHandoff, SequenceResume, SequenceTicket,
+    max_slots, BatchEngine, BatchLimits, BatchPrompt, BatchRequest, SequenceHandoff, SequenceResume, SequenceTicket,
 };
 #[cfg(feature = "bundled-llama")]
 pub use chat_format::{ChatFormat, ChatStream, ChatTemplateSource, ChatTurn};

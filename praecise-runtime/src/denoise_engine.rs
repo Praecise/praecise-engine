@@ -443,6 +443,7 @@ pub(crate) fn scheduler_loop(
     context_length: u32,
     enable_thinking: bool,
     plan: Plan,
+    slots: usize,
     rx: &Receiver<Queued>,
     shutdown_rx: &Receiver<()>,
 ) -> Result<()> {
@@ -452,7 +453,6 @@ pub(crate) fn scheduler_loop(
     // The conditioning state belongs to the model: one uniform-noise canvas
     // per pass.
     let one_per_pass = matches!(plan, Plan::Noise(_));
-    let slots = crate::batching::max_slots();
     let window = window(context_length);
     let n_ctx = NonZeroU32::new(context_length.max(window)).unwrap_or(NonZeroU32::MIN);
     let mut params = LlamaContextParams::default()
