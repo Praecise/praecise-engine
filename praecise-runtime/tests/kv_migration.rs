@@ -188,6 +188,25 @@ fn a_sequence_moves_whole_between_contexts_of_any_stream_count() {
         }
         assert_eq!(seven.kv_cache_seq_pos_max(1), 5, "{var}: the destination's other slot is untouched");
 
+        // A destination that stores keys as q8_0 refuses an f16 cache before
+        // touching its own sequence.
+        if !model.is_recurrent() {
+            let params = llama_cpp_2::context::params::LlamaContextParams::default()
+                .with_n_ctx(std::num::NonZeroU32::new(256 * 4))
+                .with_n_batch(512)
+                .with_n_seq_max(4)
+                .with_kv_unified(false)
+                .with_type_k(llama_cpp_2::context::params::KvCacheType::Q8_0)
+                .with_n_threads(4)
+                .with_n_threads_batch(4);
+            let mut q8 = model.new_context(common::backend(), params).expect("q8_0 context");
+            common::decode(&mut q8, 0, 0, &other[..6]);
+            let err = SequenceImport::new(fp, 0, 3).apply(&mut q8, &blob1).unwrap_err();
+            assert!(matches!(err, Error::KvSequence(_)), "{var}: {err}");
+            assert_eq!(q8.kv_cache_seq_pos_max(0), 5, "{var}: the refused import left the destination as it was");
+            assert_eq!(q8.kv_cache_seq_pos_max(3), -1, "{var}: the layout probe left the scratch empty");
+        }
+
         // A blob that carries only a position range cannot be applied where
         // every sequence has its own stream. A purely recurrent model has no
         // attention streams and takes it.

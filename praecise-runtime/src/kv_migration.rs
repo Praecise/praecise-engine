@@ -59,11 +59,14 @@
 //! backend (CPU, CUDA, Metal, Vulkan) therefore applies on another when the two
 //! contexts store the cache alike: same key and value types (an `f16` cache
 //! and a `q8_0` cache differ), and both with or without flash attention, which
-//! decides whether values are transposed. When they differ, the backend's
-//! reader refuses the payload, and the import fails with
-//! [`Error::KvSequence`]; for a whole-sequence blob the destination sequence
-//! has been emptied by then. The model fingerprint names the weights only, so
-//! two engines learn of a layout mismatch only on import. The numbers are the
+//! decides whether values are transposed. When they differ, the import is
+//! refused with [`Error::KvSequence`]: a whole-sequence blob's layout (see
+//! [`CacheLayout`]) is read from its payload and compared with the
+//! destination's, probed once on its scratch sequence, before the destination
+//! is touched; a range blob is staged in the scratch sequence, where the
+//! backend's own refusal leaves the destination as it was. The model
+//! fingerprint names the weights only, so two engines learn of a layout
+//! mismatch on import. The numbers are the
 //! writer's: a destination continues from cells another backend computed,
 //! which differ from its own by rounding, as any two backends' outputs do.
 //!
@@ -369,6 +372,97 @@ fn one_stream(cache: &[u8]) -> Result<Vec<u8>> {
     Ok(cache[4 + 4 * k..end].to_vec())
 }
 
+/// How one attention cache stores its cells, as its serialized form states it:
+/// whether values are transposed, the rotation dimensions, and per layer the
+/// key and value types with their row (or element) sizes. Two contexts whose
+/// layouts differ cannot read each other's cells; the backend refuses them, but
+/// only once it has emptied the destination sequence, so a whole-sequence
+/// import compares layouts first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLayout {
+    v_trans: bool,
+    n_rot_k: u32,
+    n_rot_v: u32,
+    /// Key type and row size per layer.
+    k: Vec<(i32, u64)>,
+    /// Value type, row size (element size when transposed) and, when
+    /// transposed, the embedding width, per layer that has values.
+    v: Vec<(i32, u64, u32)>,
+}
+
+/// The layout of one stream entry of an attention cache (a cell count, then the
+/// cells), `None` when it holds no cell. Each cell's metadata may carry a fixed
+/// extension (2D positions and the cell's token, 12 bytes), which the entry
+/// does not announce: the size that makes the whole entry parse exactly is the
+/// one.
+fn cache_layout(entry: &[u8]) -> Result<Option<CacheLayout>> {
+    let cells = u32_at(entry, 0).ok_or_else(|| whole_err("attention cache entry without a cell count"))?;
+    if cells == 0 {
+        return Ok(None);
+    }
+    [0usize, 12, 8, 16]
+        .into_iter()
+        .find_map(|ext| layout_with(entry, cells as usize, ext))
+        .map(Some)
+        .ok_or_else(|| whole_err("attention cache entry does not parse as cells of one layout"))
+}
+
+fn layout_with(e: &[u8], cells: usize, ext: usize) -> Option<CacheLayout> {
+    let i32_at = |at: usize| u32_at(e, at).map(|v| v as i32);
+    let u64_at = |at: usize| e.get(at..at + 8).map(|w| u64::from_le_bytes(w.try_into().expect("8 bytes")));
+    let mut at = 4usize;
+    for _ in 0..cells {
+        let n_seq = u32_at(e, at + 4)? as usize;
+        at = at.checked_add(8 + ext + 4 * n_seq)?;
+    }
+    let v_trans = u32_at(e, at)?;
+    let n_layer = u32_at(e, at + 4)? as usize;
+    if v_trans > 1 || n_layer == 0 || n_layer > 4096 {
+        return None;
+    }
+    let (n_rot_k, n_rot_v) = (u32_at(e, at + 8)?, u32_at(e, at + 12)?);
+    at += 16;
+    let ty_ok = |t: i32| (0..256).contains(&t);
+    let mut k = Vec::with_capacity(n_layer);
+    for _ in 0..n_layer {
+        let (ty, row) = (i32_at(at)?, u64_at(at + 4)?);
+        at = at.checked_add(12)?.checked_add(usize::try_from(row).ok()?.checked_mul(cells)?)?;
+        if !ty_ok(ty) || row == 0 || at > e.len() {
+            return None;
+        }
+        k.push((ty, row));
+    }
+    let mut v = Vec::new();
+    while at < e.len() && v.len() < n_layer {
+        let ty = i32_at(at)?;
+        let (size, width, bytes) = if v_trans == 0 {
+            let row = u64_at(at + 4)?;
+            (row, 0, usize::try_from(row).ok()?.checked_mul(cells)?)
+        } else {
+            let (el, width) = (u32_at(e, at + 4)?, u32_at(e, at + 8)?);
+            (u64::from(el), width, (el as usize).checked_mul(width as usize)?.checked_mul(cells)?)
+        };
+        at = at.checked_add(12)?.checked_add(bytes)?;
+        if !ty_ok(ty) || size == 0 || at > e.len() {
+            return None;
+        }
+        v.push((ty, size, width));
+    }
+    (at == e.len()).then_some(CacheLayout { v_trans: v_trans == 1, n_rot_k, n_rot_v, k, v })
+}
+
+/// The layouts of a whole-sequence payload's attention caches, in order, for
+/// those that hold cells.
+fn whole_layouts(payload: &[u8]) -> Result<Vec<CacheLayout>> {
+    let mut out = Vec::new();
+    for (kind, bytes) in whole_parts(payload)? {
+        if kind == PART_ONE_STREAM && let Some(l) = cache_layout(bytes)? {
+            out.push(l);
+        }
+    }
+    Ok(out)
+}
+
 /// Write a whole-sequence payload back in the backend's form for a context of
 /// `streams` attention streams (`None` for a model without an attention cache).
 fn expand_whole(payload: &[u8], streams: Option<u32>) -> Result<Vec<u8>> {
@@ -446,8 +540,8 @@ mod backend {
     use llama_cpp_2::token::LlamaToken;
 
     use super::{
-        DIGEST_LEN, ImportChain, KvBlob, ModelFingerprint, PART_ONE_STREAM, PART_VERBATIM, expand_whole, frame_whole,
-        is_whole_payload, one_stream,
+        CacheLayout, DIGEST_LEN, ImportChain, KvBlob, ModelFingerprint, PART_ONE_STREAM, PART_VERBATIM, expand_whole,
+        frame_whole, is_whole_payload, one_stream, whole_layouts,
     };
     use crate::error::{Error, Result};
 
@@ -580,6 +674,22 @@ mod backend {
         Ok(frame_whole(&parts))
     }
 
+    /// This context's attention cache layouts, read from a few positions
+    /// decoded into the empty scratch sequence and removed again. More than one
+    /// cell, so the cell metadata's size is not left to chance.
+    fn own_layouts(ctx: &mut LlamaContext<'_>, scratch: i32) -> Result<Vec<CacheLayout>> {
+        let bos = ctx.model.token_bos();
+        let token = if bos.0 >= 0 { bos } else { LlamaToken(0) };
+        let mut batch = llama_cpp_2::llama_batch::LlamaBatch::new(4, 1);
+        for pos in 0..4 {
+            batch.add(token, pos, &[scratch], false).map_err(|e| seq_err(e.to_string()))?;
+        }
+        let decoded = ctx.decode(&mut batch).map_err(|e| seq_err(format!("probing the cache layout: {e}")));
+        let state = decoded.and_then(|()| whole_state(ctx, scratch));
+        let _ = ctx.clear_kv_cache_seq(Some(scratch as u32), None, None);
+        whole_layouts(&state?)
+    }
+
     /// Exports one sequence's KV cache incrementally.
     #[derive(Debug, Clone)]
     pub struct SequenceExport {
@@ -667,6 +777,9 @@ mod backend {
         chain: ImportChain,
         seq: i32,
         scratch: i32,
+        /// This context's cache layouts, probed on the first whole-sequence
+        /// blob.
+        layouts: Option<Vec<CacheLayout>>,
     }
 
     impl SequenceImport {
@@ -674,7 +787,7 @@ mod backend {
         /// id. `model` is the fingerprint of the weights this context runs.
         #[must_use]
         pub const fn new(model: ModelFingerprint, seq: i32, scratch: i32) -> Self {
-            Self { chain: ImportChain::new(model), seq, scratch }
+            Self { chain: ImportChain::new(model), seq, scratch, layouts: None }
         }
 
         /// Position the sequence is rebuilt to: the next position to decode.
@@ -706,7 +819,19 @@ mod backend {
             }
             if !blob.tokens.is_empty() && is_whole_payload(&blob.payload) {
                 // The whole sequence, applied in place: the backend empties
-                // the destination sequence first.
+                // the destination sequence first, so a layout it would refuse
+                // is refused here, before that.
+                let theirs = whole_layouts(&blob.payload)?;
+                if self.layouts.is_none() {
+                    self.layouts = Some(own_layouts(ctx, self.scratch)?);
+                }
+                let ours = self.layouts.as_ref().expect("probed above");
+                if &theirs != ours {
+                    return Err(seq_err(format!(
+                        "the blob's KV cache is stored as {theirs:?}, this context's as {ours:?} (cache types or \
+                         flash attention differ); the destination is unchanged"
+                    )));
+                }
                 let bytes = expand_whole(&blob.payload, streams)?;
                 let ok = unsafe { ctx.state_seq_set_data_ext(&bytes, self.seq, LlamaStateSeqFlags::empty()) };
                 let got = (ctx.kv_cache_seq_pos_min(self.seq), ctx.kv_cache_seq_pos_max(self.seq));
@@ -834,6 +959,42 @@ mod tests {
         }
         // A model without an attention cache cannot take one.
         assert!(matches!(expand_whole(&payload, None), Err(Error::KvSequence(_))));
+    }
+
+    /// An attention cache entry of `cells` cells over two layers, keys and
+    /// values of type `ty` with 8-byte rows, cell metadata extended by `ext`.
+    fn entry(cells: u32, ty: i32, ext: usize) -> Vec<u8> {
+        let mut e = cells.to_le_bytes().to_vec();
+        for p in 0..cells {
+            e.extend_from_slice(&p.to_le_bytes());
+            e.extend_from_slice(&1u32.to_le_bytes());
+            e.extend(std::iter::repeat_n(0u8, ext));
+            e.extend_from_slice(&3i32.to_le_bytes());
+        }
+        for w in [0u32, 2, 64, 64] {
+            e.extend_from_slice(&w.to_le_bytes());
+        }
+        for _ in 0..4 {
+            e.extend_from_slice(&ty.to_le_bytes());
+            e.extend_from_slice(&8u64.to_le_bytes());
+            e.extend(std::iter::repeat_n(5u8, 8 * cells as usize));
+        }
+        e
+    }
+
+    #[test]
+    fn a_cache_layout_is_read_from_the_cells_and_compared() {
+        let f16 = cache_layout(&entry(3, 1, 0)).unwrap().unwrap();
+        assert_eq!(f16, cache_layout(&entry(1, 1, 0)).unwrap().unwrap(), "the layout does not depend on the cell count");
+        assert_eq!(f16, cache_layout(&entry(3, 1, 12)).unwrap().unwrap(), "extended cell metadata is found");
+        assert_eq!(f16, cache_layout(&entry(1, 1, 12)).unwrap().unwrap(), "one extended cell is not misread");
+        assert_ne!(f16, cache_layout(&entry(3, 8, 0)).unwrap().unwrap(), "another cache type is another layout");
+        assert_eq!(cache_layout(&0u32.to_le_bytes()).unwrap(), None);
+        let mut cut = entry(3, 1, 0);
+        cut.pop();
+        assert!(cache_layout(&cut).is_err());
+        let payload = frame_whole(&[(PART_VERBATIM, b"head"), (PART_ONE_STREAM, &entry(2, 1, 0))]);
+        assert_eq!(whole_layouts(&payload).unwrap(), vec![f16]);
     }
 
     #[test]
