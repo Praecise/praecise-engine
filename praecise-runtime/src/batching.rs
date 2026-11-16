@@ -2037,7 +2037,19 @@ fn scheduler_loop(
             }
         }
         if let Some(fp) = migration {
-            serve_exports(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, &mut exports, rx, &mut waiting, &resumes, fp, scratch);
+            serve_exports(
+                &mut ctx,
+                &mut draft_ctx,
+                &mut slots,
+                &mut cached,
+                &mut exports,
+                rx,
+                &mut waiting,
+                &resumes,
+                limits.max_slots,
+                fp,
+                scratch,
+            );
         }
 
         // An encoder-decoder model decodes one request at a time.
@@ -2536,6 +2548,7 @@ fn serve_exports(
     rx: &Receiver<Queued>,
     waiting: &mut std::collections::VecDeque<Queued>,
     resumes: &std::collections::VecDeque<(Box<SequenceResume>, u64)>,
+    queue_cap: usize,
     fp: ModelFingerprint,
     scratch: i32,
 ) {
@@ -2547,7 +2560,7 @@ fn serve_exports(
         }
         let ticket = exports[i].ticket;
         let Some(slot_idx) = slots.iter().position(|s| s.as_ref().is_some_and(|s| s.ticket == Some(ticket))) else {
-            if is_queued(ticket, rx, waiting, resumes) {
+            if is_queued(ticket, rx, waiting, resumes, queue_cap) {
                 // Not admitted yet: served once its prompt is in.
                 i += 1;
                 continue;
@@ -2592,24 +2605,29 @@ fn serve_exports(
 /// A ticket is handed out only once its request is in the channel, and an
 /// export of it is sent after that, so a request not yet taken off the
 /// channel when its export is read is still there: it is moved to the waiting
-/// list, in order, to be found.
+/// list, in order, to be found. The waiting list is filled to `cap` at most,
+/// so an export of a ticket that names nothing cannot move the bounded
+/// channel into it; with the list full the answer is "perhaps", and the
+/// export waits for the queue to move.
 fn is_queued(
     ticket: u64,
     rx: &Receiver<Queued>,
     waiting: &mut std::collections::VecDeque<Queued>,
     resumes: &std::collections::VecDeque<(Box<SequenceResume>, u64)>,
+    cap: usize,
 ) -> bool {
     if waiting.iter().any(|q| q.ticket == Some(ticket)) || resumes.iter().any(|r| r.1 == ticket) {
         return true;
     }
-    while let Ok(q) = rx.try_recv() {
+    while waiting.len() < cap {
+        let Ok(q) = rx.try_recv() else { return false };
         let found = q.ticket == Some(ticket);
         waiting.push_back(q);
         if found {
             return true;
         }
     }
-    false
+    true
 }
 
 /// Answer the delta exports of the sequence in `slot_idx`, which has just
@@ -3527,6 +3545,40 @@ mod prefix_tests {
         let seq = slots[chosen].as_ref().expect("installed");
         assert_eq!(seq.seq_id as usize, chosen, "slots[pick].seq_id == pick");
         assert!(slots[0].is_none(), "the first free slot is left free");
+    }
+
+    fn queued(ticket: u64) -> Queued {
+        let (result_tx, _) = tokio::sync::oneshot::channel();
+        let req = BatchRequest {
+            prompt: BatchPrompt::Raw(String::new()),
+            config: GenerationConfig::default(),
+            token_tx: None,
+            result_tx,
+            media: Vec::new(),
+        };
+        Queued { req, ticket: Some(ticket), score: None }
+    }
+
+    #[test]
+    fn an_export_of_a_stale_ticket_moves_no_more_than_the_queue_limit() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(4);
+        for t in 1..=4 {
+            tx.send(queued(t)).unwrap();
+        }
+        let mut waiting = std::collections::VecDeque::new();
+        let resumes = std::collections::VecDeque::new();
+        // A ticket that names nothing: the waiting list stops at the limit and
+        // the answer is to wait, not to drain the channel.
+        assert!(is_queued(99, &rx, &mut waiting, &resumes, 2));
+        assert_eq!(waiting.len(), 2);
+        assert!(is_queued(99, &rx, &mut waiting, &resumes, 2), "still full: still waits");
+        assert_eq!(waiting.len(), 2);
+        // A real ticket further back is found once there is room.
+        assert!(is_queued(3, &rx, &mut waiting, &resumes, 8));
+        assert_eq!(waiting.len(), 3);
+        // With the channel empty a ticket that names nothing is refused.
+        assert!(is_queued(4, &rx, &mut waiting, &resumes, 8));
+        assert!(!is_queued(99, &rx, &mut waiting, &resumes, 8));
     }
 
     #[test]

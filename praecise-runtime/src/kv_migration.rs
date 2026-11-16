@@ -50,6 +50,30 @@
 //! recurrent layers where the attention uses a sliding window. Its state is not
 //! split here into its parts, and is refused.
 //!
+//! ## What a blob proves
+//!
+//! The digest proves a blob arrived as written, the fingerprint names the
+//! weights it claims, and the chain proves order: each blob names its
+//! predecessor, so the token history of a rebuilt sequence is exactly the
+//! concatenation of the chain's token lists. Nothing binds the cache *values*
+//! to those tokens: they are the writer's computation, taken on trust, in a
+//! range blob as in a whole one. A whole-sequence blob carries the cells of
+//! every position, so applying it replaces the prefix earlier blobs set with
+//! the writer's cells for it; it is refused unless its cells cover exactly the
+//! chain's positions `0 .. end`, and since its token list names only its new
+//! positions, the prefix tokens it continues are those the chain already
+//! applied. A receiver that must not trust the writer recomputes instead.
+//!
+//! ## Size
+//!
+//! A whole-sequence blob grows with the sequence: measured, 112 KiB per
+//! position on a 0.6B dense model with an f16 cache (3.4 MB for a 30-position
+//! prompt, about 0.9 GB at 8192 positions), and 12 KiB per position plus a
+//! fixed 20 MB of recurrent state on a 0.8B hybrid model. A chain of exports
+//! of one running sequence sends the whole sequence each time, so its total
+//! is the sum over its exports. A checkpoint taken from a request of its own
+//! is one blob; a long chain costs a multiple of that.
+//!
 //! ## Across backends
 //!
 //! A payload does not depend on the backend that wrote it. The backend copies
@@ -286,6 +310,11 @@ impl KvBlob {
         if base_pos.checked_add(n_tokens as u32).is_none() {
             return Err(bad("position range overflow"));
         }
+        // Whole-sequence payloads came with version 2; a version 1 blob that
+        // claims one was not written by any build.
+        if version < 2 && is_whole_payload(&payload) {
+            return Err(bad("a version 1 blob cannot carry a whole-sequence payload"));
+        }
         Ok(Self { model: ModelFingerprint(model), prev_digest, base_pos, tokens, payload })
     }
 }
@@ -451,6 +480,13 @@ fn layout_with(e: &[u8], cells: usize, ext: usize) -> Option<CacheLayout> {
     (at == e.len()).then_some(CacheLayout { v_trans: v_trans == 1, n_rot_k, n_rot_v, k, v })
 }
 
+/// How many cells the first attention cache of a whole-sequence payload holds:
+/// the full-attention cache, one cell per position. `None` without one.
+fn whole_cells(payload: &[u8]) -> Result<Option<u32>> {
+    let first = whole_parts(payload)?.into_iter().find(|p| p.0 == PART_ONE_STREAM);
+    first.map(|(_, e)| u32_at(e, 0).ok_or_else(|| whole_err("attention cache entry without a cell count"))).transpose()
+}
+
 /// The layouts of a whole-sequence payload's attention caches, in order, for
 /// those that hold cells.
 fn whole_layouts(payload: &[u8]) -> Result<Vec<CacheLayout>> {
@@ -541,7 +577,7 @@ mod backend {
 
     use super::{
         CacheLayout, DIGEST_LEN, ImportChain, KvBlob, ModelFingerprint, PART_ONE_STREAM, PART_VERBATIM, expand_whole,
-        frame_whole, is_whole_payload, one_stream, whole_layouts,
+        frame_whole, is_whole_payload, one_stream, whole_cells, whole_layouts,
     };
     use crate::error::{Error, Result};
 
@@ -821,6 +857,14 @@ mod backend {
                 // The whole sequence, applied in place: the backend empties
                 // the destination sequence first, so a layout it would refuse
                 // is refused here, before that.
+                let covered = whole_cells(&blob.payload)?;
+                if covered.is_some_and(|n| n != blob.end_pos()) {
+                    return Err(seq_err(format!(
+                        "the whole-sequence payload holds {} cells for positions 0..{}; the destination is unchanged",
+                        covered.unwrap_or(0),
+                        blob.end_pos()
+                    )));
+                }
                 let theirs = whole_layouts(&blob.payload)?;
                 if self.layouts.is_none() {
                     self.layouts = Some(own_layouts(ctx, self.scratch)?);
@@ -995,6 +1039,65 @@ mod tests {
         assert!(cache_layout(&cut).is_err());
         let payload = frame_whole(&[(PART_VERBATIM, b"head"), (PART_ONE_STREAM, &entry(2, 1, 0))]);
         assert_eq!(whole_layouts(&payload).unwrap(), vec![f16]);
+    }
+
+    /// Arbitrary bytes and every single-byte change of valid input are refused
+    /// or read, never a panic or an allocation sized from untrusted counts.
+    #[test]
+    fn decoding_never_panics_on_arbitrary_input() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let whole = frame_whole(&[(PART_VERBATIM, b"head"), (PART_ONE_STREAM, &entry(2, 1, 0))]);
+        let good = KvBlob { payload: whole.clone(), ..blob(1, 0, 2, [0; 32]) }.encode();
+        let check = |b: &[u8]| {
+            let _ = KvBlob::decode(b);
+            let _ = whole_parts(b);
+            let _ = one_stream(b);
+            let _ = cache_layout(b);
+            let _ = whole_layouts(b);
+            let _ = whole_cells(b);
+            let _ = expand_whole(b, Some(3));
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 160) as usize;
+            let mut b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            if next() % 2 == 0 && b.len() >= 4 {
+                b[..4].copy_from_slice(WHOLE_MAGIC);
+            }
+            check(&b);
+        }
+        for src in [&good, &whole] {
+            for i in 0..src.len() {
+                let mut b = src.clone();
+                b[i] ^= 1 << (next() % 8);
+                check(&b);
+                check(&src[..i]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_payload_is_refused_in_a_version_1_blob() {
+        let whole = frame_whole(&[(PART_ONE_STREAM, &entry(2, 1, 0))]);
+        let mut enc = KvBlob { payload: whole, ..blob(1, 0, 2, [0; 32]) }.encode();
+        assert!(KvBlob::decode(&enc).is_ok());
+        enc[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let body = enc.len() - 32;
+        let digest = Sha256::digest(&enc[..body]);
+        enc[body..].copy_from_slice(&digest);
+        assert!(matches!(KvBlob::decode(&enc), Err(Error::KvBlob(_))));
+        // A version 1 range blob is still read.
+        let mut v1 = blob(1, 0, 2, [0; 32]).encode();
+        v1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let n = v1.len();
+        let digest = Sha256::digest(&v1[..n - 32]);
+        v1[n - 32..].copy_from_slice(&digest);
+        assert!(KvBlob::decode(&v1).is_ok());
     }
 
     #[test]
