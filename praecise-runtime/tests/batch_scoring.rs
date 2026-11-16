@@ -94,6 +94,11 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
     assert!(!verify_commitment_with(&commitment, &rows, &strict).pass, "{var}");
 
     assert!(engine.score_continuation(BatchPrompt::Raw(PROMPT.into()), &[], 8).is_err(), "{var}: empty continuation");
+    for bad in [-1, i32::MAX] {
+        assert!(engine.score_continuation(BatchPrompt::Raw(PROMPT.into()), &[bad], 8).is_err(), "{var}: token {bad}");
+    }
+    let empty = engine.score_continuation(BatchPrompt::Raw(String::new()), &tokens[..1], 8).unwrap().blocking_recv().unwrap();
+    assert!(empty.is_err(), "{var}: an empty prompt is refused with a reason");
     busy.blocking_recv().unwrap().expect("the neighbouring request finishes");
     engine.shutdown();
 }

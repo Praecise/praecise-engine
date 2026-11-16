@@ -23,8 +23,8 @@ fn two_engines_of_one_process_run_with_their_own_slot_counts() {
     backend.void_logs();
     let backend = Arc::new(backend);
     let spawn = |slots: usize| {
-        let limits = BatchLimits { physical_batch: 256, prompt_checkpoints: 0, ..BatchLimits::default() }
-            .with_max_slots(slots);
+        let limits =
+            BatchLimits::default().with_physical_batch(256).with_prompt_checkpoints(0).with_max_slots(slots);
         BatchEngine::spawn_with_limits("m".into(), load(&backend, &path), backend.clone(), 512, false, None, None, None, limits)
             .expect("spawn")
     };

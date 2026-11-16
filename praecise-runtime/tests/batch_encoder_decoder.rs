@@ -34,7 +34,7 @@ fn an_encoder_decoder_model_is_served_from_one_slot() {
     let backend = Arc::new(backend);
     let model = LlamaModel::load_from_file(&backend, &path, &LlamaModelParams::default().with_n_gpu_layers(0)).expect("load");
     assert!(model.has_encoder() && model.has_decoder(), "not an encoder-decoder model");
-    let limits = BatchLimits { physical_batch: 64, ..BatchLimits::default() }.with_max_slots(8);
+    let limits = BatchLimits::default().with_physical_batch(64).with_max_slots(8);
     let engine =
         BatchEngine::spawn_with_limits("m".into(), model, backend.clone(), 512, false, None, None, None, limits).expect("spawn");
 

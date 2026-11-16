@@ -149,7 +149,11 @@ fn physical_batch() -> usize {
 /// environment, else the built-in defaults. Engines spawned without limits
 /// keep that behaviour; [`BatchEngine::spawn_with_limits`] gives one engine
 /// its own.
+///
+/// Built from [`BatchLimits::from_env`] or [`Default`] and the `with_*`
+/// methods, so a limit added later does not break a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BatchLimits {
     /// Most sequence slots (`n_seq_max`), at least one; memory may fit fewer
     /// (see [`BatchEngine::slots`]). It also bounds the requests waiting for
@@ -187,6 +191,36 @@ impl BatchLimits {
     #[must_use]
     pub fn with_max_slots(mut self, max_slots: usize) -> Self {
         self.max_slots = max_slots;
+        self
+    }
+
+    /// These limits with a physical batch of `physical_batch`.
+    #[must_use]
+    pub fn with_physical_batch(mut self, physical_batch: usize) -> Self {
+        self.physical_batch = physical_batch;
+        self
+    }
+
+    /// These limits with at most `prompt_checkpoints` checkpoints per slot.
+    #[must_use]
+    pub fn with_prompt_checkpoints(mut self, prompt_checkpoints: usize) -> Self {
+        self.prompt_checkpoints = prompt_checkpoints;
+        self
+    }
+
+    /// These limits with `bytes` for prompt checkpoints, or the host's
+    /// measure for `None`.
+    #[must_use]
+    pub fn with_checkpoint_memory(mut self, bytes: Option<u64>) -> Self {
+        self.checkpoint_memory = bytes;
+        self
+    }
+
+    /// These limits with `bytes` for the KV cache, or the device's measure
+    /// for `None`.
+    #[must_use]
+    pub fn with_kv_memory(mut self, bytes: Option<u64>) -> Self {
+        self.kv_memory = bytes;
         self
     }
 
@@ -393,6 +427,8 @@ struct EngineInner {
     next_ticket: std::sync::atomic::AtomicU64,
     /// Requests that may wait for a slot: the engine's slot limit.
     queue_cap: usize,
+    /// The model's vocabulary size, to check token ids a caller passes.
+    n_vocab: i32,
     /// Sequences this engine serves at once: [`max_slots`] at most, fewer when
     /// that many whole contexts do not fit (see [`fit_slots`]).
     slots: Arc<std::sync::atomic::AtomicUsize>,
@@ -578,8 +614,12 @@ impl BatchEngine {
         // Read before the model moves onto the scheduler thread. A model
         // without a template still serves raw prompts.
         let chat_template = crate::chat_format::ChatTemplateSource::from_model(&model).ok();
+        let n_vocab = model.n_vocab();
         let model_id_thread = model_id.clone();
-        let slots = Arc::new(std::sync::atomic::AtomicUsize::new(limits.max_slots));
+        // An encoder-decoder model runs one sequence whatever the limit (see
+        // the scheduler), and says so from the start.
+        let initial = if traits.reuse() == Reuse::EncoderOutput { 1 } else { limits.max_slots };
+        let slots = Arc::new(std::sync::atomic::AtomicUsize::new(initial));
         let slots_thread = slots.clone();
         let handle = std::thread::Builder::new()
             .name(format!("batch-{}", model_id))
@@ -620,6 +660,7 @@ impl BatchEngine {
                 chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
                 queue_cap: limits.max_slots,
+                n_vocab,
                 slots,
             }),
         })
@@ -649,6 +690,7 @@ impl BatchEngine {
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
         let (control_tx, _control_rx) = std::sync::mpsc::channel::<Control>();
         let chat_template = crate::chat_format::ChatTemplateSource::from_model(&model).ok();
+        let n_vocab = model.n_vocab();
         let model_id_thread = model_id.clone();
         let handle = std::thread::Builder::new()
             .name(format!("denoise-{model_id}"))
@@ -680,6 +722,7 @@ impl BatchEngine {
                 chat_template,
                 next_ticket: std::sync::atomic::AtomicU64::new(1),
                 queue_cap: limits.max_slots,
+                n_vocab,
                 slots: Arc::new(std::sync::atomic::AtomicUsize::new(limits.max_slots)),
             }),
         })
@@ -748,6 +791,14 @@ impl BatchEngine {
     ) -> Result<tokio::sync::oneshot::Receiver<Result<ScoreRows>>> {
         if continuation.is_empty() || k == 0 {
             return Err(Error::Other("scoring needs a continuation of at least one token and k of at least 1".into()));
+        }
+        // An id outside the vocabulary would fail the whole decode step, and
+        // with it every other sequence in that step.
+        if let Some(bad) = continuation.iter().find(|&&t| t < 0 || t >= self.inner.n_vocab) {
+            return Err(Error::Other(format!(
+                "continuation token {bad} is outside the vocabulary of {} tokens",
+                self.inner.n_vocab
+            )));
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -1316,12 +1367,22 @@ impl Sequence {
 
     /// Append a continuation to score to the staged prompt. Returns the
     /// prompt position whose logits score its first token, which is as far as
-    /// the slot's cache may be reused; the job back when it does not fit.
-    fn start_scoring(&mut self, job: ScoreJob, ctx_size: i32) -> std::result::Result<usize, ScoreJob> {
-        let Some(prompt) = self.pending_prompt.as_mut() else { return Err(job) };
-        let from = prompt.len() - 1;
+    /// the slot's cache may be reused; the job back, with the reason, when it
+    /// cannot be scored.
+    fn start_scoring(&mut self, job: ScoreJob, ctx_size: i32) -> std::result::Result<usize, (ScoreJob, String)> {
+        // Media positions are not tokens: the rows would not line up with the
+        // continuation's positions.
+        if self.multimodal || !self.media_spans.is_empty() {
+            return Err((job, "a prompt holding media cannot be scored".into()));
+        }
+        let Some(prompt) = self.pending_prompt.as_mut() else {
+            return Err((job, "the prompt was not staged".into()));
+        };
+        let Some(from) = prompt.len().checked_sub(1) else {
+            return Err((job, "empty prompt".into()));
+        };
         if prompt.len() + job.continuation.len() >= ctx_size as usize {
-            return Err(job);
+            return Err((job, format!("prompt and continuation do not fit the context window {ctx_size}")));
         }
         prompt.extend_from_slice(&job.continuation);
         self.prompt_ids.extend(job.continuation.iter().map(|t| crate::prefix_cache::text_id(t.0)));
@@ -2169,11 +2230,9 @@ fn scheduler_loop(
                 if let Some(job) = score {
                     match slots[reuse_slot].as_mut().map(|seq| seq.start_scoring(job, ctx_size)) {
                         Some(Ok(from)) => r.shared = r.shared.min(from),
-                        Some(Err(job)) => {
+                        Some(Err((job, why))) => {
                             slots[reuse_slot] = None;
-                            let _ = job.reply.send(Err(Error::Inference(format!(
-                                "prompt and continuation do not fit the context window {ctx_size}"
-                            ))));
+                            let _ = job.reply.send(Err(Error::Inference(why)));
                             continue;
                         }
                         None => {}
@@ -2181,6 +2240,11 @@ fn scheduler_loop(
                 }
                 let held = apply_prefix_reuse(&mut ctx, &mut slots, &mut cached, &policy, r);
                 draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held as u32));
+            } else if let Some(job) = score {
+                // Refused at admission (an empty or unrenderable prompt, one
+                // past the context): the reason went to the request's own
+                // result, which nobody reads for a score.
+                let _ = job.reply.send(Err(Error::Inference("the prompt could not be admitted for scoring".into())));
             }
         }
 
