@@ -15,6 +15,11 @@
 //! `model_digest`, `build`, `shape` and `hardware`. Latency here is the
 //! engine's generation time, which excludes queue wait. On the shared Spark,
 //! follow the host rules (capped wrapper, memory floor, GPU lock) before running.
+//!
+//! `PRAECISE_TEST_THROUGHPUT_DRAFT` drafts speculatively: `mtp:<n>` with the
+//! model's own MTP head, `dflash:<n>:<drafter gguf>` with a block drafter, each
+//! drafting at most `n` tokens per step. Run once with and once without to
+//! compare.
 #![cfg(feature = "bundled-llama")]
 
 mod common;
@@ -25,7 +30,8 @@ use std::time::Instant;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
 use praecise_runtime::concurrency_sweep::{score_level, Attempt, LevelRun, LlmGate, Payload, Report, RunPin, SweepPlan};
-use praecise_runtime::{BatchEngine, BatchPrompt, BatchRequest, ChatMessage, GenerationConfig};
+use praecise_runtime::batching::BatchSpeculation;
+use praecise_runtime::{BatchEngine, BatchLimits, BatchPrompt, BatchRequest, ChatMessage, GenerationConfig};
 use tokio::sync::oneshot;
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -47,7 +53,30 @@ fn decode_throughput_by_concurrency() {
     backend.void_logs();
     let backend = Arc::new(backend);
     let model = LlamaModel::load_from_file(&backend, &path, &common::params()).expect("load model");
-    let engine = BatchEngine::spawn("throughput".into(), model, backend.clone(), ctx, false).expect("engine");
+    let draft = std::env::var("PRAECISE_TEST_THROUGHPUT_DRAFT").unwrap_or_default();
+    let speculation = match draft.split(':').collect::<Vec<_>>().as_slice() {
+        [] | [""] => None,
+        ["mtp", n] => Some(BatchSpeculation { spec_type: 0, n_max: n.parse().expect("draft length"), draft_model: None }),
+        ["dflash", n, drafter] => Some(BatchSpeculation {
+            spec_type: 1,
+            n_max: n.parse().expect("draft length"),
+            draft_model: Some(LlamaModel::load_from_file(&backend, drafter, &common::params()).expect("load drafter")),
+        }),
+        other => panic!("PRAECISE_TEST_THROUGHPUT_DRAFT: mtp:<n> or dflash:<n>:<path>, not {other:?}"),
+    };
+    eprintln!("drafting: {}", if draft.is_empty() { "off" } else { &draft });
+    let engine = BatchEngine::spawn_with_limits(
+        "throughput".into(),
+        model,
+        backend.clone(),
+        ctx,
+        false,
+        None,
+        speculation,
+        None,
+        BatchLimits::default(),
+    )
+    .expect("engine");
     let sweep = std::env::var("PRAECISE_TEST_THROUGHPUT_SWEEP").is_ok_and(|v| v == "1");
     let mut scored = vec![];
     for n in levels {
