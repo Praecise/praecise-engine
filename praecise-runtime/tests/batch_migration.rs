@@ -50,6 +50,17 @@ fn request(
     (req, result_rx)
 }
 
+/// The process's one backend; a second `init` while one lives is refused.
+fn shared_backend() -> Arc<LlamaBackend> {
+    static B: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let mut backend = LlamaBackend::init().expect("backend");
+        backend.void_logs();
+        Arc::new(backend)
+    })
+    .clone()
+}
+
 fn load(backend: &LlamaBackend, path: &str) -> LlamaModel {
     LlamaModel::load_from_file(backend, path, &LlamaModelParams::default().with_n_gpu_layers(0)).expect("load")
 }
@@ -244,6 +255,94 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
     dst.shutdown();
 }
 
+/// A session checkpoint: the prompt exported from a request that ends in the
+/// step that samples its first token, and from one still waiting for a slot.
+fn checkpoint(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
+    let fp = ModelFingerprint::of_file(path).expect("fingerprint");
+    let src = engine(backend, path, fp);
+    let dst = engine(backend, path, fp);
+
+    let (req, rx) = request(PROMPT, greedy(MAX_TOKENS), None);
+    dst.submit(req).expect("submit");
+    let reference = rx.blocking_recv().unwrap().expect("reference");
+    let ref_steps = steps(&reference).to_vec();
+    let prompt_len = reference.input_tokens as usize;
+
+    // One token: the request is freed in the step that samples it, and the
+    // export asked for at once is answered from it before the slot is freed.
+    let (req, one) = request(PROMPT, greedy(1), None);
+    let ticket = src.submit_tracked(req).expect("submit tracked");
+    let blob = src.export_sequence(ticket).unwrap().blocking_recv().unwrap().expect("export at the free");
+    let one = one.blocking_recv().unwrap().expect("the request finishes normally");
+    assert_eq!(steps(&one)[0].token_id, ref_steps[0].token_id, "{var}");
+    let k = KvBlob::decode(&blob).unwrap();
+    assert_eq!((k.base_pos, k.tokens.len()), (0, prompt_len), "{var}: the checkpoint is the prompt");
+    // Once it has gone, the ticket names nothing.
+    assert!(src.export_sequence(ticket).unwrap().blocking_recv().unwrap().is_err(), "{var}");
+
+    // The checkpoint continues on another engine as the uninterrupted run does.
+    let (result_tx, resumed_rx) = oneshot::channel();
+    dst.resume(SequenceResume {
+        blobs: vec![blob],
+        next_token: ref_steps[0].token_id as i32,
+        generated: String::new(),
+        config: greedy(MAX_TOKENS - 1),
+        token_tx: None,
+        result_tx,
+    })
+    .expect("resume");
+    let resumed = resumed_rx.blocking_recv().unwrap().expect("resumed from the checkpoint");
+    assert_eq!(resumed.cached_tokens, resumed.input_tokens, "{var}: nothing was prefilled again");
+    assert_eq!(
+        steps(&resumed).iter().map(|s| s.token_id).collect::<Vec<_>>(),
+        ref_steps[1..].iter().map(|s| s.token_id).collect::<Vec<_>>(),
+        "{var}: the continuation differs from the uninterrupted run"
+    );
+
+    // Every slot busy: the tracked request waits for one, and so does its
+    // export instead of being refused. Each busy request has streamed a chunk,
+    // so all are in slots and the queue is free for the tracked one.
+    let busy: Vec<_> = (0..src.slots())
+        .map(|_| {
+            let (tx, mut chunks) = mpsc::channel(256);
+            let (req, rx) = request(OTHER, greedy(60), Some(tx));
+            src.submit(req).expect("submit busy");
+            take_chunks(&mut chunks, 1);
+            (rx, chunks)
+        })
+        .collect();
+    let (req, queued) = request(PROMPT, greedy(1), None);
+    let ticket = src.submit_tracked(req).expect("submit tracked behind full slots");
+    let blob = src.export_sequence(ticket).unwrap().blocking_recv().unwrap().expect("export of a queued ticket");
+    let k = KvBlob::decode(&blob).unwrap();
+    assert_eq!((k.base_pos, k.tokens.len()), (0, prompt_len), "{var}");
+    queued.blocking_recv().unwrap().expect("the queued request finishes");
+    for (rx, chunks) in busy {
+        drop(chunks);
+        // A busy request whose stream is dropped ends as a client gone.
+        let _ = rx.blocking_recv();
+    }
+    eprintln!("{var}: prompt checkpoint of {prompt_len} positions, {} bytes", blob.len());
+    src.shutdown();
+    dst.shutdown();
+}
+
+#[test]
+#[ignore = "needs a GGUF: PRAECISE_TEST_KV_MODEL or PRAECISE_TEST_HYBRID_MODEL"]
+fn a_prompt_checkpoint_is_exported_when_the_first_token_ends_the_request_or_it_is_still_queued() {
+    // SAFETY: set before this test binary starts any other thread.
+    unsafe { std::env::set_var("BATCH_MAX_SLOTS", "4") };
+    let models: Vec<(&str, String)> = ["PRAECISE_TEST_KV_MODEL", "PRAECISE_TEST_HYBRID_MODEL"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok().map(|p| (var, p)))
+        .collect();
+    assert!(!models.is_empty(), "set PRAECISE_TEST_KV_MODEL or PRAECISE_TEST_HYBRID_MODEL");
+    let backend = shared_backend();
+    for (var, path) in models {
+        checkpoint(var, &path, &backend);
+    }
+}
+
 #[test]
 #[ignore = "needs a GGUF: PRAECISE_TEST_KV_MODEL or PRAECISE_TEST_HYBRID_MODEL"]
 fn a_running_sequence_moves_to_another_engine_and_continues_where_it_stopped() {
@@ -255,9 +354,7 @@ fn a_running_sequence_moves_to_another_engine_and_continues_where_it_stopped() {
         .filter_map(|var| std::env::var(var).ok().map(|p| (var, p)))
         .collect();
     assert!(!models.is_empty(), "set PRAECISE_TEST_KV_MODEL or PRAECISE_TEST_HYBRID_MODEL");
-    let mut backend = LlamaBackend::init().expect("backend");
-    backend.void_logs();
-    let backend = Arc::new(backend);
+    let backend = shared_backend();
     for (var, path) in models {
         run(var, &path, &backend);
     }

@@ -575,10 +575,18 @@ impl BatchEngine {
     /// boundary where the sequence is exportable (see the module docs), and
     /// the other slots are not paused beyond the copy.
     ///
+    /// An export of a request still waiting for a slot waits with it. Asked
+    /// for right after [`submit_tracked`](Self::submit_tracked), the first blob
+    /// holds exactly the prompt: it is taken once the prompt is in, and when
+    /// the first sampled token ends the request, it is taken from the finished
+    /// sequence before its slot is freed. A request with `max_tokens: 1` is
+    /// therefore a prefill whose prompt is exported.
+    ///
     /// # Errors
     /// Immediately when the engine cannot migrate; through the receiver when
-    /// no running sequence holds the ticket (it finished, failed or was
-    /// detached), when it holds media positions, or when the backend refuses.
+    /// no running or waiting sequence holds the ticket (it finished, failed or
+    /// was detached before the export reached the engine), when it holds media
+    /// positions, or when the backend refuses.
     pub fn export_sequence(
         &self,
         ticket: SequenceTicket,
@@ -1091,6 +1099,20 @@ impl Sequence {
             && self.forced.is_empty()
             && !self.rollback_pending
             && self.n_past as usize == self.resident.len()
+    }
+
+    /// Whether a sequence that has just finished can still be exported: the
+    /// prompt is in, the cache holds exactly `resident`, and no recurrent
+    /// rollback is waiting on a decode that will not come. Its last sampled
+    /// token, the one that ended it, never reached the cache.
+    fn exportable_at_end(&self) -> bool {
+        self.pending_prompt.is_none() && !self.rollback_pending && self.n_past as usize == self.resident.len()
+    }
+
+    /// Export the positions gained since this sequence's previous export.
+    fn export_delta(&mut self, ctx: &mut llama_cpp_2::context::LlamaContext, fp: ModelFingerprint, scratch: i32) -> Result<Vec<u8>> {
+        let seq_id = self.seq_id;
+        self.exporter.get_or_insert_with(|| SequenceExport::new(fp, seq_id, scratch)).export(ctx, &self.resident)
     }
 
     /// Close this sequence's stream for a handoff and tell its caller.
@@ -1808,7 +1830,7 @@ fn scheduler_loop(
             }
         }
         if let Some(fp) = migration {
-            serve_exports(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, &mut exports, fp, scratch);
+            serve_exports(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, &mut exports, rx, &mut waiting, &resumes, fp, scratch);
         }
 
         // An encoder-decoder model decodes one request at a time.
@@ -2150,6 +2172,15 @@ fn scheduler_loop(
                 done
             };
             if done {
+                if let Some(fp) = migration {
+                    while let Ok(c) = control_rx.try_recv() {
+                        match c {
+                            Control::Export(e) => exports.push(e),
+                            Control::Resume(r, ticket) => resumes.push_back((r, ticket)),
+                        }
+                    }
+                    serve_at_end(&mut ctx, &mut slots, slot_idx, &mut exports, fp, scratch);
+                }
                 finalize_and_free(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, policy.kind, slot_idx, &mut draining);
             }
         }
@@ -2238,6 +2269,9 @@ fn serve_exports(
     slots: &mut [Option<Sequence>],
     cached: &mut [CachedPrefix],
     exports: &mut Vec<PendingExport>,
+    rx: &Receiver<Queued>,
+    waiting: &mut std::collections::VecDeque<Queued>,
+    resumes: &std::collections::VecDeque<(Box<SequenceResume>, u64)>,
     fp: ModelFingerprint,
     scratch: i32,
 ) {
@@ -2249,6 +2283,11 @@ fn serve_exports(
         }
         let ticket = exports[i].ticket;
         let Some(slot_idx) = slots.iter().position(|s| s.as_ref().is_some_and(|s| s.ticket == Some(ticket))) else {
+            if is_queued(ticket, rx, waiting, resumes) {
+                // Not admitted yet: served once its prompt is in.
+                i += 1;
+                continue;
+            }
             exports.remove(i).reply.fail(Error::KvSequence(format!(
                 "no running sequence holds ticket {ticket}: it finished, failed or was handed off"
             )));
@@ -2265,11 +2304,7 @@ fn serve_exports(
             i += 1;
             continue;
         }
-        let seq_id = seq.seq_id;
-        let blob = seq
-            .exporter
-            .get_or_insert_with(|| SequenceExport::new(fp, seq_id, scratch))
-            .export(ctx, &seq.resident);
+        let blob = seq.export_delta(ctx, fp, scratch);
         match (exports.remove(i).reply, blob) {
             (ExportReply::Delta(tx), blob) => {
                 let _ = tx.send(blob);
@@ -2284,6 +2319,67 @@ fn serve_exports(
                 cached[slot_idx].forget();
                 let _ = tx.send(Ok(seq.hand_off(blob)));
             }
+        }
+    }
+}
+
+/// Whether a ticket names a request or a resume that is waiting for a slot.
+///
+/// A ticket is handed out only once its request is in the channel, and an
+/// export of it is sent after that, so a request not yet taken off the
+/// channel when its export is read is still there: it is moved to the waiting
+/// list, in order, to be found.
+fn is_queued(
+    ticket: u64,
+    rx: &Receiver<Queued>,
+    waiting: &mut std::collections::VecDeque<Queued>,
+    resumes: &std::collections::VecDeque<(Box<SequenceResume>, u64)>,
+) -> bool {
+    if waiting.iter().any(|q| q.ticket == Some(ticket)) || resumes.iter().any(|r| r.1 == ticket) {
+        return true;
+    }
+    while let Ok(q) = rx.try_recv() {
+        let found = q.ticket == Some(ticket);
+        waiting.push_back(q);
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Answer the delta exports of the sequence in `slot_idx`, which has just
+/// finished, from its final state, before its slot is freed. A request whose
+/// first sampled token ends it is freed in the step that samples it, so this is
+/// the only boundary where its prompt can be exported. A handoff of a finished
+/// sequence is left to be refused: there is nothing left to continue.
+fn serve_at_end(
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    slots: &mut [Option<Sequence>],
+    slot_idx: usize,
+    exports: &mut Vec<PendingExport>,
+    fp: ModelFingerprint,
+    scratch: i32,
+) {
+    let Some(seq) = slots[slot_idx].as_mut() else { return };
+    let Some(ticket) = seq.ticket else { return };
+    let mut i = 0;
+    while i < exports.len() {
+        if exports[i].ticket != ticket || !matches!(exports[i].reply, ExportReply::Delta(_)) {
+            i += 1;
+            continue;
+        }
+        let blob = if seq.multimodal {
+            Err(Error::KvSequence("a sequence holding media positions cannot be exported".into()))
+        } else if !seq.exportable_at_end() {
+            Err(Error::KvSequence(format!(
+                "ticket {ticket} finished at a point where its cache cannot be copied"
+            )))
+        } else {
+            seq.export_delta(ctx, fp, scratch)
+        };
+        if let ExportReply::Delta(tx) = exports.remove(i).reply {
+            let _ = tx.send(blob);
         }
     }
 }
