@@ -59,6 +59,19 @@ impl ChatTemplateSource {
         }
     }
 
+    /// Whether the source is the name of a template llama.cpp renders itself
+    /// (see [`llama_cpp_2::model::chat_builtin_templates`]) rather than
+    /// template text: a model file may name its template instead of carrying
+    /// it. Such a source renders through the built-in path, which takes
+    /// messages only: no tools, template variables or thinking switch.
+    #[must_use]
+    pub fn is_builtin_name(&self) -> bool {
+        static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let name = self.template.trim();
+        !name.is_empty()
+            && NAMES.get_or_init(llama_cpp_2::model::chat_builtin_templates).iter().any(|n| n == name)
+    }
+
     /// The template a GGUF model carries, with its vocabulary's special tokens.
     ///
     /// # Errors
@@ -204,6 +217,15 @@ impl ChatFormat {
             Some(Value::Array(tools)) if !tools.is_empty() => Some(serde_json::to_string(tools)?),
             _ => None,
         };
+        // A template named rather than written out is rendered by llama.cpp
+        // itself; read as Jinja, the name would be the whole prompt.
+        let builtin = source.is_builtin_name();
+        if builtin && tools_json.is_some() {
+            return Err(Error::ChatFormat(format!(
+                "the built-in chat template {:?} cannot render tools",
+                source.template.trim()
+            )));
+        }
         let kwargs_json = turn
             .template_kwargs
             .map(serde_json::to_string)
@@ -217,7 +239,7 @@ impl ChatFormat {
             reasoning_format: Some("auto"),
             chat_template_kwargs: kwargs_json.as_deref(),
             add_generation_prompt: turn.add_generation_prompt,
-            use_jinja: true,
+            use_jinja: !builtin,
             parallel_tool_calls: turn.parallel_tool_calls,
             enable_thinking: turn.enable_thinking,
             add_bos: false,
@@ -225,8 +247,9 @@ impl ChatFormat {
             parse_tool_calls: tools_json.is_some(),
             force_pure_content: turn.force_pure_content,
         };
+        let template = if builtin { source.template.trim() } else { source.template.as_str() };
         let render = llama_cpp_2::model::apply_chat_template_source_oaicompat(
-            &source.template,
+            template,
             &source.bos_token,
             &source.eos_token,
             &params,

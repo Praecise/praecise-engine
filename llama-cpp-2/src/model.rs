@@ -1203,6 +1203,23 @@ impl LlamaModel {
     }
 }
 
+/// The names of the chat templates llama.cpp renders itself, without Jinja
+/// (`chatml`, `llama3`, ...). A model file may name one of these in place of
+/// carrying template text.
+#[must_use]
+pub fn chat_builtin_templates() -> Vec<String> {
+    let n = unsafe { llama_cpp_sys_2::llama_chat_builtin_templates(std::ptr::null_mut(), 0) };
+    let Ok(n) = usize::try_from(n) else { return Vec::new() };
+    let mut names: Vec<*const std::os::raw::c_char> = vec![std::ptr::null(); n];
+    let got = unsafe { llama_cpp_sys_2::llama_chat_builtin_templates(names.as_mut_ptr(), n) };
+    names.truncate(usize::try_from(got).unwrap_or(0).min(n));
+    names
+        .into_iter()
+        .filter(|p| !p.is_null())
+        .map(|p| unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Apply a chat template given as source text, without a loaded model, using
 /// OpenAI-compatible JSON messages. `bos_token` and `eos_token` are the text
 /// the template sees for those variables. The rendered prompt keeps any

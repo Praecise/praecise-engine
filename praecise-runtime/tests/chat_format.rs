@@ -454,3 +454,22 @@ fn streamed_channel_reply_carries_no_markup() {
     assert_eq!(content, "Hello, world!");
     assert!(calls.is_empty());
 }
+
+#[test]
+fn a_template_named_by_the_model_renders_through_the_built_in_path() {
+    let messages = user();
+    let turn = ChatTurn::new(&messages);
+    for (name, opens) in [("llama3", "<|start_header_id|>user<|end_header_id|>"), ("chatml", "<|im_start|>user")] {
+        let source = ChatTemplateSource::new(format!("{name}\n"), "", "", false);
+        assert!(source.is_builtin_name(), "{name}");
+        let format = ChatFormat::render(&source, &turn).unwrap_or_else(|e| panic!("{name}: render: {e}"));
+        assert!(format.prompt().contains(opens), "{name}: {:?}", format.prompt());
+        assert!(format.prompt().contains("What time is it in Tokyo?"), "{name}");
+        assert_ne!(format.prompt().trim(), name, "{name}: the name was rendered as text");
+    }
+    // Template text is not a name, and a name cannot render tools.
+    assert!(!template("llama-cpp-deepseek-r1.jinja").is_builtin_name());
+    let tools = Value::Array(vec![get_time()]);
+    let with_tools = ChatTurn { tools: Some(&tools), ..ChatTurn::new(&messages) };
+    assert!(ChatFormat::render(&ChatTemplateSource::new("llama3", "", "", false), &with_tools).is_err());
+}
