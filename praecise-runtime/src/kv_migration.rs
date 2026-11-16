@@ -50,6 +50,23 @@
 //! recurrent layers where the attention uses a sliding window. Its state is not
 //! split here into its parts, and is refused.
 //!
+//! ## Across backends
+//!
+//! A payload does not depend on the backend that wrote it. The backend copies
+//! every cache tensor to host memory in ggml's own layout for its type, and
+//! writes per layer the key and value types and row sizes, whether values are
+//! stored transposed, and the rotation dimensions. A blob written on one
+//! backend (CPU, CUDA, Metal, Vulkan) therefore applies on another when the two
+//! contexts store the cache alike: same key and value types (an `f16` cache
+//! and a `q8_0` cache differ), and both with or without flash attention, which
+//! decides whether values are transposed. When they differ, the backend's
+//! reader refuses the payload, and the import fails with
+//! [`Error::KvSequence`]; for a whole-sequence blob the destination sequence
+//! has been emptied by then. The model fingerprint names the weights only, so
+//! two engines learn of a layout mismatch only on import. The numbers are the
+//! writer's: a destination continues from cells another backend computed,
+//! which differ from its own by rounding, as any two backends' outputs do.
+//!
 //! ## Recurrent and hybrid models
 //!
 //! A recurrent layer (Mamba, RWKV, Gated Delta Net and the like) keeps one

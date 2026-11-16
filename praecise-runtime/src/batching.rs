@@ -407,7 +407,11 @@ pub struct BatchSpeculation {
     /// 0 drafts with the target's own MTP head, 1 with a DFlash block-diffusion
     /// drafter.
     pub spec_type: i32,
-    /// Most tokens a sequence drafts in one step.
+    /// Most tokens a sequence drafts in one step, used as given. The batch
+    /// engine does not apply [`SpecPolicy::moe_max_draft`](crate::SpecPolicy)
+    /// to a mixture-of-experts model: that cap was measured with a separate
+    /// generic drafter, which this engine does not run, and neither drafter it
+    /// does run (the MTP head, the block drafter) has been measured on one.
     pub n_max: u8,
     /// A separately shipped drafter. `None` drafts with the target model.
     pub draft_model: Option<LlamaModel>,
