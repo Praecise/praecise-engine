@@ -1814,7 +1814,14 @@ fn scheduler_loop(
 
     let kind = traits.reuse();
     let context_length = NonZeroU32::new(context_length).unwrap_or(NonZeroU32::new(8192).unwrap());
-    let n_slots = fit_slots(model_id, &model, backend, context_length, traits.swa_full, kind, &limits);
+    // An encoder-decoder model decodes one request at a time, and it must have
+    // one KV stream: with a stream per sequence the backend splits each batch
+    // into equal sequence sets, which its cross-attention asserts against.
+    let n_slots = if kind == Reuse::EncoderOutput {
+        1
+    } else {
+        fit_slots(model_id, &model, backend, context_length, traits.swa_full, kind, &limits)
+    };
     slots_out.store(n_slots, std::sync::atomic::Ordering::Release);
     // An engine that moves sequences stages copies through one sequence id
     // past the slots, which no request ever decodes into.
@@ -2070,7 +2077,17 @@ fn scheduler_loop(
                     ))));
                     continue;
                 }
-                admit_encoder_decoder(&model, &mut ctx, ctx_size, &mut slots, &mut cached, req, enable_thinking, &mut encoded);
+                admit_encoder_decoder(
+                    &model,
+                    &mut ctx,
+                    ctx_size,
+                    &mut slots,
+                    &mut cached,
+                    req,
+                    enable_thinking,
+                    &mut encoded,
+                    limits.physical_batch,
+                );
                 continue;
             }
             if let Some(mut r) = admit(
@@ -3072,6 +3089,7 @@ fn admit_encoder_decoder(
     req: BatchRequest,
     enable_thinking: bool,
     encoded: &mut Option<(Namespace, Vec<LlamaToken>)>,
+    physical_batch: usize,
 ) {
     if !req.media.is_empty() {
         let _ = req.result_tx.send(Err(Error::Inference(
@@ -3097,6 +3115,15 @@ fn admit_encoder_decoder(
             return;
         }
     };
+    // The encoder takes its whole input in one physical batch; the backend
+    // aborts the process on a longer one.
+    if prompt.len() > physical_batch {
+        let _ = req.result_tx.send(Err(Error::Inference(format!(
+            "encoder input of {} tokens exceeds the physical batch of {physical_batch}",
+            prompt.len()
+        ))));
+        return;
+    }
     if prompt.len() as i32 >= ctx_size {
         let _ = req.result_tx.send(Err(Error::Inference(format!(
             "prompt of {} tokens exceeds context window {}",
