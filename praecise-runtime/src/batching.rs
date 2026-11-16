@@ -363,6 +363,8 @@ struct PendingExport {
 /// Migration requests, served by the scheduler between decode steps.
 enum Control {
     Export(PendingExport),
+    /// End the ticket's sequence at the next token boundary with what it has.
+    Yield(u64),
     Resume(Box<SequenceResume>, u64),
 }
 
@@ -697,14 +699,32 @@ impl BatchEngine {
     /// for [`export_sequence`](Self::export_sequence) and
     /// [`detach_sequence`](Self::detach_sequence).
     ///
+    /// A ticket also names the request for
+    /// [`yield_sequence`](Self::yield_sequence), on any engine; exporting it
+    /// needs an engine spawned with migration.
+    ///
     /// # Errors
-    /// As [`submit`](Self::submit), and when the engine was not spawned with
-    /// [`spawn_with_migration`](Self::spawn_with_migration).
+    /// As [`submit`](Self::submit).
     pub fn submit_tracked(&self, req: BatchRequest) -> Result<SequenceTicket> {
-        self.migration()?;
         let ticket = self.new_ticket();
         self.enqueue(Queued { req, ticket: Some(ticket), score: None })?;
         Ok(SequenceTicket(ticket))
+    }
+
+    /// Ask the ticket's request to give up its slot. At the next token
+    /// boundary decoding stops and the request's `result_tx` receives an
+    /// [`InferenceResult`] of the tokens generated so far, with
+    /// [`StopReason::Preempted`] and, when it recorded one, a commitment
+    /// covering exactly those tokens; the slot is then free. A request still
+    /// waiting for a slot yields as soon as it is admitted, with no output. A
+    /// ticket that names nothing any more is ignored. An export asked for
+    /// before the yield is answered from the yielded sequence.
+    ///
+    /// # Errors
+    /// When the engine has stopped, or is a denoising engine, which does not
+    /// yield.
+    pub fn yield_sequence(&self, ticket: SequenceTicket) -> Result<()> {
+        self.send_control(Control::Yield(ticket.0))
     }
 
     /// Score a fixed continuation of `prompt`: one prefill of the prompt and
@@ -823,6 +843,10 @@ impl BatchEngine {
 
     fn control(&self, c: Control) -> Result<()> {
         self.migration()?;
+        self.send_control(c)
+    }
+
+    fn send_control(&self, c: Control) -> Result<()> {
         self.inner.control.send(c).map_err(|_| {
             Error::Other(format!("batch engine for {} is no longer running", self.inner.model_id))
         })
@@ -1266,6 +1290,8 @@ struct Sequence {
     rollback_pending: bool,
     /// Set when this sequence scores a fixed continuation.
     score: Option<Scoring>,
+    /// The caller asked this sequence to yield its slot.
+    preempted: bool,
 }
 
 impl Sequence {
@@ -1730,7 +1756,9 @@ impl Sequence {
         // A stop sequence outranks the position ceiling, which outranks
         // end-of-generation: the sequence is what halted decoding, and the
         // trimmed text alone cannot tell the caller which of the three it was.
-        let stop_reason = if self.stream.hit_stop() {
+        let stop_reason = if self.preempted {
+            StopReason::Preempted
+        } else if self.stream.hit_stop() {
             StopReason::StopSequence
         } else if self.input_tokens as i32 + self.output_tokens as i32 >= self.max_pos {
             StopReason::Length
@@ -1979,6 +2007,10 @@ fn scheduler_loop(
     // Exports waiting for their sequence to reach a step boundary it can be
     // copied at, and sequences waiting for a slot to be rebuilt in.
     let mut exports: Vec<PendingExport> = Vec::new();
+    // Yields asked for since the last step boundary, and yields of requests
+    // still waiting for a slot, applied when they are admitted.
+    let mut yields: Vec<u64> = Vec::new();
+    let mut queued_yields: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut resumes: std::collections::VecDeque<(Box<SequenceResume>, u64)> = std::collections::VecDeque::new();
     // The encoder input whose output the context currently holds.
     let mut encoded: Option<(Namespace, Vec<LlamaToken>)> = None;
@@ -2034,6 +2066,7 @@ fn scheduler_loop(
             match c {
                 Control::Export(e) => exports.push(e),
                 Control::Resume(r, ticket) => resumes.push_back((r, ticket)),
+                Control::Yield(ticket) => yields.push(ticket),
             }
         }
         if let Some(fp) = migration {
@@ -2051,6 +2084,17 @@ fn scheduler_loop(
                 scratch,
             );
         }
+
+        // Yields: a running sequence ends here, between two steps, with what
+        // it has; a waiting one as soon as it is admitted.
+        for ticket in yields.drain(..) {
+            if let Some(seq) = slots.iter_mut().flatten().find(|s| s.ticket == Some(ticket)) {
+                seq.preempted = true;
+            } else if queued_yields.len() < 4 * limits.max_slots && is_queued(ticket, rx, &mut waiting, &resumes, limits.max_slots) {
+                queued_yields.insert(ticket);
+            }
+        }
+        end_preempted(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, policy.kind, &mut exports, migration, scratch, &mut draining);
 
         // An encoder-decoder model decodes one request at a time.
         let capacity = if policy.kind == Reuse::EncoderOutput { 1 } else { slots.len() };
@@ -2120,6 +2164,7 @@ fn scheduler_loop(
                 cached[reuse_slot].last_used = tick;
                 if let Some(seq) = slots[reuse_slot].as_mut() {
                     seq.ticket = ticket;
+                    seq.preempted = ticket.is_some_and(|t| queued_yields.remove(&t));
                 }
                 if let Some(job) = score {
                     match slots[reuse_slot].as_mut().map(|seq| seq.start_scoring(job, ctx_size)) {
@@ -2138,6 +2183,8 @@ fn scheduler_loop(
                 draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held as u32));
             }
         }
+
+        end_preempted(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, policy.kind, &mut exports, migration, scratch, &mut draining);
 
         // Media prefill, at most one chunk per step. A media chunk is encoded
         // and its embeddings decoded for that one sequence on the shared
@@ -2453,6 +2500,7 @@ fn scheduler_loop(
                         match c {
                             Control::Export(e) => exports.push(e),
                             Control::Resume(r, ticket) => resumes.push_back((r, ticket)),
+                            Control::Yield(ticket) => yields.push(ticket),
                         }
                     }
                     serve_at_end(&mut ctx, &mut slots, slot_idx, &mut exports, fp, scratch);
@@ -2663,6 +2711,45 @@ fn serve_at_end(
         if let ExportReply::Delta(tx) = exports.remove(i).reply {
             let _ = tx.send(blob);
         }
+    }
+}
+
+/// End every sequence asked to yield, between two steps: its result holds the
+/// tokens emitted so far (a sampled token waiting to be fed was emitted, and
+/// its commitment row recorded), with [`StopReason::Preempted`]. A pending
+/// export of it is answered first. One stopped inside its prompt holds only
+/// part of that prompt, so its cache is dropped rather than kept for reuse.
+#[allow(clippy::too_many_arguments)]
+fn end_preempted(
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    draft: &mut Option<llama_cpp_2::context::LlamaContext<'_>>,
+    slots: &mut [Option<Sequence>],
+    cached: &mut [CachedPrefix],
+    kind: Reuse,
+    exports: &mut Vec<PendingExport>,
+    migration: Option<ModelFingerprint>,
+    scratch: i32,
+    draining: &mut Vec<Draining>,
+) {
+    for slot_idx in 0..slots.len() {
+        let Some(seq) = slots[slot_idx].as_ref() else { continue };
+        if !seq.preempted {
+            continue;
+        }
+        if seq.pending_prompt.is_some() {
+            let seq = slots[slot_idx].take().expect("checked above");
+            let _ = ctx.clear_kv_cache_seq(Some(slot_idx as u32), None, None);
+            draft_seq_rm(draft, slot_idx as i32, None);
+            cached[slot_idx].forget();
+            if let Some(d) = seq.finish() {
+                draining.push(d);
+            }
+            continue;
+        }
+        if let Some(fp) = migration {
+            serve_at_end(ctx, slots, slot_idx, exports, fp, scratch);
+        }
+        finalize_and_free(ctx, draft, slots, cached, kind, slot_idx, draining);
     }
 }
 
@@ -3089,6 +3176,7 @@ impl Sequence {
             exporter: None,
             rollback_pending: false,
             score: None,
+            preempted: false,
         }
     }
 }
@@ -3527,6 +3615,7 @@ mod prefix_tests {
             exporter: None,
             rollback_pending: false,
             score: None,
+            preempted: false,
         }
     }
 

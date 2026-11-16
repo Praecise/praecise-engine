@@ -94,6 +94,8 @@ pub enum PraeciseStopReason {
     Length = 1,
     /// Decoded text ended with a configured stop sequence.
     StopSequence = 2,
+    /// The engine was asked to yield the slot; the result is partial.
+    Preempted = 3,
 }
 
 impl From<StopReason> for PraeciseStopReason {
@@ -102,6 +104,7 @@ impl From<StopReason> for PraeciseStopReason {
             StopReason::Eos => Self::Eos,
             StopReason::Length => Self::Length,
             StopReason::StopSequence => Self::StopSequence,
+            StopReason::Preempted => Self::Preempted,
         }
     }
 }

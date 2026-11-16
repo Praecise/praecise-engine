@@ -15,6 +15,9 @@ pub enum StopReason {
     Length,
     /// Decoded text ended with one of the configured stop sequences.
     StopSequence,
+    /// The caller asked the engine to yield the request's slot: decoding
+    /// stopped at a token boundary and the result holds the tokens so far.
+    Preempted,
 }
 
 impl StopReason {
