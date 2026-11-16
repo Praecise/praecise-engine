@@ -2213,6 +2213,7 @@ fn scheduler_loop(
             }
             if let Some(mut r) = admit(
                 &model,
+                model_id,
                 ctx_size,
                 &mut slots,
                 &mut cached,
@@ -3116,6 +3117,7 @@ fn install(slots: &mut [Option<Sequence>], slot_idx: usize, mut seq: Sequence) {
 #[allow(clippy::too_many_arguments)]
 fn admit(
     model: &LlamaModel,
+    model_id: &str,
     ctx_size: i32,
     slots: &mut [Option<Sequence>],
     cached: &mut [CachedPrefix],
@@ -3128,7 +3130,7 @@ fn admit(
     if !free.contains(&true) {
         // No free slot — reject rather than block. Caller sheds load.
         let _ = req.result_tx.send(Err(Error::QueueFull {
-            model_id: "batched".into(),
+            model_id: model_id.to_string(),
             waiting: slots.len(),
             max: slots.len(),
         }));
