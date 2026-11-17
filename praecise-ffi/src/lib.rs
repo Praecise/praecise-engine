@@ -105,6 +105,9 @@ impl From<StopReason> for PraeciseStopReason {
             StopReason::Length => Self::Length,
             StopReason::StopSequence => Self::StopSequence,
             StopReason::Preempted => Self::Preempted,
+            // A reason added after this ABI version reads as the closest
+            // stable one: the model stopped.
+            _ => Self::Eos,
         }
     }
 }

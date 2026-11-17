@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// the token counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StopReason {
     /// The model emitted an end-of-generation token.
     Eos,

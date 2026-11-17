@@ -759,7 +759,8 @@ impl BatchEngine {
     /// [`InferenceResult`] of the tokens generated so far, with
     /// [`StopReason::Preempted`] and, when it recorded one, a commitment
     /// covering exactly those tokens; the slot is then free. A request still
-    /// waiting for a slot yields as soon as it is admitted, with no output. A
+    /// waiting for a slot yields as soon as it is admitted, and one inside its
+    /// prompt yields before generating: both return an empty result. A
     /// ticket that names nothing any more is ignored. An export asked for
     /// before the yield is answered from the yielded sequence.
     ///
@@ -2147,12 +2148,21 @@ fn scheduler_loop(
         }
 
         // Yields: a running sequence ends here, between two steps, with what
-        // it has; a waiting one as soon as it is admitted.
-        for ticket in yields.drain(..) {
+        // it has; a waiting one as soon as it is admitted. Only a ticket known
+        // to be waiting is remembered, and its entry goes when it is admitted
+        // or refused; with the waiting list full the yield is tried again at
+        // the next boundary, and a ticket that names nothing is dropped.
+        for ticket in std::mem::take(&mut yields) {
             if let Some(seq) = slots.iter_mut().flatten().find(|s| s.ticket == Some(ticket)) {
                 seq.preempted = true;
-            } else if queued_yields.len() < 4 * limits.max_slots && is_queued(ticket, rx, &mut waiting, &resumes, limits.max_slots) {
-                queued_yields.insert(ticket);
+                continue;
+            }
+            match ticket_place(ticket, rx, &mut waiting, &resumes, limits.max_slots) {
+                Place::Waiting | Place::Resume => {
+                    queued_yields.insert(ticket);
+                }
+                Place::Perhaps => yields.push(ticket),
+                Place::Gone => {}
             }
         }
         end_preempted(&mut ctx, &mut draft_ctx, &mut slots, &mut cached, policy.kind, &mut exports, migration, scratch, &mut draining);
@@ -2167,6 +2177,11 @@ fn scheduler_loop(
                 let Some((resume, ticket)) = resumes.pop_front() else { break };
                 tick += 1;
                 admit_resume(&model, &mut ctx, &mut draft_ctx, ctx_size, &mut slots, &mut cached, fp, scratch, *resume, ticket, tick);
+                if queued_yields.remove(&ticket)
+                    && let Some(seq) = slots.iter_mut().flatten().find(|s| s.ticket == Some(ticket))
+                {
+                    seq.preempted = true;
+                }
             }
         }
         let active = slots.iter().filter(|s| s.is_some()).count();
@@ -2198,6 +2213,7 @@ fn scheduler_loop(
                     ))));
                     continue;
                 }
+                let yielded = ticket.is_some_and(|t| queued_yields.remove(&t));
                 admit_encoder_decoder(
                     &model,
                     &mut ctx,
@@ -2209,6 +2225,11 @@ fn scheduler_loop(
                     &mut encoded,
                     limits.physical_batch,
                 );
+                // One slot: a sequence without a ticket is the one just admitted.
+                if let Some(seq) = slots.iter_mut().flatten().find(|s| s.ticket.is_none()) {
+                    seq.ticket = ticket;
+                    seq.preempted = yielded;
+                }
                 continue;
             }
             if let Some(mut r) = admit(
@@ -2241,11 +2262,18 @@ fn scheduler_loop(
                 }
                 let held = apply_prefix_reuse(&mut ctx, &mut slots, &mut cached, &policy, r);
                 draft_seq_rm(&mut draft_ctx, reuse_slot as i32, Some(held as u32));
-            } else if let Some(job) = score {
-                // Refused at admission (an empty or unrenderable prompt, one
-                // past the context): the reason went to the request's own
-                // result, which nobody reads for a score.
-                let _ = job.reply.send(Err(Error::Inference("the prompt could not be admitted for scoring".into())));
+            } else {
+                // Refused at admission: a yield waiting for it has nothing
+                // left to end.
+                if let Some(t) = ticket {
+                    queued_yields.remove(&t);
+                }
+                if let Some(job) = score {
+                    // An empty or unrenderable prompt, one past the context:
+                    // the reason went to the request's own result, which
+                    // nobody reads for a score.
+                    let _ = job.reply.send(Err(Error::Inference("the prompt could not be admitted for scoring".into())));
+                }
             }
         }
 
@@ -2729,18 +2757,44 @@ fn is_queued(
     resumes: &std::collections::VecDeque<(Box<SequenceResume>, u64)>,
     cap: usize,
 ) -> bool {
-    if waiting.iter().any(|q| q.ticket == Some(ticket)) || resumes.iter().any(|r| r.1 == ticket) {
-        return true;
+    ticket_place(ticket, rx, waiting, resumes, cap) != Place::Gone
+}
+
+/// Where a ticket that no slot holds is: see [`is_queued`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// A request in the waiting list.
+    Waiting,
+    /// A moved sequence waiting for a slot to be rebuilt in.
+    Resume,
+    /// Not found with the waiting list full: it may still be in the channel.
+    Perhaps,
+    /// Nowhere: finished, failed, handed off or never issued.
+    Gone,
+}
+
+fn ticket_place(
+    ticket: u64,
+    rx: &Receiver<Queued>,
+    waiting: &mut std::collections::VecDeque<Queued>,
+    resumes: &std::collections::VecDeque<(Box<SequenceResume>, u64)>,
+    cap: usize,
+) -> Place {
+    if resumes.iter().any(|r| r.1 == ticket) {
+        return Place::Resume;
+    }
+    if waiting.iter().any(|q| q.ticket == Some(ticket)) {
+        return Place::Waiting;
     }
     while waiting.len() < cap {
-        let Ok(q) = rx.try_recv() else { return false };
+        let Ok(q) = rx.try_recv() else { return Place::Gone };
         let found = q.ticket == Some(ticket);
         waiting.push_back(q);
         if found {
-            return true;
+            return Place::Waiting;
         }
     }
-    true
+    Place::Perhaps
 }
 
 /// Answer the delta exports of the sequence in `slot_idx`, which has just
@@ -3712,6 +3766,33 @@ mod prefix_tests {
             media: Vec::new(),
         };
         Queued { req, ticket: Some(ticket), score: None }
+    }
+
+    #[test]
+    fn a_ticket_is_placed_exactly_and_a_full_queue_answers_perhaps() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(4);
+        for t in 1..=3 {
+            tx.send(queued(t)).unwrap();
+        }
+        let mut waiting = std::collections::VecDeque::new();
+        let (result_tx, _) = tokio::sync::oneshot::channel();
+        let resume = SequenceResume {
+            blobs: Vec::new(),
+            next_token: 0,
+            generated: String::new(),
+            config: GenerationConfig::default(),
+            token_tx: None,
+            result_tx,
+        };
+        let resumes = std::collections::VecDeque::from([(Box::new(resume), 9u64)]);
+        assert_eq!(ticket_place(9, &rx, &mut waiting, &resumes, 2), Place::Resume);
+        // Full at two: a stale ticket is not known to be waiting.
+        assert_eq!(ticket_place(77, &rx, &mut waiting, &resumes, 2), Place::Perhaps);
+        assert_eq!(ticket_place(2, &rx, &mut waiting, &resumes, 2), Place::Waiting);
+        // Room again and the channel empty: a stale ticket is gone, so a
+        // yield of it is dropped rather than remembered.
+        assert_eq!(ticket_place(77, &rx, &mut waiting, &resumes, 8), Place::Gone);
+        assert_eq!(ticket_place(3, &rx, &mut waiting, &resumes, 8), Place::Waiting);
     }
 
     #[test]
