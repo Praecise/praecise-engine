@@ -6,6 +6,15 @@
 
 - `StopReason` is `#[non_exhaustive]` and gains `Preempted`. A match on it
   outside this crate needs a wildcard arm.
+- `toploc::Tolerance::default()` accepts an honest CPU run: the mean logit
+  delta per step is at most 0.6 (was 0.25; a single top-k logit was measured
+  up to 0.505 apart between decode and a verifying prefill), and a commitment
+  passes when its passing steps plus up to 2 failing ones
+  (`ALLOWED_FAILING_STEPS`, new field `allowed_failing_steps`) reach 90%, and
+  more steps pass than fail. Honest runs measured 29 of 33, 23 of 24 and 8 of
+  9 steps; under the fraction alone any commitment under ten steps failed on
+  one near tie. A serialized tolerance without the new field reads it as 0,
+  the earlier rule.
 - `BatchLimits` is `#[non_exhaustive]`: build it from `BatchLimits::default()`
   or `BatchLimits::from_env()` and the `with_*` methods.
 - C ABI: `PraeciseStopReason::Preempted = 3`. Values 0 to 2 are unchanged; a

@@ -13,7 +13,8 @@
 //! committed records. Exact float equality is not required: kernels
 //! differ across GPUs, drivers, and batch shapes, so verification
 //! tolerates bounded index churn and bounded logit drift per step, and
-//! requires a minimum fraction of steps to pass overall.
+//! requires a minimum fraction of steps to pass overall, short of a small
+//! fixed allowance of failing steps.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,12 +44,23 @@ pub fn commitment_k_for(requested: u8) -> u8 {
 pub const MIN_INDEX_OVERLAP: f32 = 0.75;
 
 /// Maximum mean absolute logit difference over the shared token ids for
-/// a step to pass.
-pub const MAX_MEAN_LOGIT_DELTA: f32 = 0.25;
+/// a step to pass. An honest run on the CPU, decoded one token at a time and
+/// verified in one prefill, differs by up to 0.505 in a single top-k logit
+/// (Qwen3 0.6B, 24 steps; 0.31 for Qwen3.5 0.8B), so the bound sits above
+/// that.
+pub const MAX_MEAN_LOGIT_DELTA: f32 = 0.6;
 
 /// Minimum fraction of steps that must pass for the commitment as a
-/// whole to verify.
+/// whole to verify, counting [`ALLOWED_FAILING_STEPS`] as passing.
 pub const MIN_PASSING_STEP_FRACTION: f32 = 0.9;
+
+/// Failing steps a commitment may have beyond what
+/// [`MIN_PASSING_STEP_FRACTION`] allows. Honest CPU runs fail a few steps
+/// where two candidates nearly tie and the rounding of decode and prefill
+/// swaps them: 4 of 33 (Qwen3 0.6B), 1 of 24, 1 of 9 (Qwen3.5 0.8B). Under
+/// the fraction alone a commitment of fewer than ten steps tolerates none.
+/// More steps must still pass than fail.
+pub const ALLOWED_FAILING_STEPS: usize = 2;
 
 /// The thresholds a commitment is compared under. A verifier whose numbers
 /// differ from the provider's by more than rounding (another quantisation,
@@ -62,6 +74,10 @@ pub struct Tolerance {
     pub max_mean_logit_delta: f32,
     /// See [`MIN_PASSING_STEP_FRACTION`].
     pub min_passing_step_fraction: f32,
+    /// See [`ALLOWED_FAILING_STEPS`]. Absent from a serialized tolerance of
+    /// an earlier release, it reads as 0, the rule that release applied.
+    #[serde(default)]
+    pub allowed_failing_steps: usize,
 }
 
 impl Default for Tolerance {
@@ -70,6 +86,7 @@ impl Default for Tolerance {
             min_index_overlap: MIN_INDEX_OVERLAP,
             max_mean_logit_delta: MAX_MEAN_LOGIT_DELTA,
             min_passing_step_fraction: MIN_PASSING_STEP_FRACTION,
+            allowed_failing_steps: ALLOWED_FAILING_STEPS,
         }
     }
 }
@@ -201,7 +218,7 @@ pub fn top_k_from_logits(logits: &[f32], k: usize) -> Vec<TopKEntry> {
 /// and the committed top-k matches the recomputed one within tolerance. A
 /// token sampled from outside the verifier's top-k therefore fails its step;
 /// the whole commitment tolerates that at the rate
-/// [`MIN_PASSING_STEP_FRACTION`] allows.
+/// [`MIN_PASSING_STEP_FRACTION`] and [`ALLOWED_FAILING_STEPS`] allow.
 pub fn compare_step(committed: &StepRecord, recomputed: &[TopKEntry]) -> StepComparison {
     compare_step_with(committed, recomputed, &Tolerance::default())
 }
@@ -280,12 +297,15 @@ pub fn verify_commitment_with(
             failing_steps.push(i);
         }
     }
-    let fraction = steps_passed as f32 / committed.steps.len() as f32;
+    let total = committed.steps.len();
+    let failing = total - steps_passed;
+    let credited = steps_passed + tolerance.allowed_failing_steps.min(failing);
     VerificationOutcome {
-        steps_total: committed.steps.len(),
+        steps_total: total,
         steps_passed,
         failing_steps,
-        pass: fraction >= tolerance.min_passing_step_fraction,
+        pass: credited as f32 / total as f32 >= tolerance.min_passing_step_fraction
+            && (tolerance.allowed_failing_steps == 0 || steps_passed > failing),
     }
 }
 
@@ -396,6 +416,39 @@ mod tests {
         vec![entry(first, 5.0), entry(first + 1, 4.0), entry(first + 2, 3.0), entry(first + 3, 2.0)]
     }
 
+    /// `passed` exact steps followed by `failed` disjoint ones.
+    fn mixed(passed: usize, failed: usize) -> (InferenceCommitment, Vec<Vec<TopKEntry>>) {
+        let good = StepRecord { token_id: 1, top_k: four(1) };
+        let bad = StepRecord { token_id: 3, top_k: four(3) };
+        let mut steps = vec![good.clone(); passed];
+        steps.extend(vec![bad; failed]);
+        let mut recomputed = vec![good.top_k; passed];
+        recomputed.extend(vec![four(100); failed]);
+        (commitment_with(steps), recomputed)
+    }
+
+    #[test]
+    fn the_default_allows_a_few_failing_steps_beyond_the_fraction() {
+        for (passed, failed, pass) in [(29, 4, true), (8, 1, true), (23, 1, true), (7, 3, true), (6, 4, false), (2, 1, true), (1, 1, false), (0, 1, false)] {
+            let (committed, recomputed) = mixed(passed, failed);
+            let outcome = verify_commitment(&committed, &recomputed);
+            assert_eq!(outcome.pass, pass, "{passed} passing, {failed} failing");
+            assert_eq!(outcome.steps_passed, passed);
+        }
+    }
+
+    #[test]
+    fn without_an_allowance_the_fraction_alone_decides() {
+        let tolerance = Tolerance { allowed_failing_steps: 0, ..Tolerance::default() };
+        for (passed, failed, pass) in [(9, 1, true), (8, 2, false), (8, 1, false), (29, 4, false)] {
+            let (committed, recomputed) = mixed(passed, failed);
+            assert_eq!(verify_commitment_with(&committed, &recomputed, &tolerance).pass, pass, "{passed} passing, {failed} failing");
+        }
+        let earlier: Tolerance =
+            serde_json::from_str(r#"{"min_index_overlap":0.75,"max_mean_logit_delta":0.25,"min_passing_step_fraction":0.9}"#).unwrap();
+        assert_eq!(earlier.allowed_failing_steps, 0);
+    }
+
     #[test]
     fn verify_requires_passing_fraction() {
         let good = StepRecord { token_id: 1, top_k: four(1) };
@@ -411,7 +464,7 @@ mod tests {
         assert_eq!(outcome.steps_passed, 9);
         assert_eq!(outcome.failing_steps, vec![9]);
 
-        // 10 steps: 8 passes = 0.8 fails.
+        // Without the allowance, 10 steps: 8 passes = 0.8 fails.
         let mut steps = vec![good.clone(); 8];
         steps.push(bad.clone());
         steps.push(bad.clone());
@@ -419,7 +472,8 @@ mod tests {
         let mut recomputed: Vec<Vec<TopKEntry>> = vec![good.top_k.clone(); 8];
         recomputed.push(four(100));
         recomputed.push(four(100));
-        assert!(!verify_commitment(&committed, &recomputed).pass);
+        let fraction_only = Tolerance { allowed_failing_steps: 0, ..Tolerance::default() };
+        assert!(!verify_commitment_with(&committed, &recomputed, &fraction_only).pass);
     }
 
     #[test]
@@ -474,13 +528,13 @@ mod tests {
             token_id: 1,
             top_k: vec![entry(1, 9.0), entry(2, 8.0), entry(3, 7.0), entry(4, 6.0)],
         }]);
-        // Every logit half a unit off: past the default mean delta of 0.25.
-        let recomputed = vec![vec![entry(1, 9.5), entry(2, 8.5), entry(3, 7.5), entry(4, 6.5)]];
+        // Every logit 0.75 off: past the default mean delta of 0.6.
+        let recomputed = vec![vec![entry(1, 9.75), entry(2, 8.75), entry(3, 7.75), entry(4, 6.75)]];
         assert_eq!(Tolerance::default().max_mean_logit_delta, MAX_MEAN_LOGIT_DELTA);
         assert!(!verify_commitment(&committed, &recomputed).pass);
         let with_default = verify_commitment_with(&committed, &recomputed, &Tolerance::default());
         assert_eq!((with_default.pass, with_default.steps_passed), (false, 0));
-        let wide = Tolerance { max_mean_logit_delta: 0.6, ..Tolerance::default() };
+        let wide = Tolerance { max_mean_logit_delta: 0.8, ..Tolerance::default() };
         assert!(verify_commitment_with(&committed, &recomputed, &wide).pass);
         assert!(compare_step_with(&committed.steps[0], &recomputed[0], &wide).pass);
     }
