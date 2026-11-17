@@ -38,6 +38,10 @@
   answered when the first sampled token ends the request, and an export of a
   queued ticket waits. A whole-sequence import compares cache layouts first,
   and a refused import leaves the destination as it was.
+- `BatchEngine::submit_exporting`: a tracked request with its export in the
+  same message, pending from admission, so a conversation checkpoint
+  (`max_tokens: 1`) is exported even when its first sampled token ends it
+  before a separate `export_sequence` could reach the engine.
 - `BatchEngine::spawn_with_limits` and `BatchLimits`: slot count, physical
   batch and checkpoint budget per engine.
 - `BatchEngine::score_continuation`: the top-k rows of a fixed continuation in

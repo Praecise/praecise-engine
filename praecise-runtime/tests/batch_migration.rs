@@ -280,6 +280,20 @@ fn checkpoint(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
     // Once it has gone, the ticket names nothing.
     assert!(src.export_sequence(ticket).unwrap().blocking_recv().unwrap().is_err(), "{var}");
 
+    // Asked for only once the request has finished, a separate export finds
+    // nothing; sent with the request, it is answered from the finished
+    // sequence however late its receiver is read.
+    let (req, late) = request(PROMPT, greedy(1), None);
+    let ticket = src.submit_tracked(req).expect("submit tracked");
+    late.blocking_recv().unwrap().expect("the request finishes");
+    assert!(src.export_sequence(ticket).unwrap().blocking_recv().unwrap().is_err(), "{var}: an export after the end");
+    let (req, with_export) = request(PROMPT, greedy(1), None);
+    let (_, exported) = src.submit_exporting(req).expect("submit exporting");
+    with_export.blocking_recv().unwrap().expect("the request finishes");
+    let carried = exported.blocking_recv().unwrap().expect("the export sent with the request");
+    let k = KvBlob::decode(&carried).unwrap();
+    assert_eq!((k.base_pos, k.tokens.len()), (0, prompt_len), "{var}: the carried checkpoint is the prompt");
+
     // The checkpoint continues on another engine as the uninterrupted run does.
     let (result_tx, resumed_rx) = oneshot::channel();
     dst.resume(SequenceResume {

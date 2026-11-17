@@ -343,6 +343,9 @@ pub(crate) struct Queued {
     /// Set for a request that scores a fixed continuation instead of
     /// generating.
     pub(crate) score: Option<ScoreJob>,
+    /// An export of the ticket's sequence asked for with the request, pending
+    /// from its admission (see [`BatchEngine::submit_exporting`]).
+    pub(crate) export: Option<tokio::sync::oneshot::Sender<Result<Vec<u8>>>>,
 }
 
 /// The top-k logits at each position of a fixed continuation, one row per
@@ -735,7 +738,7 @@ impl BatchEngine {
     /// queued behind the running ones, the request is refused with
     /// [`Error::QueueFull`] for the caller to hold or shed.
     pub fn submit(&self, req: BatchRequest) -> Result<()> {
-        self.enqueue(Queued { req, ticket: None, score: None })
+        self.enqueue(Queued { req, ticket: None, score: None, export: None })
     }
 
     /// [`submit`](Self::submit), returning a ticket that names the sequence
@@ -750,8 +753,33 @@ impl BatchEngine {
     /// As [`submit`](Self::submit).
     pub fn submit_tracked(&self, req: BatchRequest) -> Result<SequenceTicket> {
         let ticket = self.new_ticket();
-        self.enqueue(Queued { req, ticket: Some(ticket), score: None })?;
+        self.enqueue(Queued { req, ticket: Some(ticket), score: None, export: None })?;
         Ok(SequenceTicket(ticket))
+    }
+
+    /// [`submit_tracked`](Self::submit_tracked) and
+    /// [`export_sequence`](Self::export_sequence) in one message: the export
+    /// travels with the request, so it is pending from the moment the request
+    /// is admitted. A separate `export_sequence` can arrive after a short
+    /// request has already finished (one whose first sampled token ends it
+    /// finishes in the step that ends its prefill) and is then refused; this
+    /// one is answered as `export_sequence` describes, with the prompt's
+    /// positions, from the finished sequence if need be. The checkpoint of a
+    /// conversation is therefore a request of its history with `max_tokens: 1`
+    /// submitted this way.
+    ///
+    /// # Errors
+    /// Immediately when the engine cannot migrate or its queue is full;
+    /// through the receiver as [`export_sequence`](Self::export_sequence).
+    pub fn submit_exporting(
+        &self,
+        req: BatchRequest,
+    ) -> Result<(SequenceTicket, tokio::sync::oneshot::Receiver<Result<Vec<u8>>>)> {
+        self.migration()?;
+        let ticket = self.new_ticket();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.enqueue(Queued { req, ticket: Some(ticket), score: None, export: Some(tx) })?;
+        Ok((SequenceTicket(ticket), rx))
     }
 
     /// Ask the ticket's request to give up its slot. At the next token
@@ -811,7 +839,7 @@ impl BatchEngine {
             media: Vec::new(),
         };
         let continuation = continuation.iter().map(|&t| LlamaToken(t)).collect();
-        self.enqueue(Queued { req, ticket: None, score: Some(ScoreJob { continuation, k, reply, _result_rx: result_rx }) })?;
+        self.enqueue(Queued { req, ticket: None, score: Some(ScoreJob { continuation, k, reply, _result_rx: result_rx }), export: None })?;
         Ok(rx)
     }
 
@@ -2198,13 +2226,19 @@ fn scheduler_loop(
         }
         // Fill any remaining free slots without blocking.
         while slots.iter().filter(|s| s.is_some()).count() < capacity {
-            let Queued { req, ticket, score } = match waiting.pop_front() {
+            let Queued { req, ticket, score, export } = match waiting.pop_front() {
                 Some(q) => q,
                 None => match rx.try_recv() {
                     Ok(q) => q,
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 },
             };
+            // An export that came with the request is pending from here on: it
+            // is answered at the first exportable step boundary, at the
+            // sequence's end, or refused with the reason the request was.
+            if let (Some(tx), Some(t)) = (export, ticket) {
+                exports.push(PendingExport { ticket: t, reply: ExportReply::Delta(tx) });
+            }
             tick += 1;
             if policy.kind == Reuse::EncoderOutput {
                 if let Some(job) = score {
@@ -3765,7 +3799,7 @@ mod prefix_tests {
             result_tx,
             media: Vec::new(),
         };
-        Queued { req, ticket: Some(ticket), score: None }
+        Queued { req, ticket: Some(ticket), score: None, export: None }
     }
 
     #[test]
