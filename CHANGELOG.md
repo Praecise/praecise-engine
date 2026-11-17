@@ -17,6 +17,10 @@
   still needs one spawned with migration.
 - The minimum versions of `cc` (1.10.0) and `encoding_rs` (0.8.42) are those
   of the previous release again; `Cargo.lock` still selects newer releases.
+- praecise-onnx and praecise-perception: fetching a prebuilt ONNX Runtime at
+  build time is the default feature `download-binaries`. A build that provides
+  the runtime through ORT_LIB_LOCATION sets `default-features = false` and
+  then builds no download path, no TLS stack and no ring.
 
 ### Added
 

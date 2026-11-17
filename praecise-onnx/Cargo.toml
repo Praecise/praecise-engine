@@ -13,15 +13,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.13"
 base64 = "0.23"
-# ONNX Runtime. `download-binaries` fetches a prebuilt runtime where one
-# exists; a target with no prebuilt CUDA download links a CUDA ONNX Runtime
-# through ORT_LIB_LOCATION. `copy-dylibs` places the execution-provider
-# libraries (libonnxruntime_providers_*.so) next to the built binary.
+# ONNX Runtime. The `download-binaries` feature below fetches a prebuilt
+# runtime where one exists; a target with no prebuilt CUDA download links a
+# CUDA ONNX Runtime through ORT_LIB_LOCATION. `copy-dylibs` places the
+# execution-provider libraries (libonnxruntime_providers_*.so) next to the
+# built binary.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = [
   "std",
   "ndarray",
-  "download-binaries",
-  "tls-rustls",
   "copy-dylibs",
   # External data held in memory, for a parse in a confined process.
   "api-18",
@@ -52,7 +51,12 @@ libloading = { version = "0.9", optional = true }
 tempfile = "3"
 
 [features]
-default = []
+default = ["download-binaries"]
+# Fetch a prebuilt ONNX Runtime at build time. The fetch runs over rustls with
+# ring, the only provider ort offers for it. A build that provides the runtime
+# through ORT_LIB_LOCATION turns this off with `default-features = false`, and
+# then compiles no download path, no TLS and no ring.
+download-binaries = ["ort/download-binaries", "ort/tls-rustls"]
 # NVIDIA: the CUDA and TensorRT execution providers.
 cuda = ["ort/cuda", "ort/tensorrt", "dep:libloading"]
 # AMD: the MIGraphX execution provider. ONNX Runtime removed its ROCm
