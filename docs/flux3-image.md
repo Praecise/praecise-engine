@@ -1,8 +1,31 @@
 # FLUX 3 Image Klein: a native image pipeline
 
-Design note, before any code. Nothing here has been built or run; every
-claim about the checkpoint is marked as one to confirm against its
-`model_index.json` and component configs before the port starts.
+Built as `praecise_diffusion::flux3::image::Flux3Image`. The weights are
+gated, so it has been checked against the public reference pipeline
+(diffusers 0.42, `Flux3Transformer2DModel` and the FLUX 3 modular blocks)
+on tiny random transformers, not yet on the release itself. The design as
+first written is kept below; "Settled" records what the reference answered.
+
+## Settled
+
+- Layout: the release ships the native transformer (`model.safetensors`,
+  the tensor names `flux3.rs` already reads, and `variants/fp8r`,
+  `variants/nvfp4`), the FLUX.2 autoencoder under `vae/`, and Qwen3-VL with
+  its tokenizer under `text_encoder/`. The transformer has two streams,
+  `image` and `image_cond`, and no global vector.
+- Flow map: the distilled model adds `ref_time_in`, an embedding of the
+  time the step jumps to, to every token's time embedding. Its update is
+  the ordinary Euler step; no new solver.
+- Schedule: Euler on `linspace(1, 1/N, N)` shifted by 6.93 (then 0); 16
+  steps distilled, 50 at guidance 3.5 against the empty prompt for the base.
+- Positions: the latent grid at half steps on the rotary `h` and `w` axes;
+  reference `k` at `l = -(1 + k)`; text along `l`. The text encoder gives
+  padding tokens position 1.
+- Autoencoder: the FLUX.2 one, shared with `Flux2Klein`.
+- Reference resizing and prompt upsampling are the caller's.
+
+Not checked: the release's own outputs (needs the gated weights), and the
+`fp8r` scale layout, read as one scale per tensor or per row.
 
 ## What is wanted
 

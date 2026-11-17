@@ -273,10 +273,7 @@ pub struct Flux2Klein {
     te_cfg: Qwen3Config,
     te_theta: f32,
     te: Weights,
-    vae_cfg: VaeConfig,
-    vae: Weights,
-    bn_mean: Vec<f32>,
-    bn_std: Vec<f32>,
+    ae: Autoencoder,
     tokenizer: tokenizers::Tokenizer,
     distilled: bool,
 }
@@ -319,11 +316,7 @@ impl Flux2Klein {
         dit_cfg.validate()?;
         let te_cfg: Qwen3Config = parse(files.json("text_encoder/config.json")?, "text encoder config")?;
         let te_theta = te_cfg.theta()? as f32;
-        let vae_cfg: VaeConfig = parse(files.json("vae/config.json")?, "vae config")?;
-        vae_cfg.validate()?;
-        if vae_cfg.patch_size != [2, 2] || !vae_cfg.use_post_quant_conv {
-            return Err(Error::Config("expected patched latent statistics and a post-quantisation convolution".into()));
-        }
+        let vae_cfg = Autoencoder::config(files)?;
         let want_ctx = te_cfg.hidden_size * PROMPT_LAYERS.len() as u64;
         if dit_cfg.joint_attention_dim != want_ctx {
             return Err(Error::Config(format!(
@@ -348,24 +341,19 @@ impl Flux2Klein {
         let te = Weights::load(&backend, &te_files, &te_cfg.weight_specs(qwen3::Layout::CAUSAL_LM, last, linear)?)?;
         drop(te_files);
 
-        let vae_files = SafeTensors::open(&files.weights("vae")?)?;
-        let mut vae_specs = vae_cfg.weight_specs();
-        vae_specs.extend(vae_cfg.encoder_weight_specs());
-        let vae = Weights::load(&backend, &vae_files, &vae_specs)?;
-        let (bn_mean, bn_std) = vae::latent_stats(&vae_files, &vae_cfg)?;
-        drop(vae_files);
+        let ae = Autoencoder::load(&backend, files, vae_cfg)?;
 
         let tok_path = files.root.join("tokenizer/tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| Error::Tokenizer(format!("{}: {e}", tok_path.display())))?;
 
-        Ok(Self { backend, dit_cfg, dit, te_cfg, te_theta, te, vae_cfg, vae, bn_mean, bn_std, tokenizer, distilled })
+        Ok(Self { backend, dit_cfg, dit, te_cfg, te_theta, te, ae, tokenizer, distilled })
     }
 
     /// Device bytes held by the weights.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        self.dit.bytes() + self.te.bytes() + self.vae.bytes()
+        self.dit.bytes() + self.te.bytes() + self.ae.w.bytes()
     }
 
     /// Backend device name.
@@ -411,7 +399,7 @@ impl Flux2Klein {
     /// [`Error::Request`] for dimensions or step counts the model cannot
     /// serve; backend failures otherwise.
     pub fn generate(&mut self, req: &Request) -> Result<Image> {
-        let cell = self.vae_cfg.scale_factor() as u32 * 2;
+        let cell = self.ae.cell();
         if req.width == 0 || req.height == 0 || req.width % cell != 0 || req.height % cell != 0 {
             return Err(Error::Request(format!("width and height must be positive multiples of {cell}")));
         }
@@ -437,7 +425,7 @@ impl Flux2Klein {
     /// The denoising pipeline from a given starting latent, laid out
     /// `[tokens][channels]` with tokens in row-major order.
     fn run(&mut self, req: &Request, noise: Vec<f32>) -> Result<Image> {
-        let cell = self.vae_cfg.scale_factor() as u32 * 2;
+        let cell = self.ae.cell();
         let use_cfg = !self.distilled && req.guidance_scale > 1.0;
 
         let t0 = Instant::now();
@@ -446,7 +434,7 @@ impl Flux2Klein {
         let mut grids = vec![(0.0f32, (req.height / cell) as usize, (req.width / cell) as usize)];
         let mut reference_tokens = Vec::new();
         for (k, r) in req.references.iter().enumerate() {
-            reference_tokens.extend(self.encode_reference(r)?);
+            reference_tokens.extend(self.ae.encode(&self.backend, r)?);
             grids.push((REFERENCE_T_STEP * (k + 1) as f32, (r.height / cell) as usize, (r.width / cell) as usize));
         }
         let encode_ms = t0.elapsed().as_millis() as u64;
@@ -504,16 +492,7 @@ impl Flux2Klein {
         let denoise_ms = t1.elapsed().as_millis() as u64;
 
         let t2 = Instant::now();
-        let lat = self.unpatch(&x, gh, gw);
-        let (lw, lh) = (2 * gw, 2 * gh);
-        let mut g = Graph::new(&self.backend)?;
-        let vio = vae::build_decoder(&mut g, &self.vae_cfg, &self.vae, lw as i64, lh as i64);
-        g.finish(&[vio.out])?;
-        g.set_f32(vio.latents, &lat);
-        g.compute()?;
-        let px = g.read_f32(vio.out);
-        drop(g);
-        let rgb = to_rgb(&px, req.width as usize, req.height as usize);
+        let rgb = self.ae.decode(&self.backend, &x, gh, gw)?;
         let decode_ms = t2.elapsed().as_millis() as u64;
 
         Ok(Image {
@@ -525,10 +504,61 @@ impl Flux2Klein {
             timings: Timings { encode_ms, denoise_ms, decode_ms },
         })
     }
+}
+
+/// The FLUX.2 autoencoder with its latent statistics, as FLUX.2 [klein] and
+/// FLUX 3 Image Klein use it: images to normalised, 2x2-patched latent
+/// tokens and back.
+pub(crate) struct Autoencoder {
+    pub(crate) cfg: VaeConfig,
+    pub(crate) w: Weights,
+    bn_mean: Vec<f32>,
+    bn_std: Vec<f32>,
+}
+
+impl Autoencoder {
+    /// `vae/config.json`, checked for the patched latent statistics and the
+    /// post-quantisation convolution this implementation covers.
+    pub(crate) fn config(files: &CheckpointFiles) -> Result<VaeConfig> {
+        let cfg: VaeConfig = parse(files.json("vae/config.json")?, "vae config")?;
+        cfg.validate()?;
+        if cfg.patch_size != [2, 2] || !cfg.use_post_quant_conv {
+            return Err(Error::Config("expected patched latent statistics and a post-quantisation convolution".into()));
+        }
+        Ok(cfg)
+    }
+
+    /// Encoder and decoder weights and the latent statistics from `vae/`.
+    pub(crate) fn load(backend: &Backend, files: &CheckpointFiles, cfg: VaeConfig) -> Result<Self> {
+        let vae_files = SafeTensors::open(&files.weights("vae")?)?;
+        let mut specs = cfg.weight_specs();
+        specs.extend(cfg.encoder_weight_specs());
+        let w = Weights::load(backend, &vae_files, &specs)?;
+        let (bn_mean, bn_std) = vae::latent_stats(&vae_files, &cfg)?;
+        Ok(Self { cfg, w, bn_mean, bn_std })
+    }
+
+    /// Pixels per latent token along each side.
+    pub(crate) fn cell(&self) -> u32 {
+        self.cfg.scale_factor() as u32 * 2
+    }
+
+    /// 8-bit RGB of patched latent tokens `[gh * gw][channels]`.
+    pub(crate) fn decode(&self, backend: &Backend, x: &[f32], gh: usize, gw: usize) -> Result<Vec<u8>> {
+        let lat = self.unpatch(x, gh, gw);
+        let mut g = Graph::new(backend)?;
+        let io = vae::build_decoder(&mut g, &self.cfg, &self.w, (2 * gw) as i64, (2 * gh) as i64);
+        g.finish(&[io.out])?;
+        g.set_f32(io.latents, &lat);
+        g.compute()?;
+        let px = g.read_f32(io.out);
+        let f = self.cfg.scale_factor() as usize;
+        Ok(to_rgb(&px, 2 * gw * f, 2 * gh * f))
+    }
 
     /// Encode a reference image to normalised, patched latent tokens
     /// `[tokens][channels]` in row-major order.
-    fn encode_reference(&self, r: &RgbImage) -> Result<Vec<f32>> {
+    pub(crate) fn encode(&self, backend: &Backend, r: &RgbImage) -> Result<Vec<f32>> {
         let (w, h) = (r.width as usize, r.height as usize);
         let mut px = vec![0f32; 3 * w * h];
         for y in 0..h {
@@ -538,20 +568,20 @@ impl Flux2Klein {
                 }
             }
         }
-        let mut g = Graph::new(&self.backend)?;
-        let io = vae::build_encoder(&mut g, &self.vae_cfg, &self.vae, w as i64, h as i64);
+        let mut g = Graph::new(backend)?;
+        let io = vae::build_encoder(&mut g, &self.cfg, &self.w, w as i64, h as i64);
         g.finish(&[io.mean])?;
         g.set_f32(io.pixels, &px);
         g.compute()?;
         let mean = g.read_f32(io.mean);
-        let f = self.vae_cfg.scale_factor() as usize;
+        let f = self.cfg.scale_factor() as usize;
         Ok(self.patch(&mean, h / f / 2, w / f / 2))
     }
 
     /// The 2x2 patching and latent normalisation: a `[W, H, C]` latent image
     /// to tokens `[gh * gw][c * 4]`. Inverse of [`Self::unpatch`].
     fn patch(&self, lat: &[f32], gh: usize, gw: usize) -> Vec<f32> {
-        let pc = self.dit_cfg.in_channels as usize;
+        let pc = self.cfg.latent_channels as usize * 4;
         let (w, h) = (2 * gw, 2 * gh);
         let mut out = vec![0f32; gh * gw * pc];
         for ty in 0..gh {
@@ -569,8 +599,8 @@ impl Flux2Klein {
 
     /// Undo the latent normalisation and the 2x2 patching: tokens
     /// `[gh * gw][c * 4]` to a `[W, H, C]` latent image.
-    fn unpatch(&self, x: &[f32], gh: usize, gw: usize) -> Vec<f32> {
-        let pc = self.dit_cfg.in_channels as usize;
+    pub(crate) fn unpatch(&self, x: &[f32], gh: usize, gw: usize) -> Vec<f32> {
+        let pc = self.cfg.latent_channels as usize * 4;
         let c = pc / 4;
         let (w, h) = (2 * gw, 2 * gh);
         let mut out = vec![0f32; c * h * w];

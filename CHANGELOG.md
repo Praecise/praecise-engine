@@ -33,6 +33,14 @@
 
 ### Added
 
+- FLUX 3 Image Klein (`praecise_diffusion::flux3::image::Flux3Image`):
+  text-to-image and editing from up to ten references, distilled (flow map,
+  16 steps) and base (50 guided steps), from the release's own layout.
+  `Flux3Transformer::forward_to` takes a flow map's target time;
+  `with_spatial_rope_scale` and the text encoder's `with_padding_position`
+  serve its placement. Float8 weights take a scale per row as well as per
+  tensor, and NVFP4 weights load (`SafeTensors::dequantize_nvfp4`).
+
 - Session checkpoints from the batch engine: a sequence exports from a KV
   stream of its own to a context of any stream count; a pending export is
   answered when the first sampled token ends the request, and an export of a

@@ -46,6 +46,7 @@ pub struct TextEncoder {
     pad: u32,
     layers: Vec<usize>,
     exact: bool,
+    padding_position: Option<i32>,
 }
 
 impl std::fmt::Debug for TextEncoder {
@@ -92,7 +93,17 @@ impl TextEncoder {
         let backend = Backend::select(opts.cpu_threads)?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "text encoder backend selected");
         let w = Weights::load(&backend, &st, &cfg.weight_specs(LAYOUT, last, opts.precision.wtype())?)?;
-        Ok(Self { backend, cfg, w, theta, tokenizer, pad, layers: layers.to_vec(), exact: opts.precision == Precision::F32 })
+        Ok(Self { backend, cfg, w, theta, tokenizer, pad, layers: layers.to_vec(), exact: opts.precision == Precision::F32, padding_position: None })
+    }
+
+    /// Give every padding token position `pos` instead of continuing the
+    /// prompt's positions through the padding. The image model was trained so
+    /// (its reference passes position 1 for padding), and it attends to the
+    /// padding, so the context depends on it.
+    #[must_use]
+    pub fn with_padding_position(mut self, pos: i32) -> Self {
+        self.padding_position = Some(pos);
+        self
     }
 
     /// Width of one context token.
@@ -131,8 +142,9 @@ impl TextEncoder {
         let io = qwen3::build(&mut g, &self.cfg, &self.w, LAYOUT, n as i64, &self.layers, self.theta, self.exact);
         g.finish(&[io.out])?;
         g.set_i32(io.tokens, &t.ids);
-        // Text-only prompts take plain sequential positions, padding included.
-        let pos: Vec<i32> = (0..n as i32).collect();
+        // Text-only prompts take plain sequential positions, through the
+        // padding unless it has a position of its own.
+        let pos: Vec<i32> = (0..n as i32).map(|i| self.padding_position.filter(|_| i as usize >= t.real).unwrap_or(i)).collect();
         g.set_i32(io.positions, &pos);
         g.set_f16(io.mask, &qwen3::mask(n, t.real));
         g.compute()?;

@@ -49,6 +49,9 @@ pub struct Flux3Config {
     pub streams: Vec<(String, u64)>,
     /// Rotary widths of the four position axes `(t, h, w, l)`.
     pub axes_dim: [u64; 4],
+    /// A step-distilled flow map: each evaluation also takes the time the
+    /// step jumps to (`ref_time_in`), and predicts the velocity of that jump.
+    pub flow_map: bool,
 }
 
 impl Flux3Config {
@@ -87,6 +90,7 @@ impl Flux3Config {
             vec_in_dim: st.get("vector_in.in_layer.weight").map(|v| v.shape[1]),
             streams,
             axes_dim: [head_dim / 4; 4],
+            flow_map: st.get("ref_time_in.in_layer.weight").is_some(),
         };
         if cfg.streams.is_empty() || cfg.depth_single_blocks == 0 {
             return Err(Error::Config("checkpoint has no content streams or no single-stream blocks".into()));
@@ -141,6 +145,10 @@ impl Flux3Config {
         if let Some(vd) = self.vec_in_dim {
             v.push(WeightSpec::new("vector_in.in_layer.weight", &[d, vd], WType::F32));
             v.push(WeightSpec::new("vector_in.out_layer.weight", &[d, d], WType::F32));
+        }
+        if self.flow_map {
+            v.push(WeightSpec::new("ref_time_in.in_layer.weight", &[d, TIME_FEATURES as u64], WType::F32));
+            v.push(WeightSpec::new("ref_time_in.out_layer.weight", &[d, d], WType::F32));
         }
         let mut mods = vec!["early_stream_modulations", "single_stream_modulations"];
         if self.depth_late_blocks > 0 {
@@ -292,6 +300,7 @@ pub struct Flux3Transformer {
     cfg: Flux3Config,
     w: Weights,
     exact: bool,
+    spatial_rope_scale: f32,
 }
 
 impl std::fmt::Debug for Flux3Transformer {
@@ -320,11 +329,28 @@ impl Flux3Transformer {
     /// On an unsupported layout, missing weights or no usable backend.
     pub fn load(files: &[std::path::PathBuf], prefix: &str, opts: LoadOptions) -> Result<Self> {
         let st = SafeTensors::open(files)?.renamed(|n| n.strip_prefix(prefix).map(str::to_owned))?;
-        let cfg = Flux3Config::from_tensors(&st)?;
+        Self::from_safetensors(&st, opts)
+    }
+
+    /// Load from tensors already named as in the checkpoint.
+    ///
+    /// # Errors
+    /// On an unsupported layout, missing weights or no usable backend.
+    pub fn from_safetensors(st: &SafeTensors, opts: LoadOptions) -> Result<Self> {
+        let cfg = Flux3Config::from_tensors(st)?;
         let backend = opts.backend()?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), streams = ?cfg.streams, "multi-stream transformer backend selected");
-        let w = Weights::load(&backend, &st, &cfg.weight_specs(opts.precision.wtype()))?;
-        Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32 })
+        let w = Weights::load(&backend, st, &cfg.weight_specs(opts.precision.wtype()))?;
+        Ok(Self { backend, cfg, w, exact: opts.precision == Precision::F32, spatial_rope_scale: 1.0 })
+    }
+
+    /// Positions on the `h` and `w` axes are multiplied by `scale` before the
+    /// rotary embedding (the image model places its latent grid at half
+    /// steps); 1 by default.
+    #[must_use]
+    pub fn with_spatial_rope_scale(mut self, scale: f32) -> Self {
+        self.spatial_rope_scale = scale;
+        self
     }
 
     /// The configuration.
@@ -340,7 +366,26 @@ impl Flux3Transformer {
     /// # Errors
     /// On an unknown stream, mismatched input lengths or a backend failure.
     pub fn forward(&self, text: TextInput<'_>, vector: Option<&[f32]>, streams: &[StreamInput<'_>]) -> Result<Vec<Vec<f32>>> {
+        self.forward_to(text, vector, streams, None)
+    }
+
+    /// [`Self::forward`] for a flow-map model, which also takes `target`, the
+    /// time in `[0, 1]` the step jumps to. `target` is required by, and only
+    /// by, a flow-map model.
+    ///
+    /// # Errors
+    /// As [`Self::forward`], and when `target` disagrees with the model.
+    pub fn forward_to(
+        &self,
+        text: TextInput<'_>,
+        vector: Option<&[f32]>,
+        streams: &[StreamInput<'_>],
+        target: Option<f32>,
+    ) -> Result<Vec<Vec<f32>>> {
         let cfg = &self.cfg;
+        if target.is_some() != cfg.flow_map {
+            return Err(Error::Request("the time a step jumps to is taken by, and only by, a flow-map model".into()));
+        }
         let d = cfg.hidden_size as i64;
         let n_txt = text.ids.len();
         if n_txt == 0 || text.tokens.len() != n_txt * cfg.context_in_dim as usize || text.timesteps.len() != n_txt {
@@ -385,12 +430,19 @@ impl Flux3Transformer {
             let h = g.silu(h);
             g.linear(w.get("vector_in.out_layer.weight"), h)
         });
-        // Per-token conditioning: time embedding plus the global vector, then SiLU.
+        let target_in = target.map(|_| g.input(sys::GGML_TYPE_F32, &[TIME_FEATURES as i64]));
+        let target_emb = target_in.map(|t| {
+            let h = g.linear(w.get("ref_time_in.in_layer.weight"), t);
+            let h = g.silu(h);
+            g.linear(w.get("ref_time_in.out_layer.weight"), h)
+        });
+        // Per-token conditioning: time embedding plus the global vector and
+        // the embedded target time, then SiLU.
         let cond = |g: &mut Graph, t_feat: Tn| {
             let h = g.linear(w.get("time_in.in_layer.weight"), t_feat);
             let h = g.silu(h);
             let mut v = g.linear(w.get("time_in.out_layer.weight"), h);
-            if let Some(e) = vector_emb {
+            for e in [vector_emb, target_emb].into_iter().flatten() {
                 v = g.add(v, e);
             }
             v
@@ -453,7 +505,7 @@ impl Flux3Transformer {
         }
         g.finish(&outs)?;
 
-        g.set_f32(freq_factors, &axis_rope_freq_factors(&cfg.axes_dim, cfg.head_dim, THETA));
+        g.set_f32(freq_factors, &spatial_freq_factors(&cfg.axes_dim, cfg.head_dim, self.spatial_rope_scale));
         let feats = |ts: &[f32]| ts.iter().flat_map(|&t| timestep_features(t * TIME_FACTOR, TIME_FEATURES)).collect::<Vec<f32>>();
         let pos = |ids: &[[i32; 4]]| rope_positions(&ids.iter().map(|p| p.map(|v| v as f32)).collect::<Vec<_>>());
         g.set_f32(txt_io.tokens, text.tokens);
@@ -470,11 +522,28 @@ impl Flux3Transformer {
         if let (Some(io), Some(v)) = (vec_in, vector) {
             g.set_f32(io, v);
         }
+        if let (Some(io), Some(t)) = (target_in, target) {
+            g.set_f32(io, &timestep_features(t * TIME_FACTOR, TIME_FEATURES));
+        }
         g.compute()?;
         Ok(outs.iter().map(|&o| g.read_f32(o)).collect())
     }
 }
 
+/// Rotary frequency factors with the `h` and `w` axes' positions scaled by
+/// `scale`: ggml divides each frequency by its factor, so scaling a position
+/// is dividing that axis's factors by `scale`.
+fn spatial_freq_factors(axes: &[u64; 4], head_dim: u64, scale: f32) -> Vec<f32> {
+    let mut f = axis_rope_freq_factors(axes, head_dim, THETA);
+    let start = (axes[0] / 2) as usize;
+    let end = start + ((axes[1] + axes[2]) / 2) as usize;
+    for v in &mut f[start..end] {
+        *v /= scale;
+    }
+    f
+}
+
+pub mod image;
 pub mod packing;
 pub mod policy;
 pub mod release;

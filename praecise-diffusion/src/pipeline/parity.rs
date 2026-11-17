@@ -83,7 +83,7 @@ fn parity_one_transformer_evaluation_matches_the_reference() {
     let m = meta();
     let emb = bin("prompt_embeds");
     let noise = bin("noise");
-    let cell = p.vae_cfg.scale_factor() as usize * 2;
+    let cell = p.ae.cfg.scale_factor() as usize * 2;
     let (gh, gw) = (m["height"].as_u64().unwrap() as usize / cell, m["width"].as_u64().unwrap() as usize / cell);
     let mut g = Graph::new(&p.backend).unwrap();
     let io = flux2::build(&mut g, &p.dit_cfg, &p.dit, MAX_PROMPT_TOKENS as i64, (gh * gw) as i64);
@@ -103,12 +103,12 @@ fn parity_one_transformer_evaluation_matches_the_reference() {
 fn parity_decode_matches_the_reference_autoencoder() {
     let p = load();
     let m = meta();
-    let cell = p.vae_cfg.scale_factor() as usize * 2;
+    let cell = p.ae.cfg.scale_factor() as usize * 2;
     let (h, w) = (m["height"].as_u64().unwrap() as usize, m["width"].as_u64().unwrap() as usize);
     let (gh, gw) = (h / cell, w / cell);
-    let lat = p.unpatch(&bin("noise"), gh, gw);
+    let lat = p.ae.unpatch(&bin("noise"), gh, gw);
     let mut g = Graph::new(&p.backend).unwrap();
-    let io = vae::build_decoder(&mut g, &p.vae_cfg, &p.vae, (2 * gw) as i64, (2 * gh) as i64);
+    let io = vae::build_decoder(&mut g, &p.ae.cfg, &p.ae.w, (2 * gw) as i64, (2 * gh) as i64);
     g.finish(&[io.out]).unwrap();
     g.set_f32(io.latents, &lat);
     g.compute().unwrap();
@@ -184,7 +184,7 @@ fn every_layer_norm_is_followed_by_its_scale_and_shift() {
 fn every_group_norm_is_followed_by_its_scale_and_shift() {
     let p = load();
     let mut g = Graph::new(&p.backend).unwrap();
-    let io = vae::build_decoder(&mut g, &p.vae_cfg, &p.vae, 8, 8);
+    let io = vae::build_decoder(&mut g, &p.ae.cfg, &p.ae.w, 8, 8);
     g.finish(&[io.out]).unwrap();
     let ops = g.ops();
     let norms: Vec<usize> = ops.iter().enumerate().filter(|(_, o)| *o == "GROUP_NORM").map(|(i, _)| i).collect();
