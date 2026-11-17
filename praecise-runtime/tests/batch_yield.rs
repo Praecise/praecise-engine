@@ -67,10 +67,15 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
         .expect("scored");
 
     // The same steps an uninterrupted run starts with: tokens, top-k ids and
-    // logits, bit for bit, since both were decoded the same way.
+    // logits, bit for bit. The run is on a fresh engine, so that it prefills
+    // the prompt as the yielded request did; this engine would reuse the
+    // prompt it has cached and compute the first logits from another batch.
+    let fresh = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default().with_n_gpu_layers(0)).expect("load");
+    let fresh = BatchEngine::spawn("m".into(), fresh, backend.clone(), 1024, false).expect("spawn");
     let (req, rx) = request(r.output_tokens, None);
-    engine.submit(req).expect("submit");
+    fresh.submit(req).expect("submit");
     let full = rx.blocking_recv().unwrap().expect("reference");
+    fresh.shutdown();
     let reference = full.commitment.expect("commitment");
     let want: Vec<u32> = reference.steps.iter().map(|s| s.token_id).collect();
     assert_eq!(tokens.iter().map(|&t| t as u32).collect::<Vec<_>>(), want, "{var}: the partial output is not the run's start");
