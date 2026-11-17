@@ -410,12 +410,7 @@ impl Flux2Klein {
             if r.width == 0 || r.height == 0 || r.width % cell != 0 || r.height % cell != 0 {
                 return Err(Error::Request(format!("reference {i}: sides must be positive multiples of {cell}")));
             }
-            if r.width * r.height > MAX_REFERENCE_PIXELS {
-                return Err(Error::Request(format!("reference {i}: larger than {MAX_REFERENCE_PIXELS} pixels")));
-            }
-            if r.rgb.len() != (r.width * r.height * 3) as usize {
-                return Err(Error::Request(format!("reference {i}: pixel buffer does not match its size")));
-            }
+            check_reference_size(i, r, MAX_REFERENCE_PIXELS)?;
         }
         let n = (req.width / cell) as usize * (req.height / cell) as usize * self.dit_cfg.in_channels as usize;
         let noise = schedule::gaussian(req.seed, n);
@@ -504,6 +499,19 @@ impl Flux2Klein {
             timings: Timings { encode_ms, denoise_ms, decode_ms },
         })
     }
+}
+
+/// A reference of at most `max_pixels` whose buffer holds exactly its
+/// pixels, counted wide enough that no side can wrap the product.
+pub(crate) fn check_reference_size(i: usize, r: &RgbImage, max_pixels: u32) -> Result<()> {
+    let pixels = u64::from(r.width) * u64::from(r.height);
+    if pixels > u64::from(max_pixels) {
+        return Err(Error::Request(format!("reference {i}: larger than {max_pixels} pixels")));
+    }
+    if r.rgb.len() as u64 != pixels * 3 {
+        return Err(Error::Request(format!("reference {i}: pixel buffer does not match its size")));
+    }
+    Ok(())
 }
 
 /// The FLUX.2 autoencoder with its latent statistics, as FLUX.2 [klein] and
@@ -621,6 +629,22 @@ impl Autoencoder {
 
 #[cfg(test)]
 mod parity;
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn a_reference_whose_pixel_count_wraps_u32_is_refused() {
+        let huge = RgbImage { width: 65536, height: 65536, rgb: Vec::new() };
+        let err = check_reference_size(0, &huge, MAX_REFERENCE_PIXELS).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
+        let small = RgbImage { width: 16, height: 16, rgb: vec![0; 16 * 16 * 3] };
+        assert!(check_reference_size(0, &small, MAX_REFERENCE_PIXELS).is_ok());
+        let short = RgbImage { rgb: vec![0; 3], ..small };
+        assert!(check_reference_size(0, &short, MAX_REFERENCE_PIXELS).is_err());
+    }
+}
 
 fn to_rgb(px: &[f32], w: usize, h: usize) -> Vec<u8> {
     let mut rgb = vec![0u8; w * h * 3];

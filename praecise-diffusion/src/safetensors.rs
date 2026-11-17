@@ -308,14 +308,16 @@ impl SafeTensors {
         let names: Vec<String> = self.entries.iter().filter(|(_, e)| e.dtype == Dtype::F8E4M3).map(|(n, _)| n.clone()).collect();
         for name in names {
             let scale_name = format!("{name}_scale");
-            let rows = self.entries[&name].shape.first().copied().unwrap_or(1) as usize;
+            let rows = self.entries[&name].shape.first().copied().unwrap_or(1);
+            let per_tensor = |s: &[u64]| s.is_empty() || s == [1];
+            let per_row = |s: &[u64]| s == [rows] || s == [rows, 1];
             let scale = match self.get(&scale_name) {
-                Some(v) if (v.numel() == 1 || v.numel() == rows) && !matches!(v.dtype, Dtype::Other(_) | Dtype::Quant(_)) => v.to_f32(),
+                Some(v) if (per_tensor(v.shape) || per_row(v.shape)) && !matches!(v.dtype, Dtype::Other(_) | Dtype::Quant(_)) => v.to_f32(),
                 _ => return Err(Error::Weights(format!("float8 tensor {name} has no scale {scale_name}"))),
             };
             let e = self.entries.remove(&name).expect("listed");
             let src = &self.maps[e.file][e.start..e.end];
-            let row_len = src.len() / rows.max(1);
+            let row_len = src.len() / (rows as usize).max(1);
             let mut buf = Vec::with_capacity(2 * src.len());
             for (i, &b) in src.iter().enumerate() {
                 let s = if scale.len() == 1 { scale[0] } else { scale[i / row_len] };
@@ -703,6 +705,14 @@ pub(crate) mod tests {
         assert_eq!(st.require("t.weight", &[2, 2]).unwrap().to_f32(), vec![3.0, -3.0, 3.0, -3.0]);
         assert_eq!(st.require("r.weight", &[2, 2]).unwrap().to_f32(), vec![2.0, -2.0, 0.5, -0.5]);
         assert!(st.get("r.weight_scale").is_none() && st.get("r.input_scale").is_none());
+
+        // One scale per column of a square weight is not read as one per row.
+        let path = dir.join("b.safetensors");
+        write_raw(&path, &[
+            ("c.weight", "F8_E4M3", vec![2, 2], vec![0x38, 0xb8, 0x38, 0xb8]),
+            ("c.weight_scale", "F32", vec![1, 2], f32_bytes(&[2.0, 0.5])),
+        ]);
+        assert!(SafeTensors::open(&[path]).unwrap().dequantize_scaled_f8().is_err());
     }
 
     #[test]

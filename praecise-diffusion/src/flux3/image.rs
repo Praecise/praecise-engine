@@ -24,7 +24,7 @@ use super::text_encoder::{CONTEXT_LAYERS, TextEncoder};
 use super::{Flux3Transformer, StreamInput, TextInput};
 use crate::error::{Error, Result};
 use crate::ggml::Backend;
-use crate::pipeline::{Autoencoder, CheckpointFiles, Image, LoadOptions, Request, Timings};
+use crate::pipeline::{Autoencoder, CheckpointFiles, Image, LoadOptions, Request, Timings, check_reference_size};
 use crate::safetensors::SafeTensors;
 use crate::schedule;
 
@@ -140,12 +140,7 @@ impl Flux3Image {
             if !side(r.width, r.height) {
                 return Err(Error::Request(format!("reference {i}: sides must be positive multiples of {cell}")));
             }
-            if r.width * r.height > MAX_REFERENCE_PIXELS {
-                return Err(Error::Request(format!("reference {i}: larger than {MAX_REFERENCE_PIXELS} pixels")));
-            }
-            if r.rgb.len() != (r.width * r.height * 3) as usize {
-                return Err(Error::Request(format!("reference {i}: pixel buffer does not match its size")));
-            }
+            check_reference_size(i, r, MAX_REFERENCE_PIXELS)?;
         }
         let n = (req.width / cell) as usize * (req.height / cell) as usize * self.ae.cfg.latent_channels as usize * 4;
         self.run(req, schedule::gaussian(req.seed, n))

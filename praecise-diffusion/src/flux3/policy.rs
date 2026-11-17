@@ -430,10 +430,11 @@ impl std::fmt::Debug for ActionPolicy {
     }
 }
 
-/// Check that a transformer carries the streams the settings name.
+/// Check that a transformer carries the streams the settings name, and
+/// output heads for the video and action streams the policy reads.
 ///
 /// # Errors
-/// When a stream is missing or has the wrong width.
+/// When a stream is missing, has the wrong width or lacks its head.
 pub fn check_transformer(cfg: &PolicyConfig, dit: &Flux3Transformer) -> Result<()> {
     let dc = dit.config();
     let want = [
@@ -447,7 +448,15 @@ pub fn check_transformer(cfg: &PolicyConfig, dit: &Flux3Transformer) -> Result<(
             return Err(Error::Config(format!("transformer stream {name} does not carry {ch} channels")));
         }
     }
-    Ok(())
+    require_heads(dc, &["video", cfg.action_modality.as_str()])
+}
+
+/// Every stream of `names` has an output head.
+fn require_heads(dc: &super::Flux3Config, names: &[&str]) -> Result<()> {
+    match names.iter().find(|n| !dc.output_streams.iter().any(|m| m == *n)) {
+        Some(n) => Err(Error::Config(format!("transformer stream {n} has no output head"))),
+        None => Ok(()),
+    }
 }
 
 /// Pack an observation into conditioning tokens with the video autoencoder.
@@ -582,3 +591,31 @@ impl ActionPolicy {
 
 #[cfg(test)]
 mod parity;
+
+#[cfg(test)]
+mod head_tests {
+    use super::*;
+
+    #[test]
+    fn a_policy_needs_heads_on_the_streams_it_reads() {
+        let stream = |m: &str| (m.to_owned(), 8);
+        let mut dc = super::super::Flux3Config {
+            hidden_size: 32,
+            head_dim: 16,
+            mlp_hidden: 96,
+            depth: 1,
+            depth_single_blocks: 1,
+            depth_late_blocks: 0,
+            context_in_dim: 24,
+            vec_in_dim: None,
+            streams: vec![stream("action"), stream("action_cond"), stream("video"), stream("video_cond")],
+            axes_dim: [4; 4],
+            output_streams: vec!["action".into(), "video".into()],
+            flow_map: false,
+        };
+        assert!(require_heads(&dc, &["video", "action"]).is_ok());
+        dc.output_streams = vec!["video".into()];
+        let err = require_heads(&dc, &["video", "action"]).unwrap_err().to_string();
+        assert!(err.contains("action has no output head"), "{err}");
+    }
+}
