@@ -768,6 +768,10 @@ impl BatchEngine {
     /// conversation is therefore a request of its history with `max_tokens: 1`
     /// submitted this way.
     ///
+    /// A request refused at admission, or asked to yield before its prompt is
+    /// in, has no positions to export: the export is refused, and the
+    /// request's own result carries the reason.
+    ///
     /// # Errors
     /// Immediately when the engine cannot migrate or its queue is full;
     /// through the receiver as [`export_sequence`](Self::export_sequence).
@@ -2234,8 +2238,10 @@ fn scheduler_loop(
                 },
             };
             // An export that came with the request is pending from here on: it
-            // is answered at the first exportable step boundary, at the
-            // sequence's end, or refused with the reason the request was.
+            // is answered at the first exportable step boundary or at the
+            // sequence's end. A request refused at admission, or yielded before
+            // its prompt is in, leaves it to be refused as a ticket that no
+            // running sequence holds; the reason goes to the request's result.
             if let (Some(tx), Some(t)) = (export, ticket) {
                 exports.push(PendingExport { ticket: t, reply: ExportReply::Delta(tx) });
             }
