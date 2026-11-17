@@ -72,6 +72,7 @@ impl Dtype {
     }
 }
 
+#[derive(Clone)]
 struct Entry {
     file: usize,
     dtype: Dtype,
@@ -296,25 +297,29 @@ impl SafeTensors {
     }
 
     /// Float8 (e4m3) weights `<layer>.weight` stored with a float32 scale
-    /// `<layer>.weight_scale` become bfloat16 tensors of their scaled values.
-    /// The layer's other quantisation tensors (`<layer>.input_scale`, and
-    /// non-float ones) are dropped: the products run at the load precision.
+    /// `<layer>.weight_scale`, one for the tensor or one per row, become
+    /// bfloat16 tensors of their scaled values. The layer's other
+    /// quantisation tensors (`<layer>.input_scale`, and non-float ones) are
+    /// dropped: the products run at the load precision.
     ///
     /// # Errors
-    /// A float8 tensor without a one-element float scale.
+    /// A float8 tensor without a float scale of one element or one per row.
     pub fn dequantize_scaled_f8(mut self) -> Result<Self> {
         let names: Vec<String> = self.entries.iter().filter(|(_, e)| e.dtype == Dtype::F8E4M3).map(|(n, _)| n.clone()).collect();
         for name in names {
             let scale_name = format!("{name}_scale");
+            let rows = self.entries[&name].shape.first().copied().unwrap_or(1) as usize;
             let scale = match self.get(&scale_name) {
-                Some(v) if v.numel() == 1 && !matches!(v.dtype, Dtype::Other(_) | Dtype::Quant(_)) => v.to_f32()[0],
+                Some(v) if (v.numel() == 1 || v.numel() == rows) && !matches!(v.dtype, Dtype::Other(_) | Dtype::Quant(_)) => v.to_f32(),
                 _ => return Err(Error::Weights(format!("float8 tensor {name} has no scale {scale_name}"))),
             };
             let e = self.entries.remove(&name).expect("listed");
             let src = &self.maps[e.file][e.start..e.end];
+            let row_len = src.len() / rows.max(1);
             let mut buf = Vec::with_capacity(2 * src.len());
-            for &b in src {
-                buf.extend_from_slice(&half::bf16::from_f32(f8e4m3(b) * scale).to_bits().to_le_bytes());
+            for (i, &b) in src.iter().enumerate() {
+                let s = if scale.len() == 1 { scale[0] } else { scale[i / row_len] };
+                buf.extend_from_slice(&half::bf16::from_f32(f8e4m3(b) * s).to_bits().to_le_bytes());
             }
             let len = buf.len();
             self.maps.push(Store::Owned(buf));
@@ -323,6 +328,61 @@ impl SafeTensors {
             if let Some(layer) = name.strip_suffix(".weight") {
                 let prefix = format!("{layer}.");
                 self.entries.retain(|n, e| !(n.starts_with(&prefix) && (n.ends_with(".input_scale") || matches!(e.dtype, Dtype::Other(_)))));
+            }
+        }
+        Ok(self)
+    }
+
+    /// NVFP4 weights become bfloat16 tensors of their values. A layer stores
+    /// `<layer>.weight` as bytes of two 4-bit e2m1 values (the low nibble
+    /// first), `<layer>.weight_scale` as one float8 e4m3 scale per 16 values
+    /// of a row, and `<layer>.weight_scale_2` as one float32 scale for the
+    /// tensor; a value is `e2m1 * weight_scale * weight_scale_2`. The layer's
+    /// scales and `<layer>.input_scale` are dropped.
+    ///
+    /// # Errors
+    /// When a layer's tensors disagree in shape or type.
+    pub fn dequantize_nvfp4(mut self) -> Result<Self> {
+        const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let layers: Vec<String> =
+            self.entries.keys().filter_map(|n| n.strip_suffix(".weight_scale_2").map(str::to_owned)).collect();
+        for layer in layers {
+            let (w, ws, ws2) = (format!("{layer}.weight"), format!("{layer}.weight_scale"), format!("{layer}.weight_scale_2"));
+            let bad = |what: &str| Error::Weights(format!("NVFP4 layer {layer}: {what}"));
+            let global = match self.get(&ws2) {
+                Some(v) if v.numel() == 1 && !matches!(v.dtype, Dtype::Other(_) | Dtype::Quant(_)) => v.to_f32()[0],
+                _ => return Err(bad("weight_scale_2 is not one float")),
+            };
+            let (packed, scales) = match (self.entries.get(&w), self.entries.get(&ws)) {
+                (Some(p), Some(s)) if p.dtype == Dtype::Other(1) && s.dtype == Dtype::F8E4M3 => (p.clone(), s.clone()),
+                _ => return Err(bad("weight is not packed bytes or weight_scale is not float8")),
+            };
+            let (rows, half_cols) = match packed.shape[..] {
+                [r, c] => (r as usize, c as usize),
+                _ => return Err(bad("weight is not a matrix")),
+            };
+            let cols = 2 * half_cols;
+            if cols % 16 != 0 || scales.shape[..] != [rows as u64, (cols / 16) as u64] {
+                return Err(bad("weight_scale does not hold one scale per 16 values"));
+            }
+            let src = &self.maps[packed.file][packed.start..packed.end];
+            let sc = &self.maps[scales.file][scales.start..scales.end];
+            let mut buf = Vec::with_capacity(2 * rows * cols);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let byte = src[r * half_cols + c / 2];
+                    let nib = if c % 2 == 0 { byte & 0xf } else { byte >> 4 };
+                    let v = E2M1[usize::from(nib & 7)] * if nib & 8 != 0 { -1.0 } else { 1.0 };
+                    let v = v * f8e4m3(sc[r * (cols / 16) + c / 16]) * global;
+                    buf.extend_from_slice(&half::bf16::from_f32(v).to_bits().to_le_bytes());
+                }
+            }
+            let len = buf.len();
+            self.maps.push(Store::Owned(buf));
+            let shape = vec![rows as u64, cols as u64];
+            self.entries.insert(w, Entry { file: self.maps.len() - 1, dtype: Dtype::Bf16, shape, start: 0, end: len });
+            for n in [ws, ws2, format!("{layer}.input_scale")] {
+                self.entries.remove(&n);
             }
         }
         Ok(self)
@@ -602,6 +662,76 @@ pub(crate) mod tests {
                 f.write_all(&v.to_le_bytes()).unwrap();
             }
         }
+    }
+
+    /// Write a safetensors file of raw tensors `(name, dtype, shape, bytes)`.
+    fn write_raw(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)]) {
+        let mut header = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, dtype, shape, data) in tensors {
+            header.insert((*name).into(), serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + data.len()]}));
+            offset += data.len();
+        }
+        let header = serde_json::to_vec(&Value::Object(header)).unwrap();
+        let mut f = File::create(path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(&header).unwrap();
+        for (_, _, _, data) in tensors {
+            f.write_all(data).unwrap();
+        }
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn float8_weights_take_a_tensor_scale_or_one_per_row() {
+        let dir = std::env::temp_dir().join(format!("pd-st-f8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.safetensors");
+        // 1.0 and -1.0 in two rows of two.
+        let w = vec![0x38, 0xb8, 0x38, 0xb8];
+        write_raw(&path, &[
+            ("t.weight", "F8_E4M3", vec![2, 2], w.clone()),
+            ("t.weight_scale", "F32", vec![], f32_bytes(&[3.0])),
+            ("r.weight", "F8_E4M3", vec![2, 2], w),
+            ("r.weight_scale", "F32", vec![2, 1], f32_bytes(&[2.0, 0.5])),
+            ("r.input_scale", "F32", vec![], f32_bytes(&[1.0])),
+        ]);
+        let st = SafeTensors::open(&[path]).unwrap().dequantize_scaled_f8().unwrap();
+        assert_eq!(st.require("t.weight", &[2, 2]).unwrap().to_f32(), vec![3.0, -3.0, 3.0, -3.0]);
+        assert_eq!(st.require("r.weight", &[2, 2]).unwrap().to_f32(), vec![2.0, -2.0, 0.5, -0.5]);
+        assert!(st.get("r.weight_scale").is_none() && st.get("r.input_scale").is_none());
+    }
+
+    #[test]
+    fn nvfp4_weights_decode_to_their_values() {
+        let dir = std::env::temp_dir().join(format!("pd-st-fp4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.safetensors");
+        // Row 0: the eight positive e2m1 codes, then their negatives; row 1:
+        // 6.0 throughout. Low nibble first.
+        let mut packed = Vec::new();
+        for i in 0..8u8 {
+            let (a, b) = if i < 4 { (2 * i, 2 * i + 1) } else { (8 | (2 * (i - 4)), 8 | (2 * (i - 4) + 1)) };
+            packed.push(a | (b << 4));
+        }
+        packed.extend([0x77u8; 8]);
+        write_raw(&path, &[
+            ("l.weight", "U8", vec![2, 8], packed),
+            // Scales 2.0 and 0.5 (e4m3 0x40 and 0x30).
+            ("l.weight_scale", "F8_E4M3", vec![2, 1], vec![0x40, 0x30]),
+            ("l.weight_scale_2", "F32", vec![], f32_bytes(&[0.25])),
+            ("l.input_scale", "F32", vec![], f32_bytes(&[1.0])),
+        ]);
+        let st = SafeTensors::open(&[path]).unwrap().dequantize_nvfp4().unwrap();
+        let v = st.require("l.weight", &[2, 16]).unwrap().to_f32();
+        let codes = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let row0: Vec<f32> = codes.iter().chain(codes.iter()).enumerate().map(|(i, c)| if i < 8 { c * 0.5 } else { -c * 0.5 }).collect();
+        assert_eq!(&v[..16], &row0[..]);
+        assert_eq!(&v[16..], &[6.0 * 0.125; 16]);
+        assert!(st.get("l.weight_scale").is_none() && st.get("l.weight_scale_2").is_none() && st.get("l.input_scale").is_none());
     }
 
     #[test]
