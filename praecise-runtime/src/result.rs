@@ -41,6 +41,7 @@ impl StopReason {
             Self::Eos => "eos",
             Self::Length => "length",
             Self::StopSequence => "stop_sequence",
+            Self::Preempted => "preempted",
         }
     }
 }
@@ -199,6 +200,18 @@ impl ChatMessage {
             role: role.into(),
             content: content.into(),
             ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wire_spelling_of_every_stop_reason_is_its_serde_name() {
+        for reason in [StopReason::Eos, StopReason::Length, StopReason::StopSequence, StopReason::Preempted] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), reason.as_str(), "{reason:?}");
         }
     }
 }
