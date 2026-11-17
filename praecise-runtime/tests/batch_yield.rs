@@ -10,7 +10,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use praecise_runtime::result::StopReason;
-use praecise_runtime::toploc::verify_commitment;
+use praecise_runtime::toploc::{compare_step, verify_commitment};
 use praecise_runtime::{BatchEngine, BatchPrompt, BatchRequest, GenerationConfig, InferenceResult};
 use tokio::sync::{mpsc, oneshot};
 
@@ -65,16 +65,31 @@ fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
         .blocking_recv()
         .unwrap()
         .expect("scored");
-    let outcome = verify_commitment(&commitment, &rows);
-    eprintln!("{var}: yielded after {} tokens; {} of {} steps verify", r.output_tokens, outcome.steps_passed, outcome.steps_total);
-    assert!(outcome.pass, "{var}: {outcome:?}");
 
-    // The same tokens an uninterrupted run starts with.
+    // The same steps an uninterrupted run starts with: tokens, top-k ids and
+    // logits, bit for bit, since both were decoded the same way.
     let (req, rx) = request(r.output_tokens, None);
     engine.submit(req).expect("submit");
     let full = rx.blocking_recv().unwrap().expect("reference");
-    let want: Vec<u32> = full.commitment.expect("commitment").steps.iter().map(|s| s.token_id).collect();
+    let reference = full.commitment.expect("commitment");
+    let want: Vec<u32> = reference.steps.iter().map(|s| s.token_id).collect();
     assert_eq!(tokens.iter().map(|&t| t as u32).collect::<Vec<_>>(), want, "{var}: the partial output is not the run's start");
+    for (i, (a, b)) in commitment.steps.iter().zip(&reference.steps).enumerate() {
+        let a: Vec<(u32, u32)> = a.top_k.iter().map(|e| (e.token_id, e.logit.to_bits())).collect();
+        let b: Vec<(u32, u32)> = b.top_k.iter().map(|e| (e.token_id, e.logit.to_bits())).collect();
+        assert_eq!(a, b, "{var}: step {i} differs from the uninterrupted run");
+    }
+
+    let outcome = verify_commitment(&commitment, &rows);
+    eprintln!("{var}: yielded after {} tokens; {} of {} steps verify", r.output_tokens, outcome.steps_passed, outcome.steps_total);
+    for &i in &outcome.failing_steps {
+        let c = compare_step(&commitment.steps[i], &rows[i]);
+        eprintln!(
+            "{var}: step {i}: token supported {}, index overlap {}, mean logit delta {}",
+            c.token_supported, c.index_overlap, c.mean_logit_delta
+        );
+    }
+    assert!(outcome.pass, "{var}: {outcome:?}");
 
     // A ticket that names nothing any more is ignored.
     engine.yield_sequence(ticket).expect("a stale yield is not an error");
