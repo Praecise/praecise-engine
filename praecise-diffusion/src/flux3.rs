@@ -49,6 +49,10 @@ pub struct Flux3Config {
     pub streams: Vec<(String, u64)>,
     /// Rotary widths of the four position axes `(t, h, w, l)`.
     pub axes_dim: [u64; 4],
+    /// Streams with an output head (`final_layer.<stream>`), sorted. The
+    /// others only condition: the image model predicts its image stream and
+    /// not its reference stream.
+    pub output_streams: Vec<String>,
     /// A step-distilled flow map: each evaluation also takes the time the
     /// step jumps to (`ref_time_in`), and predicts the velocity of that jump.
     pub flow_map: bool,
@@ -79,6 +83,7 @@ impl Flux3Config {
         if head_dim % 8 != 0 || hidden_size % head_dim != 0 {
             return Err(Error::Config(format!("head width {head_dim} does not split hidden width {hidden_size}")));
         }
+        let output_streams = streams_with_heads(st, &streams);
         let cfg = Self {
             hidden_size,
             head_dim,
@@ -90,10 +95,11 @@ impl Flux3Config {
             vec_in_dim: st.get("vector_in.in_layer.weight").map(|v| v.shape[1]),
             streams,
             axes_dim: [head_dim / 4; 4],
+            output_streams,
             flow_map: st.get("ref_time_in.in_layer.weight").is_some(),
         };
-        if cfg.streams.is_empty() || cfg.depth_single_blocks == 0 {
-            return Err(Error::Config("checkpoint has no content streams or no single-stream blocks".into()));
+        if cfg.streams.is_empty() || cfg.depth_single_blocks == 0 || cfg.output_streams.is_empty() {
+            return Err(Error::Config("checkpoint has no content streams, output heads or single-stream blocks".into()));
         }
         Ok(cfg)
     }
@@ -162,8 +168,10 @@ impl Flux3Config {
         }
         for (m, c) in &self.streams {
             v.push(WeightSpec::new(format!("emb_in.{m}.weight"), &[d, *c], WType::F32));
-            v.push(WeightSpec::new(format!("final_layer.{m}.adaLN_modulation.1.weight"), &[2 * d, d], linear));
-            v.push(WeightSpec::new(format!("final_layer.{m}.linear.weight"), &[*c, d], WType::F32));
+            if self.output_streams.contains(m) {
+                v.push(WeightSpec::new(format!("final_layer.{m}.adaLN_modulation.1.weight"), &[2 * d, d], linear));
+                v.push(WeightSpec::new(format!("final_layer.{m}.linear.weight"), &[*c, d], WType::F32));
+            }
             for i in 0..self.depth {
                 self.block_specs(&mut v, &format!("content_mode_blocks.{m}.{i}"), linear);
             }
@@ -360,8 +368,9 @@ impl Flux3Transformer {
     }
 
     /// One evaluation: the prediction for every stream in `streams`, in the
-    /// same order, each `[n][channels]`. Streams absent from `streams` take
-    /// no part; the joint sequence is the text followed by `streams` in order.
+    /// same order, each `[n][channels]`, and an empty vector for a stream
+    /// without an output head. Streams absent from `streams` take no part;
+    /// the joint sequence is the text followed by `streams` in order.
     ///
     /// # Errors
     /// On an unknown stream, mismatched input lengths or a backend failure.
@@ -491,6 +500,10 @@ impl Flux3Transformer {
         }
         let mut outs = Vec::with_capacity(streams.len());
         for (j, s) in streams.iter().enumerate() {
+            if !cfg.output_streams.iter().any(|m| m == s.name) {
+                outs.push(None);
+                continue;
+            }
             // Final head: shift then scale, both from the stream's own conditioning.
             let m = g.linear(w.get(&format!("final_layer.{}.adaLN_modulation.1.weight", s.name)), s_act[j]);
             let shift = g.view_rows(m, 0, d);
@@ -501,9 +514,9 @@ impl Flux3Transformer {
             let xn = g.norm(xs[j], EPS);
             let xn = g.mul(xn, scale1);
             let xn = g.add(xn, shift);
-            outs.push(g.linear(w.get(&format!("final_layer.{}.linear.weight", s.name)), xn));
+            outs.push(Some(g.linear(w.get(&format!("final_layer.{}.linear.weight", s.name)), xn)));
         }
-        g.finish(&outs)?;
+        g.finish(&outs.iter().flatten().copied().collect::<Vec<_>>())?;
 
         g.set_f32(freq_factors, &spatial_freq_factors(&cfg.axes_dim, cfg.head_dim, self.spatial_rope_scale));
         let feats = |ts: &[f32]| ts.iter().flat_map(|&t| timestep_features(t * TIME_FACTOR, TIME_FEATURES)).collect::<Vec<f32>>();
@@ -526,8 +539,13 @@ impl Flux3Transformer {
             g.set_f32(io, &timestep_features(t * TIME_FACTOR, TIME_FEATURES));
         }
         g.compute()?;
-        Ok(outs.iter().map(|&o| g.read_f32(o)).collect())
+        Ok(outs.iter().map(|o| o.map_or_else(Vec::new, |o| g.read_f32(o))).collect())
     }
+}
+
+/// The streams of `streams` that have an output head.
+fn streams_with_heads(st: &SafeTensors, streams: &[(String, u64)]) -> Vec<String> {
+    streams.iter().map(|(m, _)| m.clone()).filter(|m| st.get(&format!("final_layer.{m}.linear.weight")).is_some()).collect()
 }
 
 /// Rotary frequency factors with the `h` and `w` axes' positions scaled by
