@@ -100,7 +100,7 @@ impl Flux3Image {
         }
         let backend = opts.backend()?;
         let ae = Autoencoder::load(&backend, files, Autoencoder::config(files)?)?;
-        let latent = u64::from(ae.cfg.latent_channels) * 4;
+        let latent = ae.cfg.latent_channels * 4;
         if cfg.streams.iter().any(|(_, c)| *c != latent) {
             return Err(Error::Config("transformer and autoencoder latent widths disagree".into()));
         }
