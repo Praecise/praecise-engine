@@ -153,18 +153,24 @@ impl TensorView<'_> {
             }
             Dtype::F32 => self
                 .bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect(),
             Dtype::F16 => self
                 .bytes
-                .chunks_exact(2)
-                .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_le_bytes(*b).to_f32())
                 .collect(),
             Dtype::Bf16 => self
                 .bytes
-                .chunks_exact(2)
-                .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::bf16::from_le_bytes(*b).to_f32())
                 .collect(),
         }
     }
@@ -234,10 +240,10 @@ impl SafeTensors {
     pub fn renamed(mut self, rename: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let mut entries = HashMap::with_capacity(self.entries.len());
         for (name, entry) in self.entries.drain() {
-            if let Some(new) = rename(&name) {
-                if entries.insert(new.clone(), entry).is_some() {
-                    return Err(Error::Weights(format!("two tensors are renamed to {new}")));
-                }
+            if let Some(new) = rename(&name)
+                && entries.insert(new.clone(), entry).is_some()
+            {
+                return Err(Error::Weights(format!("two tensors are renamed to {new}")));
             }
         }
         self.entries = entries;
@@ -431,18 +437,18 @@ impl SafeTensors {
     /// readable: a later read faults them in from the file again.
     pub fn release(&self, name: &str) {
         #[cfg(unix)]
-        if let Some(e) = self.entries.get(name) {
-            if let Some(Store::Map(map)) = self.maps.get(e.file) {
-                // A multiple of every page size in use (4, 16 and 64 KiB).
-                const PAGE: usize = 1 << 16;
-                let start = e.start.div_ceil(PAGE) * PAGE;
-                let end = e.end / PAGE * PAGE;
-                if end > start {
-                    // SAFETY: the mapping is private, read-only and backed by
-                    // a file nobody writes while it is mapped, so dropping its
-                    // pages only means the next read reloads the same bytes.
-                    let _ = unsafe { map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, end - start) };
-                }
+        if let Some(e) = self.entries.get(name)
+            && let Some(Store::Map(map)) = self.maps.get(e.file)
+        {
+            // A multiple of every page size in use (4, 16 and 64 KiB).
+            const PAGE: usize = 1 << 16;
+            let start = e.start.div_ceil(PAGE) * PAGE;
+            let end = e.end / PAGE * PAGE;
+            if end > start {
+                // SAFETY: the mapping is private, read-only and backed by
+                // a file nobody writes while it is mapped, so dropping its
+                // pages only means the next read reloads the same bytes.
+                let _ = unsafe { map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, end - start) };
             }
         }
         #[cfg(not(unix))]
@@ -618,7 +624,7 @@ fn parse_gguf(map: &[u8], file: usize, metadata: &mut HashMap<String, String>) -
             1 => Dtype::F16,
             30 => Dtype::Bf16,
             // SAFETY: a range-checked lookup in ggml's static type table.
-            t if t < sys::GGML_TYPE_COUNT as u32 && unsafe { sys::ggml_is_quantized(t as sys::ggml_type) } => Dtype::Quant(t),
+            t if t < sys::GGML_TYPE_COUNT && unsafe { sys::ggml_is_quantized(t as sys::ggml_type) } => Dtype::Quant(t),
             t => return Err(format!("tensor {name}: unsupported type {t}")),
         };
         let len = dtype.bytes(&shape).ok_or_else(|| format!("tensor {name}: rows are not whole blocks"))? as usize;
@@ -807,7 +813,7 @@ pub(crate) mod tests {
         b.extend(2u32.to_le_bytes());
         b.extend(32u64.to_le_bytes());
         b.extend(2u64.to_le_bytes());
-        b.extend((sys::GGML_TYPE_Q8_0 as u32).to_le_bytes());
+        b.extend(sys::GGML_TYPE_Q8_0.to_le_bytes());
         b.extend(32u64.to_le_bytes());
         b.resize(b.len().div_ceil(32) * 32, 0);
         for v in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
@@ -820,13 +826,13 @@ pub(crate) mod tests {
         }
         let path = std::env::temp_dir().join(format!("praecise-gguf-{}.gguf", std::process::id()));
         std::fs::write(&path, &b).unwrap();
-        let st = SafeTensors::open(&[path.clone()]).unwrap();
+        let st = SafeTensors::open(std::slice::from_ref(&path)).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(st.metadata("config"), Some("{\"a\":1}"));
         let a = st.require("a", &[2, 3]).unwrap();
         assert_eq!(a.to_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let q = st.require("q", &[2, 32]).unwrap();
-        assert_eq!(q.dtype, Dtype::Quant(sys::GGML_TYPE_Q8_0 as u32));
+        assert_eq!(q.dtype, Dtype::Quant(sys::GGML_TYPE_Q8_0));
         assert_eq!(q.bytes.len(), 2 * 34);
         let f = q.to_f32();
         assert_eq!(f[1], 0.5);

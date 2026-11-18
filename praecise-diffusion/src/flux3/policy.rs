@@ -353,7 +353,7 @@ pub fn sample_chunk(
     if noise.video.len() != LATENT_CHANNELS * nt * lh * lw || noise.action.len() != d * k {
         return Err(Error::Request("noise does not match the policy shapes".into()));
     }
-    if ctx.len() % width != 0 || ctx_uncond.is_some_and(|u| u.len() % width != 0) {
+    if !ctx.len().is_multiple_of(width) || ctx_uncond.is_some_and(|u| !u.len().is_multiple_of(width)) {
         return Err(Error::Request("text context width does not match the transformer".into()));
     }
     let action_name = cfg.action_modality.as_str();

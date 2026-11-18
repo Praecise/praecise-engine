@@ -400,7 +400,7 @@ impl Flux2Klein {
     /// serve; backend failures otherwise.
     pub fn generate(&mut self, req: &Request) -> Result<Image> {
         let cell = self.ae.cell();
-        if req.width == 0 || req.height == 0 || req.width % cell != 0 || req.height % cell != 0 {
+        if req.width == 0 || req.height == 0 || !req.width.is_multiple_of(cell) || !req.height.is_multiple_of(cell) {
             return Err(Error::Request(format!("width and height must be positive multiples of {cell}")));
         }
         if req.steps == 0 {

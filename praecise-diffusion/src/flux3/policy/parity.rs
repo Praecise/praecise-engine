@@ -11,13 +11,13 @@ use super::*;
 use crate::pipeline::Precision;
 
 fn f32s(dir: &Path, name: &str) -> Vec<f32> {
-    std::fs::read(dir.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    std::fs::read(dir.join(format!("{name}.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 fn ids(dir: &Path, name: &str) -> Vec<[i32; 4]> {
     let v: Vec<i32> =
-        std::fs::read(dir.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-    v.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+        std::fs::read(dir.join(format!("{name}.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b)).collect();
+    v.as_chunks::<4>().0.to_vec()
 }
 
 fn agreement(ours: &[f32], reference: &[f32]) -> (f64, f64) {
@@ -82,7 +82,7 @@ fn run(precision: Precision, min_cos: f64, max_rel: f64) {
 }
 
 fn ids_flat(dir: &Path, name: &str) -> Vec<i32> {
-    std::fs::read(dir.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    std::fs::read(dir.join(format!("{name}.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b)).collect()
 }
 
 #[test]

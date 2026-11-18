@@ -179,7 +179,7 @@ mod parity {
             assert_eq!(t.ids, want_ids, "case {i}: token ids");
             assert_eq!(t.real, c["real"].as_u64().unwrap() as usize);
             let ours = te.encode_tokens(&t).unwrap();
-            let want: Vec<f32> = std::fs::read(root.join(format!("ctx{i}.f32"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            let want: Vec<f32> = std::fs::read(root.join(format!("ctx{i}.f32"))).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
             assert_eq!(ours.len(), want.len());
             let (mut dot, mut a2, mut b2, mut d2) = (0f64, 0f64, 0f64, 0f64);
             for (&a, &b) in ours.iter().zip(&want) {
