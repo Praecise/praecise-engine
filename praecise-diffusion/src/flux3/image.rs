@@ -126,7 +126,7 @@ impl Flux3Image {
     /// cannot serve; backend failures otherwise.
     pub fn generate(&self, req: &Request) -> Result<Image> {
         let cell = self.ae.cell();
-        let side = |w: u32, h: u32| w > 0 && h > 0 && w % cell == 0 && h % cell == 0;
+        let side = |w: u32, h: u32| w > 0 && h > 0 && w.is_multiple_of(cell) && h.is_multiple_of(cell);
         if !side(req.width, req.height) {
             return Err(Error::Request(format!("width and height must be positive multiples of {cell}")));
         }

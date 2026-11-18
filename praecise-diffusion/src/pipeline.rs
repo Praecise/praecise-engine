@@ -630,6 +630,20 @@ impl Autoencoder {
 #[cfg(test)]
 mod parity;
 
+fn to_rgb(px: &[f32], w: usize, h: usize) -> Vec<u8> {
+    let mut rgb = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                let v = px[c * h * w + y * w + x];
+                let u = ((v / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+                rgb[(y * w + x) * 3 + c] = u;
+            }
+        }
+    }
+    rgb
+}
+
 #[cfg(test)]
 mod size_tests {
     use super::*;
@@ -644,18 +658,4 @@ mod size_tests {
         let short = RgbImage { rgb: vec![0; 3], ..small };
         assert!(check_reference_size(0, &short, MAX_REFERENCE_PIXELS).is_err());
     }
-}
-
-fn to_rgb(px: &[f32], w: usize, h: usize) -> Vec<u8> {
-    let mut rgb = vec![0u8; w * h * 3];
-    for y in 0..h {
-        for x in 0..w {
-            for c in 0..3 {
-                let v = px[c * h * w + y * w + x];
-                let u = ((v / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
-                rgb[(y * w + x) * 3 + c] = u;
-            }
-        }
-    }
-    rgb
 }
