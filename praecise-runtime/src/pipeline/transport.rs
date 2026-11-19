@@ -379,12 +379,14 @@ pub(crate) mod tests {
         }
     }
 
+    type Handshaken = Result<(SecureReader, SecureWriter), HandshakeError>;
+
     fn link(
         a_expects: Vec<u8>,
         b_expects: Vec<u8>,
         plan_a: [u8; 32],
         plan_b: [u8; 32],
-    ) -> (Result<(SecureReader, SecureWriter), HandshakeError>, Result<(SecureReader, SecureWriter), HandshakeError>) {
+    ) -> (Handshaken, Handshaken) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let t = std::thread::spawn(move || {

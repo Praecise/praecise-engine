@@ -75,6 +75,10 @@ pub extern "C" fn praecise_abi_version() -> u32 {
 /// Return the crate's semantic version as a static NUL-terminated C string
 /// (e.g. `"0.1.0"`). The pointer is valid for the lifetime of the process and
 /// must not be freed.
+///
+/// # Panics
+///
+/// Never: the package version contains no NUL byte.
 #[must_use]
 pub extern "C" fn praecise_version() -> *const c_char {
     static VERSION: OnceLock<CString> = OnceLock::new();
@@ -101,12 +105,11 @@ pub enum PraeciseStopReason {
 impl From<StopReason> for PraeciseStopReason {
     fn from(r: StopReason) -> Self {
         match r {
-            StopReason::Eos => Self::Eos,
             StopReason::Length => Self::Length,
             StopReason::StopSequence => Self::StopSequence,
             StopReason::Preempted => Self::Preempted,
-            // A reason added after this ABI version reads as the closest
-            // stable one: the model stopped.
+            // The model stopped, and so does a reason added after this ABI
+            // version, which reads as the closest stable one.
             _ => Self::Eos,
         }
     }

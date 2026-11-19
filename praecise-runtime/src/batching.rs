@@ -627,10 +627,10 @@ impl BatchEngine {
         let handle = std::thread::Builder::new()
             .name(format!("batch-{}", model_id))
             .spawn(move || {
-                if let Err(e) = scheduler_loop(
-                    &model_id_thread,
+                if let Err(e) = scheduler_loop(SchedulerParams {
+                    model_id: &model_id_thread,
                     model,
-                    &backend,
+                    backend: &backend,
                     context_length,
                     enable_thinking,
                     projector,
@@ -638,11 +638,11 @@ impl BatchEngine {
                     traits,
                     migration,
                     limits,
-                    &slots_thread,
-                    &rx,
-                    &control_rx,
-                    &shutdown_rx,
-                ) {
+                    slots_out: &slots_thread,
+                    rx: &rx,
+                    control_rx: &control_rx,
+                    shutdown_rx: &shutdown_rx,
+                }) {
                     warn!(
                         "batch engine for {} exited with error: {}",
                         model_id_thread, e
@@ -1258,7 +1258,7 @@ fn fit_slots(
                 _ => cgroup_available().map_or(host_free, |c| c.min(host_free)) / 2,
             }
         });
-    let fit = if per_slot == 0 { wanted } else { usize::try_from(budget / per_slot).unwrap_or(usize::MAX) };
+    let fit = budget.checked_div(per_slot).map_or(wanted, |n| usize::try_from(n).unwrap_or(usize::MAX));
     let slots = fit.clamp(1, wanted);
     info!(
         "batch engine for {}: {} bytes of KV per slot of {} tokens, {} bytes for KV: {} of {} slots",
@@ -1919,11 +1919,11 @@ fn build_sampler(config: &GenerationConfig, n_vocab: i32) -> LlamaSampler {
     crate::sampling::build_sampler_chain(config, n_vocab)
 }
 
-#[allow(clippy::too_many_lines)]
-fn scheduler_loop(
-    model_id: &str,
+/// What the scheduler thread of one batch engine owns or borrows.
+struct SchedulerParams<'a> {
+    model_id: &'a str,
     model: LlamaModel,
-    backend: &LlamaBackend,
+    backend: &'a LlamaBackend,
     context_length: u32,
     enable_thinking: bool,
     projector: Option<Projector>,
@@ -1931,11 +1931,15 @@ fn scheduler_loop(
     traits: MemoryTraits,
     migration: Option<ModelFingerprint>,
     limits: BatchLimits,
-    slots_out: &std::sync::atomic::AtomicUsize,
-    rx: &Receiver<Queued>,
-    control_rx: &Receiver<Control>,
-    shutdown_rx: &Receiver<()>,
-) -> Result<()> {
+    slots_out: &'a std::sync::atomic::AtomicUsize,
+    rx: &'a Receiver<Queued>,
+    control_rx: &'a Receiver<Control>,
+    shutdown_rx: &'a Receiver<()>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn scheduler_loop(params: SchedulerParams<'_>) -> Result<()> {
+    let SchedulerParams { model_id, model, backend, context_length, enable_thinking, projector, speculation, traits, migration, limits, slots_out, rx, control_rx, shutdown_rx } = params;
     use std::num::NonZeroU32;
 
     let kind = traits.reuse();

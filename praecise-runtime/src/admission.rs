@@ -228,8 +228,8 @@ impl CostModel {
 
         // Budget use: how much of what the caller allowed was actually
         // generated. A request that hit its ceiling counts as 100%, not more.
-        if o.budget_tokens > 0 {
-            let pct = (o.generated_tokens.saturating_mul(100) / o.budget_tokens).min(100);
+        if let Some(pct) = o.generated_tokens.saturating_mul(100).checked_div(o.budget_tokens) {
+            let pct = pct.min(100);
             self.budget_use_pct = Self::ema(self.budget_use_pct, pct, first);
         }
         self.samples = self.samples.saturating_add(1);
