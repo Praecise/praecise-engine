@@ -52,8 +52,10 @@ fn decode_throughput_by_concurrency() {
     let mut backend = LlamaBackend::init().expect("backend");
     backend.void_logs();
     let backend = Arc::new(backend);
-    let model = LlamaModel::load_from_file(&backend, &path, &common::params()).expect("load model");
     let draft = std::env::var("PRAECISE_TEST_THROUGHPUT_DRAFT").unwrap_or_default();
+    // The MTP head is loaded only on request; without it the MTP graph aborts the process.
+    let params = common::params().with_load_mtp(draft.starts_with("mtp"));
+    let model = LlamaModel::load_from_file(&backend, &path, &params).expect("load model");
     let speculation = match draft.split(':').collect::<Vec<_>>().as_slice() {
         [] | [""] => None,
         ["mtp", n] => Some(BatchSpeculation { spec_type: 0, n_max: n.parse().expect("draft length"), draft_model: None }),
