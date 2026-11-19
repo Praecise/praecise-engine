@@ -486,7 +486,7 @@ mod linux {
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
         libc::SYS_kexec_load,
-        libc::SYS_kexec_file_load,
+        SYS_KEXEC_FILE_LOAD,
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
@@ -512,6 +512,17 @@ mod linux {
     const AUDIT_ARCH: u32 = 0xC000_003E;
     #[cfg(target_arch = "aarch64")]
     const AUDIT_ARCH: u32 = 0xC000_00B7;
+    #[cfg(target_arch = "arm")]
+    const AUDIT_ARCH: u32 = 0x4000_0028;
+    #[cfg(target_arch = "riscv64")]
+    const AUDIT_ARCH: u32 = 0xC000_00F3;
+
+    /// `kexec_file_load`: the libc crate has no constant for riscv64, whose
+    /// number is the generic table's.
+    #[cfg(target_arch = "riscv64")]
+    const SYS_KEXEC_FILE_LOAD: libc::c_long = 294;
+    #[cfg(not(target_arch = "riscv64"))]
+    const SYS_KEXEC_FILE_LOAD: libc::c_long = libc::SYS_kexec_file_load;
 
     fn stmt(code: u16, k: u32) -> libc::sock_filter {
         libc::sock_filter { code, jt: 0, jf: 0, k }
@@ -556,5 +567,37 @@ mod linux {
             return Err(format!("seccomp: {}", errno()));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `EM_*` machine number, with the little-endian bit and, for 64-bit
+        /// ABIs, the 64-bit bit, as `include/uapi/linux/audit.h` builds them.
+        const fn audit_arch(machine: u32, is_64: bool) -> u32 {
+            machine | 0x4000_0000 | if is_64 { 0x8000_0000 } else { 0 }
+        }
+
+        #[test]
+        fn the_audit_arch_of_every_supported_target_follows_the_kernel_header() {
+            assert_eq!(audit_arch(62, true), 0xC000_003E, "x86_64");
+            assert_eq!(audit_arch(183, true), 0xC000_00B7, "aarch64");
+            assert_eq!(audit_arch(40, false), 0x4000_0028, "arm");
+            assert_eq!(audit_arch(243, true), 0xC000_00F3, "riscv64");
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(AUDIT_ARCH, audit_arch(62, true));
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(AUDIT_ARCH, audit_arch(183, true));
+            #[cfg(target_arch = "arm")]
+            assert_eq!(AUDIT_ARCH, audit_arch(40, false));
+            #[cfg(target_arch = "riscv64")]
+            assert_eq!(AUDIT_ARCH, audit_arch(243, true));
+        }
+
+        #[test]
+        fn kexec_file_load_is_among_the_denied_calls() {
+            assert!(DENIED.contains(&SYS_KEXEC_FILE_LOAD));
+        }
     }
 }
