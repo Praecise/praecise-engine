@@ -1,6 +1,11 @@
 //! NAL unit framing (Annex B start codes and length prefixes) and the H.264
 //! and H.265 decoder configuration records.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use crate::{Error, Result};
 
 /// NAL units of an Annex B stream, without their start codes.

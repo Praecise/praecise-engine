@@ -1,6 +1,12 @@
 //! H.264: encoding through `OpenH264`, decoding through a pure-Rust decoder
 //! (Baseline, Main and High profiles, 8-bit 4:2:0).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use openh264::OpenH264API;
 use openh264::encoder::{BitRate, EncoderConfig, FrameRate, IntraFramePeriod, QpRange, RateControlMode, VuiConfig};
 use openh264::formats::YUVSlices;

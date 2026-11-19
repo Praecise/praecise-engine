@@ -3,6 +3,14 @@
 //! latents that ride along the target's tokens, and the target is denoised
 //! with flow-matching Euler steps under norm-preserving guidance.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::fmt::Write as _;
 use std::time::Instant;
 

@@ -13,6 +13,14 @@
 //! tokens carry timestep 0, and it stays clean through sampling (zero
 //! velocity keeps a `UniPC` sample fixed).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::time::Instant;
 
 use serde_json::Value;

@@ -3,6 +3,13 @@
 //! camera-to-world matrices, resampled at the latent frames and encoded as
 //! per-pixel Plucker rays folded onto the latent grid.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 /// Units moved per frame along one axis.
 pub const MOVE_STEP: f64 = 12.35;
 /// Units moved per frame along each axis when moving diagonally.

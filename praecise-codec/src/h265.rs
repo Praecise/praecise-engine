@@ -4,6 +4,11 @@
 //! order here by picture order count, one coded video sequence (from one
 //! IDR picture to the next) at a time.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use rust_h265::{DecodeLimits, Decoder, Frame, NalUnitType, PixelData, parse_annex_b};
 
 use crate::color::{Matrix, Planes};

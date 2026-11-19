@@ -13,6 +13,15 @@
 //! reordered at load so each head's pairs sit half a head apart, and the
 //! rotation is applied from host tables.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use serde::Deserialize;
 
 use crate::error::{Error, Result};

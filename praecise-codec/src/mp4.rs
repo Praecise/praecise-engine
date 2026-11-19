@@ -2,6 +2,13 @@
 //! track, with the movie header first so playback can start while the file
 //! downloads; reading goes through `re_mp4`.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use re_mp4::{Mp4, StsdBoxContent, TrackKind};
 
 use crate::color::Matrix;

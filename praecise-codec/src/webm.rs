@@ -1,6 +1,12 @@
 //! `WebM`: a writer for one AV1 track and an optional Opus track; reading
 //! (any Matroska file) goes through `matroska-demuxer`.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::io::Cursor;
 
 use matroska_demuxer::{Frame, MatrixCoefficients, MatroskaFile, Range};

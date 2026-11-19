@@ -22,6 +22,16 @@
 //! that language-model block's keys and values (projected to the expert's
 //! width), and a gated `SiLU` MLP.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::path::Path;
 
 use serde_json::Value;

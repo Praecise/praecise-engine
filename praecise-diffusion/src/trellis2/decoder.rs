@@ -6,6 +6,12 @@
 //! the material decoder reuses the shape decoder's masks so both land on the
 //! same voxels, and ends in base colour, metallic, roughness and alpha.
 
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::many_single_char_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use serde::Deserialize;
 
 use crate::error::{Error, Result};

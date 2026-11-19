@@ -7,6 +7,11 @@
 //! Run with `PRAECISE_FLUX3_PARITY=<fixture dir> cargo test -p
 //! praecise-diffusion -- --ignored flux3_parity`.
 
+#![allow(
+    clippy::similar_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::path::PathBuf;
 
 use serde_json::Value;

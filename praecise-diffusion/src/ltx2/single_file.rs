@@ -6,6 +6,13 @@
 //! maps each original name to its component and the name that component
 //! loads.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use super::audio_vae::AudioVaeConfig;
 use super::connectors::ConnectorsConfig;
 use super::vae::VideoVaeConfig;

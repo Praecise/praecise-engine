@@ -5,6 +5,11 @@
 //! Run with `PRAECISE_FLUX3_POLICY_PARITY=<fixture dir> cargo test -p
 //! praecise-diffusion -- --ignored flux3_policy_parity`.
 
+#![allow(
+    clippy::cast_precision_loss,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::path::{Path, PathBuf};
 
 use super::*;

@@ -15,6 +15,14 @@
 //! the padding is held at zero throughout sampling. The task description is
 //! wrapped in the structured JSON caption the model was trained on.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};

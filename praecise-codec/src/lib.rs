@@ -137,6 +137,7 @@ pub(crate) struct Rate {
 
 impl Rate {
     pub(crate) fn from_fps(fps: f32) -> Self {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a rounded frame rate in range")]
         let (mut num, mut den) = ((f64::from(fps) * 1000.0).round() as u32, 1000u32);
         let g = gcd(num, den);
         num /= g;

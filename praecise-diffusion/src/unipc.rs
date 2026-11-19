@@ -6,6 +6,13 @@
 //! previous step's result with it (from the second step on), then predicts
 //! the next sample. The first step and the last run at first order.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use serde::Deserialize;
 
 use crate::error::{Error, Result};

@@ -2,6 +2,11 @@
 //! metallic-roughness PBR material, byte-for-byte deterministic for the same
 //! input (fixed JSON key order, fixed PNG encoding).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 use std::fmt::Write as _;
 use std::io::Write as _;
 

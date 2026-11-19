@@ -1,5 +1,14 @@
 //! RGB and 4:2:0 YCbCr conversion.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "tensor and kernel math: sizes, indices and counts move between usize, i64, u32 and f32 within bounds the tensor shapes fix; a checked conversion at each site would change no value"
+)]
+
 /// The YCbCr matrix and range of a picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Matrix {
