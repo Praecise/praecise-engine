@@ -554,7 +554,7 @@ fn streams_with_heads(st: &SafeTensors, streams: &[(String, u64)]) -> Vec<String
 fn spatial_freq_factors(axes: &[u64; 4], head_dim: u64, scale: f32) -> Vec<f32> {
     let mut f = axis_rope_freq_factors(axes, head_dim, THETA);
     let start = (axes[0] / 2) as usize;
-    let end = start + ((axes[1] + axes[2]) / 2) as usize;
+    let end = start + u64::midpoint(axes[1], axes[2]) as usize;
     for v in &mut f[start..end] {
         *v /= scale;
     }

@@ -1,7 +1,7 @@
-//! SigLIP vision transformer: square patches embedded by a strided
+//! `SigLIP` vision transformer: square patches embedded by a strided
 //! convolution, a learned position per patch, pre-norm encoder layers
-//! (LayerNorm, biased multi-head attention, tanh-GELU MLP) and a final
-//! LayerNorm. Every patch attends to every other.
+//! (`LayerNorm`, biased multi-head attention, tanh-GELU MLP) and a final
+//! `LayerNorm`. Every patch attends to every other.
 
 use serde::Deserialize;
 
@@ -26,7 +26,7 @@ pub struct SiglipConfig {
     pub patch_size: usize,
     /// Image side in pixels.
     pub image_size: usize,
-    /// LayerNorm epsilon.
+    /// `LayerNorm` epsilon.
     #[serde(default = "default_eps")]
     pub layer_norm_eps: f64,
 }
@@ -124,7 +124,7 @@ fn layer_norm(g: &mut Graph, w: &Weights, name: &str, x: Tn, eps: f32) -> Tn {
 }
 
 /// Encode one image: `patches` is a `[patch_len, patches]` input; the result
-/// is `[hidden_size, patches]` after the final LayerNorm. `exact` computes
+/// is `[hidden_size, patches]` after the final `LayerNorm`. `exact` computes
 /// attention and the GELU entirely in float32.
 #[must_use]
 pub fn build(g: &mut Graph, cfg: &SiglipConfig, w: &Weights, prefix: &str, patches: Tn, exact: bool) -> Tn {

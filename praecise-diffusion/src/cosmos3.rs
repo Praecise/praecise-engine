@@ -145,7 +145,7 @@ impl Cosmos3Config {
         if self.action_gen && self.action_dim.is_none_or(|d| d == 0) {
             return bad("action projections without an action width".into());
         }
-        if self.num_attention_heads % self.num_key_value_heads != 0 || self.head_dim % 2 != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) || !self.head_dim.is_multiple_of(2) {
             return bad("query heads must be a multiple of key/value heads and the head width even".into());
         }
         if self.patch_latent_dim != self.latent_channel * self.latent_patch_size * self.latent_patch_size {
@@ -269,7 +269,7 @@ impl Cosmos3Config {
             .collect()
     }
 
-    /// Gated (SiLU) feed-forward rather than squared ReLU.
+    /// Gated (`SiLU`) feed-forward rather than squared `ReLU`.
     fn gated(&self) -> bool {
         self.hidden_act == "silu"
     }

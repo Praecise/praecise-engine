@@ -270,7 +270,7 @@ fn compose_step(cams: &[&Frame], layout: CameraLayout, ch: usize, cw: usize) -> 
             blit(&mut canvas, ch, cw, &resize(cams[0], ch, cw, true), 0, 0);
         }
         CameraLayout::SideBySide => {
-            if cams.len() != 2 || cw % 2 != 0 {
+            if cams.len() != 2 || !cw.is_multiple_of(2) {
                 return Err(Error::Request("side-by-side layout needs two cameras and an even canvas width".into()));
             }
             for (i, cam) in cams.iter().enumerate() {
@@ -500,7 +500,7 @@ mod tests {
             let got = compose_canvas(&cams, CameraLayout::parse(layout).unwrap(), ch, cw).unwrap();
             let want: Vec<f32> = std::fs::read(dir.join(format!("{layout}_canvas.f32")))
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
             assert_eq!(got.len(), want.len(), "{layout}");

@@ -286,10 +286,10 @@ impl ZImage {
 
     fn check(&self, req: &Request) -> Result<()> {
         let cell = 16;
-        if req.width == 0 || req.height == 0 || req.width % cell != 0 || req.height % cell != 0 {
+        if req.width == 0 || req.height == 0 || !req.width.is_multiple_of(cell) || !req.height.is_multiple_of(cell) {
             return Err(Error::Request(format!("width and height must be positive multiples of {cell}")));
         }
-        let (gh, gw) = ((req.height / cell) as u64, (req.width / cell) as u64);
+        let (gh, gw) = (u64::from(req.height / cell), u64::from(req.width / cell));
         if gh > self.cfg.axes_lens[1] || gw > self.cfg.axes_lens[2] {
             return Err(Error::Request("image larger than the rotary tables cover".into()));
         }

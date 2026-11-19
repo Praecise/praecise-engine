@@ -102,15 +102,12 @@ impl QwenImageConfig {
     fn linear(v: &mut Vec<WeightSpec>, name: &str, out: u64, inp: u64, ty: WType, rows: Option<Vec<usize>>) {
         let w = WeightSpec::new(format!("{name}.weight"), &[out, inp], ty);
         let b = WeightSpec::new(format!("{name}.bias"), &[out], WType::F32);
-        match rows {
-            Some(r) => {
-                v.push(w.with_rows(r.clone()));
-                v.push(b.with_rows(r));
-            }
-            None => {
-                v.push(w);
-                v.push(b);
-            }
+        if let Some(r) = rows {
+            v.push(w.with_rows(r.clone()));
+            v.push(b.with_rows(r));
+        } else {
+            v.push(w);
+            v.push(b);
         }
     }
 
@@ -211,7 +208,7 @@ struct Mod {
 }
 
 /// The two modulations (attention, feed-forward) of `{p}.{s}_mod` for the
-/// embedding `temb` (already through SiLU).
+/// embedding `temb` (already through `SiLU`).
 fn mods(g: &mut Graph, w: &Weights, name: &str, temb: Tn, d: i64) -> [Mod; 2] {
     let m = lin(g, w, name, temb);
     let mut part = |i: i64| g.view_1d(m, d, (i * d) as usize);

@@ -1,8 +1,8 @@
-//! SmolVLA: a compact vision-language-action policy.
+//! `SmolVLA`: a compact vision-language-action policy.
 //!
 //! The backbone is a small vision-language model cut to its first
 //! `num_vlm_layers` decoder layers. Each camera frame is resized with
-//! padding to the vision tower's input, encoded by a SigLIP tower,
+//! padding to the vision tower's input, encoded by a `SigLIP` tower,
 //! pixel-shuffled (`scale_factor` squared patches per token) and projected
 //! to the decoder width. The prefix is the image tokens, the instruction
 //! tokens (both scaled by the square root of the width) and one projected
@@ -66,7 +66,7 @@ pub struct TextConfig {
     pub vocab_size: u64,
 }
 
-/// A SmolVLA release's settings: the policy's `config.json` and the
+/// A `SmolVLA` release's settings: the policy's `config.json` and the
 /// backbone's.
 #[derive(Debug, Clone)]
 pub struct SmolVlaConfig {
@@ -186,7 +186,7 @@ impl SmolVlaConfig {
         if resize != (vision.image_size, vision.image_size) {
             return Err(Error::Config(format!("frames resized to {resize:?} do not match the {} pixel vision input", vision.image_size)));
         }
-        if vision.grid() % scale_factor != 0 {
+        if !vision.grid().is_multiple_of(scale_factor) {
             return Err(Error::Config("the patch grid does not divide by the pixel-shuffle factor".into()));
         }
         Ok(Self {
@@ -219,7 +219,7 @@ impl SmolVlaConfig {
     }
 
     fn self_attn(&self, layer: usize) -> bool {
-        layer % self.self_attn_every_n_layers == 0
+        layer.is_multiple_of(self.self_attn_every_n_layers)
     }
 
     /// Every weight the policy reads.
@@ -282,7 +282,7 @@ struct ChunkIo {
     out: Tn,
 }
 
-/// A loaded SmolVLA policy.
+/// A loaded `SmolVLA` policy.
 pub struct SmolVla {
     cfg: SmolVlaConfig,
     norm: Normalization,

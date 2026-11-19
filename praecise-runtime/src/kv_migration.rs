@@ -298,7 +298,7 @@ impl KvBlob {
         let n_tokens = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
         let token_bytes = take(n_tokens.checked_mul(4).ok_or_else(|| bad("token count overflow"))?)?;
         let tokens = token_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| i32::from_le_bytes(c.try_into().expect("4 bytes")))
             .collect();
         let payload_len = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));

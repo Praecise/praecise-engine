@@ -260,7 +260,7 @@ impl Ltx2Connectors {
         let k = cfg.feature_width() as usize;
         let n = hidden.len() / k;
         let (v, a) = (cfg.video(), cfg.audio());
-        if hidden.len() % k != 0 || n == 0 || n > seq_len || seq_len % v.registers as usize != 0 || seq_len % a.registers as usize != 0 {
+        if !hidden.len().is_multiple_of(k) || n == 0 || n > seq_len || !seq_len.is_multiple_of(v.registers as usize) || !seq_len.is_multiple_of(a.registers as usize) {
             return Err(Error::Request("prompt connector inputs disagree with the sequence length".into()));
         }
         let mut g = Graph::new(&self.backend)?;

@@ -2,8 +2,8 @@
 //! unnormalised video latents.
 //!
 //! Activations are laid out `[W, H, C, T]`. The network is a 3x3x3
-//! convolution, group norm and SiLU, residual blocks (convolution, group
-//! norm, SiLU, convolution, group norm, then SiLU of the sum with the
+//! convolution, group norm and `SiLU`, residual blocks (convolution, group
+//! norm, `SiLU`, convolution, group norm, then `SiLU` of the sum with the
 //! input), a per-frame 3x3 convolution to four times the channels folded
 //! into 2x2 pixel blocks, more residual blocks and a final 3x3x3
 //! convolution. Every convolution is zero padded on all three axes; group
@@ -65,7 +65,7 @@ impl UpsamplerConfig {
         if cfg.dims != 3 || !cfg.spatial_upsample || cfg.temporal_upsample || cfg.rational_resampler || cfg.spatial_scale != 2.0 {
             return Err(Error::Config("latent upsampler: only the 3D spatial x2 variant without a rational resampler is supported".into()));
         }
-        if cfg.mid_channels % GROUPS != 0 || cfg.in_channels == 0 {
+        if !cfg.mid_channels.is_multiple_of(GROUPS) || cfg.in_channels == 0 {
             return Err(Error::Config("latent upsampler: channel counts must suit 32 norm groups".into()));
         }
         Ok(cfg)
@@ -81,7 +81,7 @@ impl UpsamplerConfig {
         let conv3 = |v: &mut Vec<HostTensor>, p: &str, cin: u64, cout: u64| -> Result<()> {
             let w = st.require(&format!("{p}.weight"), &[cout, cin, 3, 3, 3])?.to_f32();
             for k in 0..3 {
-                let d: Vec<f32> = w.chunks_exact(27).flat_map(|c| (0..9).map(move |j| c[k * 9 + j])).collect();
+                let d: Vec<f32> = w.as_chunks::<27>().0.iter().flat_map(|c| (0..9).map(move |j| c[k * 9 + j])).collect();
                 v.push(HostTensor { name: format!("{p}.t{k}"), shape: vec![cout, cin, 3, 3], ty: kt, data: d });
             }
             Ok(())

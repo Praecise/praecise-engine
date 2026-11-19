@@ -1,4 +1,4 @@
-//! H.264: encoding through OpenH264, decoding through a pure-Rust decoder
+//! H.264: encoding through `OpenH264`, decoding through a pure-Rust decoder
 //! (Baseline, Main and High profiles, 8-bit 4:2:0).
 
 use openh264::OpenH264API;

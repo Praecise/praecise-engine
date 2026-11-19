@@ -1,7 +1,7 @@
 //! LTX-2 audio autoencoder: the decoder, latents to a mel spectrogram.
 //!
 //! The latent is a small image, time by mel bins, with a few channels; the
-//! decoder is a 2D residual network over it (pixel norm, SiLU, convolution,
+//! decoder is a 2D residual network over it (pixel norm, `SiLU`, convolution,
 //! twice, with a 1x1 shortcut on a width change) with nearest-neighbour 2x
 //! upsampling between levels. Every convolution is causal in time: two zero
 //! rows of padding before the first frame and none after, so an output row

@@ -9,7 +9,7 @@
 //!
 //! - every camera frame is scaled to 8 bits, optionally padded to a square,
 //!   resized so its shorter side is the release's edge, centre-cropped by
-//!   the crop fraction and resized back (OpenCV area interpolation for
+//!   the crop fraction and resized back (`OpenCV` area interpolation for
 //!   releases trained with it, antialiased bicubic otherwise), then resized
 //!   to multiples of the merged patch as the backbone's image processor
 //!   does. The frames go to the prompt once per step of the camera history
@@ -52,7 +52,7 @@ pub struct ImageGeometry {
     pub shortest_edge: Option<usize>,
     /// Fraction of each side the centre crop keeps.
     pub crop_fraction: Option<f64>,
-    /// OpenCV area interpolation keeping the aspect ratio (otherwise
+    /// `OpenCV` area interpolation keeping the aspect ratio (otherwise
     /// antialiased bicubic to a square).
     pub area: bool,
     /// Pad frames to a square first.
@@ -495,7 +495,7 @@ impl GrootProcessor {
             for t in 0..steps {
                 let row = if g.rows > 1 { t } else { 0 };
                 let (lo, hi) = (&g.lo[row * g.dim..(row + 1) * g.dim], &g.hi[row * g.dim..(row + 1) * g.dim]);
-                let v: Vec<f32> = (0..g.dim).map(|j| (chunk[t * width + at + j].clamp(-1.0, 1.0) + 1.0) * 0.5 * (hi[j] - lo[j]) + lo[j]).collect();
+                let v: Vec<f32> = (0..g.dim).map(|j| f32::midpoint(chunk[t * width + at + j].clamp(-1.0, 1.0), 1.0) * (hi[j] - lo[j]) + lo[j]).collect();
                 let dst = &mut out[t * d + at..t * d + at + g.dim];
                 match g.rep {
                     ActionRep::Absolute => dst.copy_from_slice(&v),

@@ -1,4 +1,4 @@
-//! The MolmoAct2 policy's inputs as its release prepares them for inference.
+//! The `MolmoAct2` policy's inputs as its release prepares them for inference.
 //!
 //! Each camera frame is resized (torchvision bilinear, no antialiasing) to
 //! the single crop the release's processor uses, mapped to `[-1, 1]` and cut
@@ -105,7 +105,7 @@ pub fn state_bins(state: &[f32], bins: usize) -> Vec<usize> {
         .iter()
         .map(|&x| {
             let x = if x.is_nan() { 0.0 } else { x.clamp(-1.0, 1.0) };
-            let v = ((x + 1.0) / 2.0 * top as f32).round_ties_even();
+            let v = (f32::midpoint(x, 1.0) * top as f32).round_ties_even();
             (v.max(0.0) as usize).min(top)
         })
         .collect()
@@ -363,7 +363,7 @@ impl MolmoAct2Processor {
     }
 }
 
-/// One feature's normalisation in a MolmoAct2 embodiment: the 1st and 99th
+/// One feature's normalisation in a `MolmoAct2` embodiment: the 1st and 99th
 /// percentiles map to `[-1, 1]` for the values whose mask entry is set; the
 /// others (a gripper already in `[-1, 1]`) pass through.
 #[derive(Debug, Clone)]
@@ -413,11 +413,10 @@ impl MolmoAct2FeatureNorm {
                 _ => return Err(Error::Config(format!("MolmoAct2 {what} statistics neither mask nor name their {d} values; normalise the gripper instead"))),
             }
         };
-        if let (Some(min), Some(max)) = (floats(stats.get("min")), floats(stats.get("max"))) {
-            if min.len() == d && max.len() == d && (0..d).any(|i| !mask[i] && (min[i] < -1.0 || max[i] > 1.0)) {
+        if let (Some(min), Some(max)) = (floats(stats.get("min")), floats(stats.get("max")))
+            && min.len() == d && max.len() == d && (0..d).any(|i| !mask[i] && (min[i] < -1.0 || max[i] > 1.0)) {
                 return Err(Error::Config(format!("MolmoAct2 {what} gripper values are not in [-1, 1]; normalise the gripper instead")));
             }
-        }
         Ok(Self { norm: FeatureNorm { mode: NormMode::Quantiles, lo, hi, eps: 1e-8 }, mask })
     }
 
@@ -453,7 +452,7 @@ impl MolmoAct2FeatureNorm {
     }
 }
 
-/// One embodiment of a MolmoAct2 release (`norm_stats.json`, by tag).
+/// One embodiment of a `MolmoAct2` release (`norm_stats.json`, by tag).
 #[derive(Debug, Clone)]
 pub struct MolmoAct2Embodiment {
     /// Camera features in prompt order (empty: any cameras).
@@ -564,7 +563,7 @@ impl MolmoAct2Embodiment {
     }
 }
 
-/// A MolmoAct2 release for one embodiment, as a [`ChunkPolicy`] in robot
+/// A `MolmoAct2` release for one embodiment, as a [`ChunkPolicy`] in robot
 /// units: the release's preprocessing, the vision backbone, the language
 /// model's prefill and the action expert's flow matching (from noise
 /// `[action_horizon][max_action_dim]`, robot action dimensions beyond the

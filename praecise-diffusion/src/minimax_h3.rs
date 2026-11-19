@@ -15,7 +15,7 @@
 //! ships `adaln_t_table` replaces the time embedder by a table of timestep
 //! embedding coordinates: each timestep's embedding is the linear
 //! interpolation of its two nearest rows (`t` in `[0, 1]` over the grid), fed
-//! to the modulation projections without the SiLU.
+//! to the modulation projections without the `SiLU`.
 
 use serde::Deserialize;
 
@@ -66,7 +66,7 @@ impl MiniMaxH3Config {
         if 6 * self.rope_freq_dim > self.attention_head_dim {
             return bad("rotary part wider than a head");
         }
-        if self.freq_dim % 2 != 0 || self.num_layers == 0 {
+        if !self.freq_dim.is_multiple_of(2) || self.num_layers == 0 {
             return bad("empty or odd layout");
         }
         Ok(())
@@ -91,7 +91,7 @@ impl MiniMaxH3Config {
         let inner = self.num_attention_heads * hd;
         let f = WType::F32;
         // 8-bit blocks hold 32 columns; narrower rows stay float32.
-        let q = |cols: u64| if linear == WType::Q8_0 && cols % 32 != 0 { f } else { linear };
+        let q = |cols: u64| if linear == WType::Q8_0 && !cols.is_multiple_of(32) { f } else { linear };
         let mut v = Vec::new();
         let mut lin = |name: &str, out: u64, inp: u64, ty: WType, bias: bool| {
             v.push(WeightSpec::new(format!("{name}.weight"), &[out, inp], ty));

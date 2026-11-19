@@ -2,7 +2,7 @@
 //!
 //! Decoding reads MP4 (ISO base media) and Matroska/WebM files holding
 //! H.264, H.265 or AV1 video and returns 8-bit RGB frames in display order.
-//! Encoding writes 8-bit RGB frames as H.264 or AV1 in MP4, or AV1 in WebM,
+//! Encoding writes 8-bit RGB frames as H.264 or AV1 in MP4, or AV1 in `WebM`,
 //! with an optional Opus soundtrack. Everything runs in the calling process;
 //! no external program or system library is involved.
 //!
@@ -55,7 +55,7 @@ pub enum VideoCodec {
 pub enum Container {
     /// ISO base media file format (`.mp4`).
     Mp4,
-    /// WebM (`.webm`); decoding also reads other Matroska files.
+    /// `WebM` (`.webm`); decoding also reads other Matroska files.
     WebM,
 }
 
@@ -84,7 +84,7 @@ impl Container {
 pub struct EncodeOptions {
     /// Video format: H.264 or AV1.
     pub codec: VideoCodec,
-    /// File format: MP4 (H.264 or AV1) or WebM (AV1).
+    /// File format: MP4 (H.264 or AV1) or `WebM` (AV1).
     pub container: Container,
     /// Constant quantizer on the H.264 scale, 0 (best) to 51.
     pub quantizer: u8,
@@ -107,7 +107,7 @@ impl EncodeOptions {
         if self.quantizer > 51 {
             return Err(Error::Request(format!("quantizer {} is above 51", self.quantizer)));
         }
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 || width > 8192 || height > 8192 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) || width > 8192 || height > 8192 {
             return Err(Error::Request(format!("{width}x{height}: width and height must be even and 2..=8192")));
         }
         if !(fps.is_finite() && (0.1..=480.0).contains(&fps)) {
@@ -272,7 +272,7 @@ impl VideoWriter {
 /// frames.
 pub fn encode(opts: EncodeOptions, width: u32, height: u32, fps: f32, rgb: &[u8], sound: Option<Sound<'_>>) -> Result<Vec<u8>> {
     let frame = width as usize * height as usize * 3;
-    if frame == 0 || rgb.len() % frame != 0 {
+    if frame == 0 || !rgb.len().is_multiple_of(frame) {
         return Err(Error::Request(format!("{} bytes is not a whole number of {width}x{height} RGB frames", rgb.len())));
     }
     let mut w = VideoWriter::new(opts, width, height, fps)?;

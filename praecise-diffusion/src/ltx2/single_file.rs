@@ -160,7 +160,7 @@ impl ConnectorsConfig {
         let (heads, hd, aheads, ahd) = (u("connector_num_attention_heads")?, u("connector_attention_head_dim")?, u("audio_connector_num_attention_heads")?, u("audio_connector_attention_head_dim")?);
         let (layers, registers) = (u("connector_num_layers")?, u("connector_num_learnable_registers")?);
         let base = transformer["connector_positional_embedding_max_pos"][0].as_u64().ok_or_else(|| Error::Config("single-file transformer config lacks connector_positional_embedding_max_pos".into()))?;
-        if feature_width % caption != 0 || transformer["text_encoder_norm_type"] != "per_token_rms" || !b("caption_proj_before_connector") {
+        if !feature_width.is_multiple_of(caption) || transformer["text_encoder_norm_type"] != "per_token_rms" || !b("caption_proj_before_connector") {
             return Err(Error::Config("single-file prompt projection: layout not implemented".into()));
         }
         let cfg = Self {

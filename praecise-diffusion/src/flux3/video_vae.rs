@@ -96,7 +96,7 @@ impl VaeConfig {
         }
         for (i, &h) in self.num_heads.iter().enumerate() {
             let dim = self.embed_dim << i;
-            if h == 0 || dim % h != 0 || (dim / h) % 8 != 0 {
+            if h == 0 || !dim.is_multiple_of(h) || !(dim / h).is_multiple_of(8) {
                 return Err(Error::Config(format!("stage {i}: width {dim} over {h} heads needs a head width divisible by 8")));
             }
         }
@@ -295,7 +295,7 @@ fn rope_tables(dims: [usize; 3], hd: usize) -> (Vec<f32>, Vec<f32>) {
             for x in 0..dims[2] {
                 for (axis, pos) in [t, y, x].into_iter().enumerate() {
                     for (j, f) in freqs.iter().enumerate() {
-                        half[axis * chunk / 2 + j] = (pos as f32 * *f as f32) as f64;
+                        half[axis * chunk / 2 + j] = f64::from(pos as f32 * *f as f32);
                     }
                 }
                 for _ in 0..2 {
@@ -429,7 +429,7 @@ impl VideoVae {
     /// On a frame count off the `4k + 1` grid, a size mismatch or a backend
     /// failure.
     pub fn encode_chunked(&self, video: &[f32], frames: usize, h: usize, w: usize) -> Result<(Vec<f32>, [usize; 3])> {
-        if frames == 0 || (frames - 1) % TEMPORAL_DOWNSAMPLE != 0 {
+        if frames == 0 || !(frames - 1).is_multiple_of(TEMPORAL_DOWNSAMPLE) {
             return Err(Error::Config(format!("the autoencoder takes 4k + 1 frames, got {frames}")));
         }
         if video.len() != 3 * frames * h * w {
@@ -640,7 +640,7 @@ impl VideoVae {
                         o[..c].copy_from_slice(&a[s * c..][..c]);
                         o[c..].copy_from_slice(&b[s * c..][..c]);
                         for k in 0..c {
-                            skip[(d * g.h * g.w + s) * c + k] = (a[s * c + k] + b[s * c + k]) * 0.5;
+                            skip[(d * g.h * g.w + s) * c + k] = f32::midpoint(a[s * c + k], b[s * c + k]);
                         }
                     }
                 }
@@ -826,7 +826,7 @@ mod parity {
     use std::path::PathBuf;
 
     fn f32s(p: &std::path::Path) -> Vec<f32> {
-        std::fs::read(p).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+        std::fs::read(p).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
     }
 
     fn agreement(ours: &[f32], reference: &[f32]) -> (f64, f64) {

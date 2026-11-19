@@ -1,4 +1,4 @@
-//! DINOv3 vision transformer used as an image feature encoder: patch
+//! `DINOv3` vision transformer used as an image feature encoder: patch
 //! embedding, a class token and register tokens, pre-norm blocks with
 //! layer scale and a 2D rotary embedding over patch centres, returning every
 //! token's last hidden state layer-normalised without affine parameters.
@@ -84,7 +84,7 @@ impl Dinov3Config {
         if self.hidden_act != "gelu" {
             return Err(Error::Config(format!("image encoder activation {:?} is not implemented", self.hidden_act)));
         }
-        if self.num_attention_heads == 0 || self.hidden_size % self.num_attention_heads != 0 || self.head_dim() % 4 != 0 {
+        if self.num_attention_heads == 0 || !self.hidden_size.is_multiple_of(self.num_attention_heads) || !self.head_dim().is_multiple_of(4) {
             return Err(Error::Config("image encoder heads do not divide the width into multiples of 4".into()));
         }
         Ok(())
@@ -190,7 +190,7 @@ impl Dinov3 {
     pub fn encode(&self, backend: &Backend, pixels: &[f32], height: usize, width: usize) -> Result<Vec<f32>> {
         let cfg = &self.cfg;
         let p = cfg.patch_size;
-        if height % p != 0 || width % p != 0 || pixels.len() != cfg.num_channels * height * width {
+        if !height.is_multiple_of(p) || !width.is_multiple_of(p) || pixels.len() != cfg.num_channels * height * width {
             return Err(Error::Request("image size is not a whole number of patches".into()));
         }
         let (gh, gw) = (height / p, width / p);

@@ -253,7 +253,7 @@ fn lin(g: &mut Graph, w: &Weights, name: &str, x: Tn) -> Tn {
     g.linear(w.get(&format!("{name}.weight")), x)
 }
 
-/// Timestep embedding for features `time`, already through SiLU.
+/// Timestep embedding for features `time`, already through `SiLU`.
 fn temb(g: &mut Graph, w: &Weights, time: Tn) -> Tn {
     let t = lin(g, w, "time_text_embed.timestep_embedder.linear_1", time);
     let t = g.silu(t);

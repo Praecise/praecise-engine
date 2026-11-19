@@ -105,12 +105,11 @@ impl Gemma3Config {
         if self.use_bidirectional_attention == Some(true) {
             return Err(Error::Config("bidirectional attention is not implemented".into()));
         }
-        if let Some(a) = &self.hidden_activation {
-            if a != "gelu_pytorch_tanh" {
+        if let Some(a) = &self.hidden_activation
+            && a != "gelu_pytorch_tanh" {
                 return Err(Error::Config(format!("activation {a:?} is not implemented")));
             }
-        }
-        if self.num_attention_heads % self.num_key_value_heads != 0 || self.head_dim % 2 != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) || !self.head_dim.is_multiple_of(2) {
             return Err(Error::Config("text encoder head layout".into()));
         }
         let t = self.layer_types();
@@ -125,12 +124,9 @@ impl Gemma3Config {
     /// Whether each layer uses sliding-window attention.
     #[must_use]
     pub fn layer_types(&self) -> Vec<bool> {
-        match &self.layer_types {
-            Some(t) => t.iter().map(|s| s == "sliding_attention").collect(),
-            None => {
-                let p = self.sliding_window_pattern.unwrap_or(6);
-                (0..self.num_hidden_layers).map(|i| (i + 1) % p != 0).collect()
-            }
+        if let Some(t) = &self.layer_types { t.iter().map(|s| s == "sliding_attention").collect() } else {
+            let p = self.sliding_window_pattern.unwrap_or(6);
+            (0..self.num_hidden_layers).map(|i| (i + 1) % p != 0).collect()
         }
     }
 
@@ -438,7 +434,7 @@ mod parity {
             let tag = case["tag"].as_str().unwrap();
             let tokens: Vec<u32> = case["tokens"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as u32).collect();
             let ours = e.forward(&tokens, case["start"].as_u64().unwrap() as usize).unwrap();
-            let reference: Vec<f32> = std::fs::read(d.join(format!("out_{tag}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            let reference: Vec<f32> = std::fs::read(d.join(format!("out_{tag}.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
             assert_eq!(ours.len(), reference.len(), "length");
             let (mut dot, mut na, mut nb, mut maxerr, mut maxref) = (0f64, 0f64, 0f64, 0f64, 0f64);
             for (a, b) in ours.iter().zip(&reference) {

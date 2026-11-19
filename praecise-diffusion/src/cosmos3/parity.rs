@@ -1,6 +1,6 @@
 //! Agreement of the joint transformer with the reference implementation on
 //! small random checkpoints, one per layout (squared-ReLU with a separate
-//! generation key norm; gated SiLU with text query/key norms), each with a
+//! generation key norm; gated `SiLU` with text query/key norms), each with a
 //! video segment and an action segment, from
 //! `tests/parity/make_cosmos3_mot_fixtures.py`.
 //!
@@ -22,7 +22,7 @@ fn root() -> PathBuf {
 fn bin(dir: &Path, name: &str) -> Vec<f32> {
     std::fs::read(dir.join(format!("{name}.bin")))
         .unwrap()
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
@@ -76,7 +76,7 @@ fn run(name: &str, wtype: WType, exact: bool) -> ((f64, f64), (f64, f64)) {
     let a = io.actions.clone().unwrap();
     g.finish(&[io.out.unwrap(), a.out.unwrap()]).unwrap();
     let gp = bin(&dir, "gen_positions");
-    let pos: Vec<[f32; 3]> = gp.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect();
+    let pos: Vec<[f32; 3]> = gp.as_chunks::<3>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
     let (cos, sin) = cfg.rotary_tables(&pos);
     g.set_f32(io.patches, &bin(&dir, "patches"));
     g.set_f32(io.time, &cfg.time_features(u("t_vision")));

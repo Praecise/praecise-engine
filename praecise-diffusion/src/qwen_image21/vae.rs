@@ -246,7 +246,7 @@ impl Net<'_, '_> {
         self.add_bias(y, p)
     }
 
-    /// Channel RMS norm with gain, then SiLU.
+    /// Channel RMS norm with gain, then `SiLU`.
     fn norm_silu(&mut self, p: &str, x: Tn) -> Tn {
         let c = self.g.permute(x, [1, 2, 0, 3]);
         let c = self.g.cont(c);

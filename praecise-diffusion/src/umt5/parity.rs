@@ -25,7 +25,7 @@ fn umt5_parity() {
     g.set_i32(io.buckets, &cfg.buckets(n));
     g.compute().unwrap();
     let got = g.read_f32(io.out);
-    let want: Vec<f32> = std::fs::read(dir.join("out.bin")).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let want: Vec<f32> = std::fs::read(dir.join("out.bin")).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
     let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
     for (x, y) in got.iter().zip(&want) {
         let (x, y) = (f64::from(*x), f64::from(*y));

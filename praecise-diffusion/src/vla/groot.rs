@@ -3,7 +3,7 @@
 //! flow-matching velocity, integrated from noise at `t = 0` to actions at
 //! `t = 1` by forward Euler.
 //!
-//! The backbone features pass a LayerNorm and a stack of self-attention
+//! The backbone features pass a `LayerNorm` and a stack of self-attention
 //! blocks. The state and the actions are embedded by per-embodiment
 //! projections (one embodiment's weights are loaded); the action embedding
 //! is fused with a sinusoidal embedding of the discretised time and gets a

@@ -4,7 +4,7 @@
 //! resolution sentences appended, and fed as raw token ids to the joint
 //! transformer (there is no separate text encoder). The video is generated in
 //! a 48-channel latent at 1/16 of the resolution and 1/4 of the frame rate
-//! (plus the first frame), sampled with UniPC under classifier-free guidance,
+//! (plus the first frame), sampled with `UniPC` under classifier-free guidance,
 //! and decoded frame by frame by the causal autoencoder.
 //!
 //! A conditioning image becomes the first latent frame: it is encoded, kept
@@ -485,10 +485,10 @@ impl Cosmos3 {
 
     pub(crate) fn check(req: &VideoRequest) -> Result<()> {
         let bad = |m: String| Err(Error::Request(m));
-        if req.width == 0 || req.height == 0 || req.width % 32 != 0 || req.height % 32 != 0 {
+        if req.width == 0 || req.height == 0 || !req.width.is_multiple_of(32) || !req.height.is_multiple_of(32) {
             return bad("width and height must be positive multiples of 32".into());
         }
-        if req.num_frames == 0 || (req.num_frames - 1) % 4 != 0 {
+        if req.num_frames == 0 || !(req.num_frames - 1).is_multiple_of(4) {
             return bad("frames must be 1 or 4k + 1".into());
         }
         if !(req.fps > 0.0 && req.fps.is_finite()) {

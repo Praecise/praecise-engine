@@ -14,7 +14,7 @@ use crate::ggml::{Graph, HostTensor, Tn, WType, WeightSpec, Weights};
 use crate::safetensors::SafeTensors;
 use llama_cpp_sys_2 as sys;
 
-/// ggml's rotary mode for split-half (NeoX) rotation, `GGML_ROPE_TYPE_NEOX`.
+/// ggml's rotary mode for split-half (`NeoX`) rotation, `GGML_ROPE_TYPE_NEOX`.
 const ROPE_NEOX: i32 = 2;
 /// Width of the sinusoidal timestep features.
 pub const TIME_FEATURES: usize = 256;
@@ -100,7 +100,7 @@ impl DitConfig {
         if self.in_channels != 3 * self.audio_acoustic_hidden_dim {
             return Err(Error::Config("transformer input is not source, mask and noisy latents".into()));
         }
-        if self.patch_size == 0 || self.num_attention_heads % self.num_key_value_heads != 0 {
+        if self.patch_size == 0 || !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) {
             return Err(Error::Config("transformer patch or head layout is not supported".into()));
         }
         self.sliding()?;
@@ -195,7 +195,7 @@ impl DitConfig {
         }
         // The patch matrices are small; keep them exact unless the caller
         // asked for 8-bit, whose rows must be multiples of 32.
-        let ty = |cols: usize| if linear == WType::Q8_0 && cols % 32 != 0 { WType::F32 } else { linear };
+        let ty = |cols: usize| if linear == WType::Q8_0 && !cols.is_multiple_of(32) { WType::F32 } else { linear };
         Ok(vec![
             HostTensor { name: "proj_in.weight".into(), shape: vec![d as u64, (p * c) as u64], ty: ty(p * c), data: win },
             HostTensor { name: "proj_out.weight".into(), shape: vec![(p * a) as u64, d as u64], ty: ty(d), data: wout },
@@ -248,7 +248,7 @@ impl ConditionConfig {
         if self.attention_bias {
             return Err(Error::Config("attention biases are not implemented".into()));
         }
-        if self.num_attention_heads % self.num_key_value_heads != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) {
             return Err(Error::Config("condition encoder head layout is not supported".into()));
         }
         self.lyric_sliding()?;

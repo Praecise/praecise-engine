@@ -1,4 +1,4 @@
-//! WebM: a writer for one AV1 track and an optional Opus track; reading
+//! `WebM`: a writer for one AV1 track and an optional Opus track; reading
 //! (any Matroska file) goes through `matroska-demuxer`.
 
 use std::io::Cursor;

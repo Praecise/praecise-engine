@@ -1,16 +1,16 @@
-//! The MolmoAct2 vision backbone: a ViT over image crops (patches flattened
+//! The `MolmoAct2` vision backbone: a `ViT` over image crops (patches flattened
 //! and embedded by one linear map, a learned position per patch, pre-norm
-//! blocks of LayerNorm, biased multi-head attention and a tanh-GELU MLP),
+//! blocks of `LayerNorm`, biased multi-head attention and a tanh-GELU MLP),
 //! whose hidden states after two chosen blocks are concatenated per patch.
 //! Each image token pools a few of those patch features: their masked mean
-//! queries an attention over them, and a SwiGLU projector maps the result
+//! queries an attention over them, and a `SwiGLU` projector maps the result
 //! to the language model's width.
 //!
 //! The language model reads the prompt with those features added to the
 //! embeddings of its image-patch tokens: pre-norm decoder blocks of RMS
 //! norm, one fused query/key/value projection, per-head query and key RMS
 //! norms, split-half rotary positions, grouped-query attention and a gated
-//! SiLU MLP. Attention is causal except that image tokens see each other
+//! `SiLU` MLP. Attention is causal except that image tokens see each other
 //! both ways. The keys and values of every block are kept for the action
 //! expert.
 //!
@@ -20,7 +20,7 @@
 //! modulates (shift, scale, gate from the time embedding) a self-attention
 //! over the chunk with split-half rotary positions, a cross-attention to
 //! that language-model block's keys and values (projected to the expert's
-//! width), and a gated SiLU MLP.
+//! width), and a gated `SiLU` MLP.
 
 use std::path::Path;
 
@@ -41,15 +41,15 @@ const E: &str = "model.action_expert.";
 /// `adapter_config`.
 #[derive(Debug, Clone)]
 pub struct MolmoAct2VisionConfig {
-    /// ViT width.
+    /// `ViT` width.
     pub hidden: u64,
-    /// ViT MLP width.
+    /// `ViT` MLP width.
     pub intermediate: u64,
-    /// ViT heads.
+    /// `ViT` heads.
     pub heads: u64,
-    /// ViT head width.
+    /// `ViT` head width.
     pub head_dim: u64,
-    /// LayerNorm epsilon.
+    /// `LayerNorm` epsilon.
     pub eps: f64,
     /// Patch side in pixels.
     pub patch_size: usize,
@@ -153,7 +153,7 @@ impl MolmoAct2VisionConfig {
         3 * self.patch_size * self.patch_size
     }
 
-    /// ViT blocks run: up to the last one read.
+    /// `ViT` blocks run: up to the last one read.
     #[must_use]
     pub fn blocks(&self) -> usize {
         self.layers.iter().max().map_or(0, |l| l + 1)
@@ -167,7 +167,7 @@ impl MolmoAct2VisionConfig {
         let cat = d * self.layers.len() as u64;
         let pl = self.patch_len() as u64;
         // Patch rows are 3 * p * p values, not always a multiple of the 8-bit block.
-        let kernel = if linear == WType::Q8_0 && pl % 32 != 0 { WType::Bf16 } else { linear };
+        let kernel = if linear == WType::Q8_0 && !pl.is_multiple_of(32) { WType::Bf16 } else { linear };
         let mut s = vec![
             WeightSpec::new(format!("{P}image_vit.patch_embedding.weight"), &[d, pl], kernel),
             WeightSpec::new(format!("{P}image_vit.patch_embedding.bias"), &[d], f),
@@ -229,13 +229,13 @@ pub(crate) fn checkpoint_files(dir: &Path) -> Vec<std::path::PathBuf> {
 pub fn snap_pixels(px: &[f32]) -> Vec<f32> {
     px.iter()
         .map(|&x| {
-            let v = (((x + 1.0) * 0.5) * 255.0).round_ties_even().clamp(0.0, 255.0) / 255.0;
+            let v = (f32::midpoint(x, 1.0) * 255.0).round_ties_even().clamp(0.0, 255.0) / 255.0;
             v * 2.0 - 1.0
         })
         .collect()
 }
 
-/// The MolmoAct2 vision backbone on one device.
+/// The `MolmoAct2` vision backbone on one device.
 pub struct MolmoAct2Vision {
     cfg: MolmoAct2VisionConfig,
     backend: Backend,
@@ -261,7 +261,7 @@ fn layer_norm(g: &mut Graph, w: &Weights, name: &str, x: Tn, eps: f32) -> Tn {
 
 impl MolmoAct2Vision {
     /// Load the backbone from a checkpoint directory (`config.json` and its
-    /// safetensors files); ViT blocks after the last one read are skipped.
+    /// safetensors files); `ViT` blocks after the last one read are skipped.
     ///
     /// # Errors
     /// On a missing or malformed file, an unsupported variant, or a backend
@@ -317,7 +317,7 @@ impl MolmoAct2Vision {
     pub fn encode(&self, pixels: &[f32], crops: usize, pooling: &[i32], pool: usize) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let (n, pl) = (c.patches(), c.patch_len());
-        if crops == 0 || pool == 0 || pixels.len() != crops * n * pl || pooling.len() % pool != 0 {
+        if crops == 0 || pool == 0 || pixels.len() != crops * n * pl || !pooling.len().is_multiple_of(pool) {
             return Err(Error::Request("crops or pooling indices of the wrong size".into()));
         }
         let total = (crops * n) as i32;
@@ -431,7 +431,7 @@ impl MolmoAct2Vision {
                 let count = t.iter().filter(|&&v| v).count().max(1) as f32;
                 shares.extend(t.iter().map(|&v| if v { 1.0 / count } else { 0.0 }));
             } else {
-                shares.extend(std::iter::repeat(1.0 / pool as f32).take(pool));
+                shares.extend(std::iter::repeat_n(1.0 / pool as f32, pool));
             }
         }
         g.set_f32(weigh, &shares);
@@ -516,7 +516,7 @@ impl MolmoAct2TextConfig {
             vocab: u(t, "vocab_size")?,
             new_vocab: t.get("additional_vocab_size").and_then(Value::as_u64).unwrap_or(0),
         };
-        if cfg.kv_heads == 0 || cfg.heads % cfg.kv_heads != 0 || cfg.head_dim % 2 != 0 {
+        if cfg.kv_heads == 0 || !cfg.heads.is_multiple_of(cfg.kv_heads) || !cfg.head_dim.is_multiple_of(2) {
             return Err(Error::Config("malformed MolmoAct2 attention heads".into()));
         }
         Ok(cfg)
@@ -626,7 +626,7 @@ pub struct MolmoAct2Prefix {
     pub values: Vec<Vec<f32>>,
 }
 
-/// The MolmoAct2 language model on one device.
+/// The `MolmoAct2` language model on one device.
 pub struct MolmoAct2Lm {
     cfg: MolmoAct2TextConfig,
     image: MolmoAct2ImageTokens,
@@ -919,13 +919,13 @@ impl MolmoAct2ActionConfig {
             eos: id("eos_token_id"),
             action_span: id("action_start_token_id").zip(id("action_end_token_id")),
         };
-        if heads == 0 || hidden % heads != 0 || (cfg.rope && cfg.head_dim % 2 != 0) {
+        if heads == 0 || hidden % heads != 0 || (cfg.rope && !cfg.head_dim.is_multiple_of(2)) {
             return Err(Error::Config("malformed MolmoAct2 action-expert heads".into()));
         }
         if cfg.layers != u(t, "num_hidden_layers")? as usize {
             return unsupported("a block count other than the language model's");
         }
-        if cfg.time_dim % 2 != 0 || cfg.time_dim < 4 {
+        if !cfg.time_dim.is_multiple_of(2) || cfg.time_dim < 4 {
             return unsupported("an odd or tiny time embedding");
         }
         if cfg.steps == 0 || cfg.max_horizon == 0 || cfg.max_action_dim == 0 {
@@ -938,7 +938,7 @@ impl MolmoAct2ActionConfig {
         let f = WType::F32;
         let (d, ff, a) = (self.hidden, self.intermediate, self.max_action_dim as u64);
         // Rows of the 8-bit type are whole blocks of 32 values.
-        let fit = |cols: u64| if linear == WType::Q8_0 && cols % 32 != 0 { WType::Bf16 } else { linear };
+        let fit = |cols: u64| if linear == WType::Q8_0 && !cols.is_multiple_of(32) { WType::Bf16 } else { linear };
         let mut s = Vec::new();
         let mut lin = |name: String, rows: u64, cols: u64, bias: bool| {
             s.push(WeightSpec::new(format!("{name}.weight"), &[rows, cols], fit(cols)));
@@ -1039,7 +1039,7 @@ impl MolmoAct2ActionConfig {
     }
 }
 
-/// The MolmoAct2 action expert on one device.
+/// The `MolmoAct2` action expert on one device.
 pub struct MolmoAct2ActionExpert {
     cfg: MolmoAct2ActionConfig,
     backend: Backend,

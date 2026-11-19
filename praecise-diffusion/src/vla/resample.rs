@@ -1,10 +1,10 @@
 //! 8-bit image resampling as the policies' reference image pipelines
-//! compute it, to the bit: OpenCV's `INTER_AREA`, torch's antialiased
+//! compute it, to the bit: `OpenCV`'s `INTER_AREA`, torch's antialiased
 //! bicubic resize of `uint8` images (the torchvision path on CPU) and
 //! torchvision's plain bilinear resize of `uint8` images.
 //!
 //! They work in integers or `float32` exactly as the libraries do, so the
-//! pixels a policy sees match the reference. OpenCV's area decimation and
+//! pixels a policy sees match the reference. `OpenCV`'s area decimation and
 //! torch's bilinear kernel sum in `float32` with fused multiply-adds on
 //! aarch64 builds and separate ones elsewhere; the build target picks the
 //! same here.
@@ -194,7 +194,7 @@ fn area_linear_taps(ssize: usize, dsize: usize) -> Vec<(usize, usize, i32, i32)>
 }
 
 /// Area interpolation that enlarges an axis: linear interpolation with area
-/// weights, horizontal pass in integers, vertical pass as OpenCV's vector
+/// weights, horizontal pass in integers, vertical pass as `OpenCV`'s vector
 /// kernel computes it (shifted to 16 bits, high halves of the products,
 /// rounded down by four).
 fn area_up(f: &Frame8, h: usize, w: usize) -> Frame8 {

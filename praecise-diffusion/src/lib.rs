@@ -7,7 +7,7 @@
 //! ACE-Step 1.5, a flow-matching transformer over 1D audio latents conditioned
 //! on caption, lyrics and timbre, decoded to a waveform by an Oobleck
 //! autoencoder. The video family is Cosmos3, a joint text-and-video
-//! transformer over patchified 3D latents sampled with UniPC, decoded frame by
+//! transformer over patchified 3D latents sampled with `UniPC`, decoded frame by
 //! frame by a causal video autoencoder. The LTX-2.3 audio-video transformer
 //! denoises video and audio latents together.
 //!

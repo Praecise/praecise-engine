@@ -231,11 +231,10 @@ pub fn generate_speculative(
             if output_tokens >= config.max_tokens {
                 stop_now = true;
             }
-            if let Ok(piece) = target_model.token_to_piece(sampled, &mut decoder, true, None) {
-                if !(stream.push(&piece, token_tx) && !stream.hit_stop()) {
+            if let Ok(piece) = target_model.token_to_piece(sampled, &mut decoder, true, None)
+                && !(stream.push(&piece, token_tx) && !stream.hit_stop()) {
                     stop_now = true;
                 }
-            }
             let matched = (idx as usize) < drafts.len() && sampled == drafts[idx as usize];
             if matched {
                 n_accepted += 1;

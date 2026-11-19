@@ -6,7 +6,7 @@
 //! first frame twice for a causal one); the spatial axes are zero padded.
 //!
 //! The decoder is a list of stages read from the checkpoint header, in weight
-//! order from the latent side: groups of residual blocks (pixel norm, SiLU,
+//! order from the latent side: groups of residual blocks (pixel norm, `SiLU`,
 //! convolution, twice, plus the input) and upsampling convolutions that widen
 //! the channels and fold them into time and space (depth to space). A
 //! temporal fold drops its first output frame, so with three of them `T`
@@ -193,7 +193,7 @@ impl VideoVaeConfig {
         let mut conv = |p: &str, cin: u64, cout: u64| -> Result<()> {
             let w = st.require(&format!("{p}.weight"), &[cout, cin, 3, 3, 3])?.to_f32();
             for k in 0..3 {
-                let d: Vec<f32> = w.chunks_exact(27).flat_map(|c| (0..9).map(move |j| c[k * 9 + j])).collect();
+                let d: Vec<f32> = w.as_chunks::<27>().0.iter().flat_map(|c| (0..9).map(move |j| c[k * 9 + j])).collect();
                 v.push(HostTensor { name: format!("{p}.t{k}"), shape: vec![cout, cin, 3, 3], ty: kt, data: d });
             }
             v.push(HostTensor { name: format!("{p}.bias"), shape: vec![cout], ty: WType::F32, data: st.require(&format!("{p}.bias"), &[cout])?.to_f32() });
@@ -257,7 +257,7 @@ impl Net<'_, '_> {
         self.g.add(acc.expect("three taps"), b)
     }
 
-    /// Pixel norm over channels, then SiLU.
+    /// Pixel norm over channels, then `SiLU`.
     fn norm_silu(&mut self, x: Tn) -> Tn {
         let c = self.g.permute(x, [1, 2, 0, 3]);
         let c = self.g.cont(c);
@@ -554,11 +554,10 @@ impl Default for Tiling {
 impl Tiling {
     fn check(self, s: usize, t: usize) -> Result<()> {
         for (tile, f, axis) in [(self.spatial, s, "spatial"), (self.temporal, t, "temporal")] {
-            if let Some(Tile { min, stride }) = tile {
-                if stride == 0 || stride > min || min % f != 0 || stride % f != 0 {
+            if let Some(Tile { min, stride }) = tile
+                && (stride == 0 || stride > min || min % f != 0 || stride % f != 0) {
                     return Err(Error::Request(format!("{axis} tiles must be multiples of {f} with 0 < stride <= min")));
                 }
-            }
         }
         Ok(())
     }

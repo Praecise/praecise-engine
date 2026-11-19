@@ -21,15 +21,15 @@ fn meta() -> Value {
 }
 
 fn f32s(name: &str) -> Vec<f32> {
-    std::fs::read(dir().join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    std::fs::read(dir().join(format!("{name}.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 fn i32s(name: &str) -> Vec<i32> {
-    std::fs::read(dir().join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    std::fs::read(dir().join(format!("{name}.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 fn coords(name: &str) -> Vec<[i32; 3]> {
-    i32s(name).chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+    i32s(name).as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]]).collect()
 }
 
 fn backend() -> Backend {

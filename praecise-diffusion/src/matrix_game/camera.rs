@@ -58,7 +58,7 @@ pub fn next_pose(p: &Pose, keyboard: &[f32], mouse: &[f32]) -> Pose {
         fwd = fwd.signum() * DIAGONAL_STEP;
         right = right.signum() * DIAGONAL_STEP;
     }
-    let r = ((yaw + new_yaw) / 2.0).to_radians();
+    let r = f64::midpoint(yaw, new_yaw).to_radians();
     let (c, sn) = (r.cos(), r.sin());
     #[allow(clippy::cast_possible_truncation)]
     [
@@ -184,7 +184,7 @@ pub fn interpolate(c2ws: &[Mat4], src: &[f64], tgt: &[f64]) -> Vec<Mat4> {
     let mut dets: Vec<f64> = c2ws.iter().map(|m| det3(&rot(m))).collect();
     dets.sort_by(f64::total_cmp);
     let n = dets.len();
-    let median = if n % 2 == 1 { dets[n / 2] } else { (dets[n / 2 - 1] + dets[n / 2]) / 2.0 };
+    let median = if n % 2 == 1 { dets[n / 2] } else { f64::midpoint(dets[n / 2 - 1], dets[n / 2]) };
     let flip = n > 0 && median < 0.0;
     let fl = |r: Mat3| if flip { r.map(|row| [row[0], row[1], -row[2]]) } else { r };
     let quats: Vec<[f64; 4]> = c2ws.iter().map(|m| quat(&fl(rot(m)))).collect();

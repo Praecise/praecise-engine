@@ -1,4 +1,4 @@
-//! UniPC multistep sampler (B(h) = e^h - 1, second order, data prediction)
+//! `UniPC` multistep sampler (B(h) = e^h - 1, second order, data prediction)
 //! over flow-matching velocities, with Karras-spaced noise levels mapped to
 //! the flow parameterisation.
 //!

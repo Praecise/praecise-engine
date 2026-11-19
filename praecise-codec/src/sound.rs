@@ -65,7 +65,7 @@ pub(crate) fn encode(s: Sound<'_>) -> Result<Encoded> {
         2 => Channels::Stereo,
         n => return Err(Error::Request(format!("{n} sound channels; 1 or 2 are encoded"))),
     };
-    if s.sample_rate == 0 || s.samples.len() % ch != 0 {
+    if s.sample_rate == 0 || !s.samples.len().is_multiple_of(ch) {
         return Err(Error::Request("sound is not a whole number of samples per channel".into()));
     }
     let per = s.samples.len() / ch;

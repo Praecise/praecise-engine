@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::ggml::{Graph, Tn, WType, WeightSpec, Weights};
 use llama_cpp_sys_2 as sys;
 
-/// ggml's rotary mode for split-half (NeoX) rotation, `GGML_ROPE_TYPE_NEOX`
+/// ggml's rotary mode for split-half (`NeoX`) rotation, `GGML_ROPE_TYPE_NEOX`
 /// in ggml.h (a preprocessor define, so not in the generated bindings).
 const ROPE_NEOX: i32 = 2;
 

@@ -609,7 +609,7 @@ impl MiniMaxH3Pipeline {
             }
             let plane = h * w;
             let mut px = vec![0f32; 3 * plane];
-            for (i, rgb) in im.rgb.chunks_exact(3).enumerate() {
+            for (i, rgb) in im.rgb.as_chunks::<3>().0.iter().enumerate() {
                 for c in 0..3 {
                     px[c * plane + i] = f32::from(rgb[c]) / 255.0;
                 }

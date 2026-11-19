@@ -119,7 +119,7 @@ impl WanDitConfig {
         if self.image_dim.is_some() || self.added_kv_proj_dim.is_some() {
             return Err(Error::Config("image-embedding cross-attention is not supported".into()));
         }
-        if self.attention_head_dim % 2 != 0 || self.attention_head_dim < 6 {
+        if !self.attention_head_dim.is_multiple_of(2) || self.attention_head_dim < 6 {
             return Err(Error::Config("attention_head_dim must be even".into()));
         }
         Ok(())
@@ -471,11 +471,10 @@ pub fn build(g: &mut Graph, cfg: &WanDitConfig, w: &Weights, pe: &Weights, frame
         }
         let a = attention(g, cfg, w, &format!("{p}.attn2"), h, ctx, None, exact);
         x = g.add(x, a);
-        if let (Some(wd), Some(aio)) = (&cfg.world, &actions) {
-            if wd.action.blocks.contains(&i) {
+        if let (Some(wd), Some(aio)) = (&cfg.world, &actions)
+            && wd.action.blocks.contains(&i) {
                 x = matrix_game::build_action(g, &wd.action, w, &format!("{p}.action_model"), x, aio, frames, exact);
             }
-        }
 
         let h = modulate(g, x, c_shift, c_scale, eps);
         let f = lin(g, w, &format!("{p}.ffn.net.0.proj"), h);

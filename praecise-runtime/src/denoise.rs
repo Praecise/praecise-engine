@@ -990,7 +990,7 @@ mod tests {
         let mut rng = Rng::new(3);
         let mut c = NoiseCanvas::new(noise_plan(), 10, &[1, 2], 16, &mut rng);
         assert_eq!(c.next_input().unwrap().len(), 6);
-        assert_eq!(c.conditioning().0, false);
+        assert!(!c.conditioning().0);
         let rows: Vec<NoiseRow> = [4, 5, 0, 6].iter().map(|&t| NoiseRow { argmax: t, sampled: t, entropy: 0.0 }).collect();
         let (_, renoise) = c.draws(&mut rng);
         assert_eq!(c.apply(&rows, &renoise, |t| t == 0, &mut rng), CanvasEnd::Open, "one step is not yet stable");

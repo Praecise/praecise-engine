@@ -410,10 +410,10 @@ impl Ltx2Pipeline {
     fn check(&self, req: &Ltx2Request) -> Result<(AvShape, usize)> {
         let cfg = self.transformer.config();
         let (t, sp) = (cfg.vae_scale_factors[0] as usize, cfg.vae_scale_factors[1] as usize);
-        if req.width == 0 || req.height == 0 || req.width % sp != 0 || req.height % sp != 0 {
+        if req.width == 0 || req.height == 0 || !req.width.is_multiple_of(sp) || !req.height.is_multiple_of(sp) {
             return Err(Error::Request(format!("width and height must be positive multiples of {sp}")));
         }
-        if req.num_frames == 0 || (req.num_frames - 1) % t != 0 {
+        if req.num_frames == 0 || !(req.num_frames - 1).is_multiple_of(t) {
             return Err(Error::Request(format!("frames must be one more than a multiple of {t}")));
         }
         if (req.schedule == Schedule::Shifted && req.steps < 2) || !(req.fps > 0.0) {
@@ -423,7 +423,7 @@ impl Ltx2Pipeline {
             if req.schedule != Schedule::Distilled || self.upsampler.is_none() {
                 return Err(Error::Request("two-stage generation needs the distilled schedule and a latent upsampler".into()));
             }
-            if req.width % (2 * sp) != 0 || req.height % (2 * sp) != 0 {
+            if !req.width.is_multiple_of(2 * sp) || !req.height.is_multiple_of(2 * sp) {
                 return Err(Error::Request(format!("two-stage width and height must be multiples of {}", 2 * sp)));
             }
         }

@@ -501,7 +501,7 @@ impl<'p> Rollout<'p> {
 /// # Errors
 /// When the image does not divide into the grid.
 pub fn frames_from_grid(width: usize, height: usize, rgb: &[u8], cameras: usize, frames: usize) -> Result<Vec<Vec<Frame>>> {
-    if cameras == 0 || frames == 0 || rgb.len() != width * height * 3 || width % cameras != 0 || height % frames != 0 {
+    if cameras == 0 || frames == 0 || rgb.len() != width * height * 3 || !width.is_multiple_of(cameras) || !height.is_multiple_of(frames) {
         return Err(Error::Request(format!("a {width}x{height} image is not a grid of {frames} rows by {cameras} cameras")));
     }
     let (cw, ch) = (width / cameras, height / frames);

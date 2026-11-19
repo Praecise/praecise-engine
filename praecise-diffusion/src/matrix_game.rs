@@ -124,11 +124,11 @@ pub const CAMERA_CHANNELS: u64 = 6 * 256;
 /// Read the original-layout `config.json` into a transformer configuration.
 pub fn config(json: &[u8]) -> Result<WanDitConfig> {
     let c: OriginalConfig = serde_json::from_slice(json).map_err(|e| Error::Config(format!("world model config: {e}")))?;
-    if c.dim % c.num_heads != 0 {
+    if !c.dim.is_multiple_of(c.num_heads) {
         return Err(Error::Config("dim is not a multiple of num_heads".into()));
     }
     let a = &c.action_config;
-    if a.mouse_hidden_dim % a.heads_num != 0 || a.keyboard_hidden_dim % a.heads_num != 0 {
+    if !a.mouse_hidden_dim.is_multiple_of(a.heads_num) || !a.keyboard_hidden_dim.is_multiple_of(a.heads_num) {
         return Err(Error::Config("action hidden dims must divide by heads_num".into()));
     }
     if a.rope_dim_list.iter().sum::<u64>() != a.mouse_hidden_dim / a.heads_num || a.keyboard_hidden_dim != a.mouse_hidden_dim {
@@ -321,10 +321,10 @@ pub fn windows(a: &ActionConfig, rows: &[f32], dims: usize, memory: &[f32]) -> R
     let r = a.vae_time_compression_ratio as usize;
     let win = a.window();
     let n = rows.len() / dims;
-    if rows.len() % dims != 0 || n == 0 {
+    if !rows.len().is_multiple_of(dims) || n == 0 {
         return Err(Error::Request("action rows are not whole".into()));
     }
-    let (frames, pad) = if (n - 1) % r == 0 { ((n - 1) / r + 1, win) } else if n % r == 0 { (n / r, win - r) } else {
+    let (frames, pad) = if (n - 1).is_multiple_of(r) { ((n - 1) / r + 1, win) } else if n.is_multiple_of(r) { (n / r, win - r) } else {
         return Err(Error::Request(format!("{n} action rows do not span whole latent frames")));
     };
     let padded: Vec<&[f32]> = std::iter::repeat_n(&rows[..dims], pad).chain(rows.chunks_exact(dims)).collect();

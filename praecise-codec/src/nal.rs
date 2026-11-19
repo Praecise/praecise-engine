@@ -4,6 +4,7 @@
 use crate::{Error, Result};
 
 /// NAL units of an Annex B stream, without their start codes.
+#[must_use]
 pub fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
@@ -142,11 +143,13 @@ pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// The H.264 NAL unit type.
+#[must_use]
 pub fn h264_type(nal: &[u8]) -> u8 {
     nal.first().map_or(0, |b| b & 0x1f)
 }
 
 /// The H.265 NAL unit type.
+#[must_use]
 pub fn h265_type(nal: &[u8]) -> u8 {
     nal.first().map_or(0, |b| (b >> 1) & 0x3f)
 }

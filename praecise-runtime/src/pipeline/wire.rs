@@ -185,11 +185,11 @@ impl<'a> Cursor<'a> {
     }
     fn i32s(&mut self, n: usize) -> Result<Vec<i32>, PipelineError> {
         let b = self.take(n.checked_mul(4).ok_or_else(|| proto("size"))?)?;
-        Ok(b.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Ok(b.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
     fn f32s(&mut self, n: usize) -> Result<Vec<f32>, PipelineError> {
         let b = self.take(n.checked_mul(4).ok_or_else(|| proto("size"))?)?;
-        Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Ok(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 }
 

@@ -16,7 +16,7 @@ fn root() -> PathBuf {
 fn bin(dir: &Path, name: &str) -> Vec<f32> {
     std::fs::read(dir.join(format!("{name}.bin")))
         .unwrap()
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }

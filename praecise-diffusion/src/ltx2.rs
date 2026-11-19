@@ -170,7 +170,7 @@ impl Ltx2Config {
                 self.audio_inner() == self.audio_cross_attention_dim && self.num_attention_heads == self.audio_num_attention_heads,
                 "audio-video rotary tables wider or with other heads than the audio stream",
             ),
-            (self.attention_head_dim % 2 == 0 && self.audio_attention_head_dim % 2 == 0, "odd head widths"),
+            (self.attention_head_dim.is_multiple_of(2) && self.audio_attention_head_dim.is_multiple_of(2), "odd head widths"),
         ];
         for (ok, what) in checks {
             if !ok {
@@ -283,13 +283,13 @@ impl Ltx2Config {
         let n = frames * height * width;
         let mut c = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
         for f in 0..frames {
-            let t = (time(f) + time(f + 1)) / 2.0;
+            let t = f32::midpoint(time(f), time(f + 1));
             for y in 0..height {
-                let r = (y as f32 * s[1] + (y + 1) as f32 * s[1]) / 2.0;
+                let r = f32::midpoint(y as f32 * s[1], (y + 1) as f32 * s[1]);
                 for x in 0..width {
                     c[0].push(t);
                     c[1].push(r);
-                    c[2].push((x as f32 * s[2] + (x + 1) as f32 * s[2]) / 2.0);
+                    c[2].push(f32::midpoint(x as f32 * s[2], (x + 1) as f32 * s[2]));
                 }
             }
         }
@@ -302,7 +302,7 @@ impl Ltx2Config {
         let s = self.audio_scale_factor as f32;
         let off = self.causal_offset as f32;
         let secs = |i: usize| ((i as f32 * s + off - s).max(0.0)) * self.audio_hop_length as f32 / self.audio_sampling_rate as f32;
-        (0..frames).map(|i| (secs(i) + secs(i + 1)) / 2.0).collect()
+        (0..frames).map(|i| f32::midpoint(secs(i), secs(i + 1))).collect()
     }
 
     /// Video, audio and the two cross-stream rotary tables for one shape.

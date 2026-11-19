@@ -18,7 +18,7 @@ fn root() -> PathBuf {
 }
 
 pub(super) fn raw(dir: &std::path::Path, name: &str) -> Vec<[u8; 4]> {
-    std::fs::read(dir.join(format!("{name}.bin"))).unwrap().chunks_exact(4).map(|b| [b[0], b[1], b[2], b[3]]).collect()
+    std::fs::read(dir.join(format!("{name}.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| [b[0], b[1], b[2], b[3]]).collect()
 }
 
 pub(super) fn f32s(dir: &std::path::Path, name: &str) -> Vec<f32> {
@@ -26,7 +26,7 @@ pub(super) fn f32s(dir: &std::path::Path, name: &str) -> Vec<f32> {
 }
 
 pub(super) fn ids(dir: &std::path::Path, name: &str) -> Vec<[i32; 4]> {
-    raw(dir, name).into_iter().map(i32::from_le_bytes).collect::<Vec<_>>().chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    raw(dir, name).into_iter().map(i32::from_le_bytes).collect::<Vec<_>>().as_chunks::<4>().0.iter().map(|c| [c[0], c[1], c[2], c[3]]).collect()
 }
 
 /// Cosine similarity and max error relative to the reference's largest

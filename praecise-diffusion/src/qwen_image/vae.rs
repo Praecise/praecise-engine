@@ -234,7 +234,7 @@ impl Net<'_, '_> {
         self.add_bias(y, p)
     }
 
-    /// Channel RMS norm with gain, then SiLU.
+    /// Channel RMS norm with gain, then `SiLU`.
     fn norm_silu(&mut self, p: &str, x: Tn) -> Tn {
         let c = self.g.permute(x, [1, 2, 0, 3]);
         let c = self.g.cont(c);
@@ -399,13 +399,10 @@ impl QwenImageVae {
         steps.sort_by_key(|s| s.0);
         for (k, r) in steps {
             let p = format!("encoder.down_blocks.{k}");
-            x = match r {
-                Some((i, o)) => n.resnet(&p, x, i, o),
-                None => {
-                    let padded = n.g.pad_end(x, 1, 1);
-                    let y = n.g.conv2d_stride2(n.w.get(&format!("{p}.resample.1.weight")), padded);
-                    n.add_bias(y, &format!("{p}.resample.1"))
-                }
+            x = if let Some((i, o)) = r { n.resnet(&p, x, i, o) } else {
+                let padded = n.g.pad_end(x, 1, 1);
+                let y = n.g.conv2d_stride2(n.w.get(&format!("{p}.resample.1.weight")), padded);
+                n.add_bias(y, &format!("{p}.resample.1"))
             };
         }
         let top = *cfg.enc_dims().last().expect("validated");

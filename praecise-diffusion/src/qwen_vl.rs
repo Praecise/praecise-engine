@@ -63,11 +63,10 @@ impl VisionConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if let (Some(a), Some(b)) = (self.in_channels, self.in_chans) {
-            if a != b {
+        if let (Some(a), Some(b)) = (self.in_channels, self.in_chans)
+            && a != b {
                 return Err(Error::Config(format!("vision config: in_channels {a} and in_chans {b} disagree")));
             }
-        }
         Ok(())
     }
 }

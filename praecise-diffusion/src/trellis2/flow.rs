@@ -81,7 +81,7 @@ impl FlowConfig {
         if !self.share_mod {
             return Err(Error::Config("flow transformer without a shared modulation is not implemented".into()));
         }
-        if self.num_heads == 0 || self.model_channels % self.num_heads != 0 || self.head_dim() % 2 != 0 {
+        if self.num_heads == 0 || !self.model_channels.is_multiple_of(self.num_heads) || !self.head_dim().is_multiple_of(2) {
             return Err(Error::Config("flow transformer heads do not divide the width into even head widths".into()));
         }
         if self.head_dim() / 2 / 3 == 0 {
@@ -216,7 +216,7 @@ impl FlowModel {
         if x.len() != n * cfg.in_channels {
             return Err(Error::Request(format!("flow input holds {} values for {n} tokens of {}", x.len(), cfg.in_channels)));
         }
-        if cond.is_empty() || cond.len() % cfg.cond_channels != 0 {
+        if cond.is_empty() || !cond.len().is_multiple_of(cfg.cond_channels) {
             return Err(Error::Request("image features do not match the condition width".into()));
         }
         let lc = cond.len() / cfg.cond_channels;

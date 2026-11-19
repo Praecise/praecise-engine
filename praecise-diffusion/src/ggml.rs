@@ -360,7 +360,7 @@ mod backend_tests {
             let vd: Vec<f32> = (0..d * nkv * h).map(|i| half::f16::from_f32(value(i, 3)).to_f32()).collect();
             // A band of visible keys per query, different for every row, so
             // masked keys fall inside, before and after the tiles.
-            let visible = |iq: usize, ik: usize| !masked || (ik + 7 * iq) % 5 != 0 || ik == iq % nkv;
+            let visible = |iq: usize, ik: usize| !masked || !(ik + 7 * iq).is_multiple_of(5) || ik == iq % nkv;
             let md: Vec<f32> =
                 (0..nq * nkv).map(|i| if visible(i / nkv, i % nkv) { 0.0 } else { f32::NEG_INFINITY }).collect();
             g.set_f32(q, &qd);
@@ -976,7 +976,7 @@ impl Graph {
     pub fn scale_bias(&mut self, a: Tn, s: f32, b: f32) -> Tn {
         Tn(unsafe { sys::ggml_scale_bias(self.ctx, a.0, s, b) })
     }
-    /// SiLU.
+    /// `SiLU`.
     pub fn silu(&mut self, a: Tn) -> Tn {
         Tn(unsafe { sys::ggml_silu(self.ctx, a.0) })
     }

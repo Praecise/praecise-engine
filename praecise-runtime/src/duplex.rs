@@ -224,11 +224,10 @@ impl DuplexSession {
         if self.barged {
             return ControlFlow::Break(());
         }
-        if !pcm.is_empty() && self.first_audio.is_none() {
-            if let Some(t) = self.turn_ended_at {
+        if !pcm.is_empty() && self.first_audio.is_none()
+            && let Some(t) = self.turn_ended_at {
                 self.first_audio = Some(t.elapsed());
             }
-        }
         ControlFlow::Continue(())
     }
 

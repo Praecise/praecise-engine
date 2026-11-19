@@ -257,7 +257,7 @@ impl Cosmos3 {
         if emb.domain >= domains {
             return bad(format!("embodiment {} uses domain {}, the model has {domains}", req.embodiment, emb.domain));
         }
-        if req.chunk_size == 0 || req.chunk_size % 4 != 0 {
+        if req.chunk_size == 0 || !req.chunk_size.is_multiple_of(4) {
             return bad("chunk_size must be a positive multiple of 4".into());
         }
         if !(req.fps > 0.0 && req.fps.is_finite()) {
@@ -285,7 +285,7 @@ impl Cosmos3 {
                 first.width, first.height, req.resolution_tier
             ));
         }
-        if first.width % 32 != 0 || first.height % 32 != 0 {
+        if !first.width.is_multiple_of(32) || !first.height.is_multiple_of(32) {
             return bad(format!("canvas {}x{} is not a multiple of 32", first.width, first.height));
         }
         match (&req.mode, &req.actions) {

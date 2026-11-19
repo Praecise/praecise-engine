@@ -191,12 +191,9 @@ pub fn dual_grid_mesh(coords: &[[i32; 3]], offsets: &[V3], crossed: &[[bool; 3]]
             let mut q = [0u32; 4];
             let mut ok = true;
             for (k, off) in EDGE[axis].iter().enumerate() {
-                match index.get(&[c[0] + off[0], c[1] + off[1], c[2] + off[2]]) {
-                    Some(&v) => q[k] = v,
-                    None => {
-                        ok = false;
-                        break;
-                    }
+                if let Some(&v) = index.get(&[c[0] + off[0], c[1] + off[1], c[2] + off[2]]) { q[k] = v } else {
+                    ok = false;
+                    break;
                 }
             }
             if !ok {
@@ -359,19 +356,16 @@ pub fn split_non_manifold(mesh: &mut Mesh) -> usize {
         root_vertex.clear();
         for i in 0..fs.len() {
             let r = find(&mut parent, i as u32);
-            let target = match root_vertex.iter().find(|(rr, _)| *rr == r) {
-                Some(&(_, t)) => t,
-                None => {
-                    let t = if root_vertex.is_empty() {
-                        v
-                    } else {
-                        mesh.vertices.push(mesh.vertices[v as usize]);
-                        changes += 1;
-                        (mesh.vertices.len() - 1) as u32
-                    };
-                    root_vertex.push((r, t));
-                    t
-                }
+            let target = if let Some(&(_, t)) = root_vertex.iter().find(|(rr, _)| *rr == r) { t } else {
+                let t = if root_vertex.is_empty() {
+                    v
+                } else {
+                    mesh.vertices.push(mesh.vertices[v as usize]);
+                    changes += 1;
+                    (mesh.vertices.len() - 1) as u32
+                };
+                root_vertex.push((r, t));
+                t
             };
             if target != v {
                 for x in &mut mesh.faces[fs[i] as usize] {
@@ -627,7 +621,7 @@ pub fn simplify(mesh: &mut Mesh, max_faces: usize) -> usize {
     let mut stamp = vec![0u64; nv];
     let mut epoch = 0u64;
     let target = |q: &Quadric, pa: [f64; 3], pb: [f64; 3]| -> ([f64; 3], f64) {
-        let mid = [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5, (pa[2] + pb[2]) * 0.5];
+        let mid = [f64::midpoint(pa[0], pb[0]), f64::midpoint(pa[1], pb[1]), f64::midpoint(pa[2], pb[2])];
         let mut best = (mid, q.eval(mid));
         if let Some(o) = q.optimum() {
             // Keep the optimum near the edge to avoid spikes.

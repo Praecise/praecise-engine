@@ -126,7 +126,7 @@ fn splits_an_observation_grid() {
     assert!(g.iter().all(|c| c.len() == 2 && c[0].w == 2 && c[0].h == 1));
     let probe = Frame::from_u8(1, 2, &[20, 10, 0, 20, 10, 0]).unwrap();
     assert_eq!(g[2][1].data, probe.data);
-    assert!(frames_from_grid(7, 2, &vec![0; 42], 3, 2).is_err());
+    assert!(frames_from_grid(7, 2, &[0; 42], 3, 2).is_err());
 }
 
 /// A release of `case` (history conditioning, the fixture's statistics) in
@@ -303,7 +303,7 @@ fn flux3_release_real() {
     // Commands at the middle of the state range, drifting slowly.
     let (states, past) = match &r.normalization {
         Some(n) => {
-            let raw: Vec<f32> = (0..frames * d).map(|i| 0.5 * (n.state.q01[i % d] + n.state.q99[i % d]) + (i / d) as f32 * 0.1).collect();
+            let raw: Vec<f32> = (0..frames * d).map(|i| f32::midpoint(n.state.q01[i % d], n.state.q99[i % d]) + (i / d) as f32 * 0.1).collect();
             let past = cfg.condition_on_past_actions.then(|| n.past_actions(&raw));
             (n.states(&raw), past)
         }
@@ -359,7 +359,7 @@ fn flux3_release_real() {
         eprintln!("  {row:?}");
     }
     if let Some(n) = &r.normalization {
-        let anchor: Vec<f32> = (0..d).map(|c| 0.5 * (n.state.q01[c] + n.state.q99[c]) + (frames - 1) as f32 * 0.1).collect();
+        let anchor: Vec<f32> = (0..d).map(|c| f32::midpoint(n.state.q01[c], n.state.q99[c]) + (frames - 1) as f32 * 0.1).collect();
         let commands = n.commands(&chunk, &anchor);
         eprintln!("first commands: {:?}", &commands[..d]);
         eprintln!("last commands:  {:?}", &commands[commands.len() - d..]);

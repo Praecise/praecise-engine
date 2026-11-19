@@ -1,7 +1,7 @@
-//! pi0.5: a PaliGemma backbone with a Gemma action expert.
+//! pi0.5: a `PaliGemma` backbone with a Gemma action expert.
 //!
 //! Each camera frame is resized with centred padding to the vision input,
-//! encoded by a SigLIP tower and linearly projected to the decoder width.
+//! encoded by a `SigLIP` tower and linearly projected to the decoder width.
 //! The measured state is normalised, discretised into 256 bins over
 //! `[-1, 1]` and written into the prompt (`Task: ..., State: ...;\nAction: `),
 //! whose token embeddings are scaled by the square root of the width. The
@@ -82,7 +82,7 @@ pub struct Pi05Dims {
 }
 
 impl Pi05Dims {
-    /// The released network: the named decoder variants and a SigLIP
+    /// The released network: the named decoder variants and a `SigLIP`
     /// so400m tower at `image_size`.
     ///
     /// # Errors
@@ -270,7 +270,7 @@ pub fn discretize_state(state: &[f32]) -> Vec<i32> {
 /// The prompt for an instruction and a discretised state.
 #[must_use]
 pub fn prompt(instruction: &str, bins: &[i32]) -> String {
-    let task = instruction.trim().replace('_', " ").replace('\n', " ");
+    let task = instruction.trim().replace(['_', '\n'], " ");
     let state: Vec<String> = bins.iter().map(i32::to_string).collect();
     format!("Task: {task}, State: {};\nAction: ", state.join(" "))
 }

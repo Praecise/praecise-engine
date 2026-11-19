@@ -130,7 +130,7 @@ pub fn crop_to_object(img: &RgbaImage) -> Result<RgbImage> {
     if img.data.len() != w * h * 4 || w == 0 || h == 0 {
         return Err(Error::Request("image size does not match its pixels".into()));
     }
-    if img.data.chunks_exact(4).all(|p| p[3] == 255) {
+    if img.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255) {
         return Err(Error::Request(
             "the image is fully opaque: image-to-3D needs the object isolated by an alpha mask (background removal is not part of this engine)".into(),
         ));
@@ -183,7 +183,7 @@ pub fn crop_to_object(img: &RgbaImage) -> Result<RgbImage> {
     Ok(RgbImage { width: cw as u32, height: chh as u32, rgb })
 }
 
-/// Resize to `side x side` and normalise with the ImageNet mean and
+/// Resize to `side x side` and normalise with the `ImageNet` mean and
 /// deviation: `[3, side, side]` row-major floats.
 #[must_use]
 pub fn encoder_input(img: &RgbImage, side: usize) -> Vec<f32> {

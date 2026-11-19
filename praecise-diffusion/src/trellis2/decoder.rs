@@ -1,5 +1,5 @@
 //! Structured-latent decoders: a sparse convolutional U-Net that refines the
-//! latent voxels through ConvNeXt blocks and doubles their resolution four
+//! latent voxels through `ConvNeXt` blocks and doubles their resolution four
 //! times, each time splitting every voxel into the children a subdivision
 //! mask keeps. The shape decoder predicts its own masks and ends in
 //! per-voxel dual-grid vertices, edge-crossing flags and quad split weights;
@@ -22,7 +22,7 @@ pub struct DecoderConfig {
     pub model_channels: Vec<usize>,
     /// Latent channels.
     pub latent_channels: usize,
-    /// ConvNeXt blocks per stage.
+    /// `ConvNeXt` blocks per stage.
     pub num_blocks: Vec<usize>,
     /// Block kind per stage.
     pub block_type: Vec<String>,
@@ -257,15 +257,12 @@ impl SparseDecoder {
             if let Some(y) = o_out {
                 return Ok(Decoded { voxels: here, feats: g.read_f32(y), subdivisions });
             }
-            let mask: Vec<bool> = match o_sub {
-                Some(sub) => g.read_f32(sub).into_iter().map(|v| v > 0.0).collect(),
-                None => {
-                    let m = guide.expect("checked above")[s].clone();
-                    if m.len() != here.len() * 8 {
-                        return Err(Error::Request(format!("subdivision mask {s} holds {} flags for {} voxels", m.len(), here.len())));
-                    }
-                    m
+            let mask: Vec<bool> = if let Some(sub) = o_sub { g.read_f32(sub).into_iter().map(|v| v > 0.0).collect() } else {
+                let m = guide.expect("checked above")[s].clone();
+                if m.len() != here.len() * 8 {
+                    return Err(Error::Request(format!("subdivision mask {s} holds {} flags for {} voxels", m.len(), here.len())));
                 }
+                m
             };
             let (children, rows) = here.subdivide(&mask);
             if children.is_empty() {

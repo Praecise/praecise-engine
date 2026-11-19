@@ -61,7 +61,7 @@ pub fn write_glb(mesh: &TexturedMesh) -> Result<Vec<u8>> {
     let mut bin: Vec<u8> = Vec::new();
     let mut views: Vec<(usize, usize, Option<u32>)> = Vec::new();
     let mut push_view = |bin: &mut Vec<u8>, bytes: &[u8], target: Option<u32>| -> usize {
-        while bin.len() % 4 != 0 {
+        while !bin.len().is_multiple_of(4) {
             bin.push(0);
         }
         let off = bin.len();
@@ -103,7 +103,7 @@ pub fn write_glb(mesh: &TexturedMesh) -> Result<Vec<u8>> {
         let png = encode_png(tex)?;
         images.push(push_view(&mut bin, &png, None));
     }
-    while bin.len() % 4 != 0 {
+    while !bin.len().is_multiple_of(4) {
         bin.push(0);
     }
 
@@ -157,7 +157,7 @@ pub fn write_glb(mesh: &TexturedMesh) -> Result<Vec<u8>> {
         .collect();
     let _ = write!(j, r#""bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#, bv.join(","), bin.len());
     let mut jb = j.into_bytes();
-    while jb.len() % 4 != 0 {
+    while !jb.len().is_multiple_of(4) {
         jb.push(b' ');
     }
     let total = 12 + 8 + jb.len() + 8 + bin.len();

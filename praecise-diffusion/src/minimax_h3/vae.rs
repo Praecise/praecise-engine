@@ -1,4 +1,4 @@
-//! MiniMax-H3 video autoencoder: a causal 3D CNN encoder and a ViT decoder.
+//! MiniMax-H3 video autoencoder: a causal 3D CNN encoder and a `ViT` decoder.
 //!
 //! Encoder activations are laid out `[W, H, C, T]`. A 3x3x3 convolution is
 //! three 2D convolutions over shifted frames, summed; the frame axis gets two
@@ -17,7 +17,7 @@
 //! are dropped; decoding mirrors that with overlapping clips cross-faded in
 //! time. Both directions tile space with linearly blended overlaps by
 //! default, as the checkpoint was released. Pixels are in the autoencoder's
-//! own space (ImageNet mean / std normalised RGB); latents are normalised
+//! own space (`ImageNet` mean / std normalised RGB); latents are normalised
 //! with the checkpoint's per-channel `latents_mean` / `latents_std`.
 //!
 //! Checkpoints in the single-file layout (`encoder.down.N.block.M`,
@@ -79,9 +79,9 @@ fn from_single_file_layout(st: SafeTensors, cfg: &H3VideoVaeConfig) -> Result<Sa
     })
 }
 
-/// ImageNet channel means of the pixel space.
+/// `ImageNet` channel means of the pixel space.
 pub const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-/// ImageNet channel spreads of the pixel space.
+/// `ImageNet` channel spreads of the pixel space.
 pub const PIXEL_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 /// `vae/config.json` of a MiniMax-H3 checkpoint.
@@ -272,7 +272,7 @@ impl Host<'_> {
     fn conv3(&mut self, p: &str, cin: u64, cout: u64) -> Result<()> {
         let w = self.st.require(&format!("{p}.weight"), &[cout, cin, 3, 3, 3])?.to_f32();
         for k in 0..3 {
-            let d: Vec<f32> = w.chunks_exact(27).flat_map(|c| (0..9).map(move |j| c[k * 9 + j])).collect();
+            let d: Vec<f32> = w.as_chunks::<27>().0.iter().flat_map(|c| (0..9).map(move |j| c[k * 9 + j])).collect();
             self.v.push(HostTensor { name: format!("{p}.t{k}"), shape: vec![cout, cin, 3, 3], ty: WType::F32, data: d });
         }
         self.vector(&format!("{p}.bias"), cout)
@@ -594,7 +594,7 @@ impl H3VideoVae {
         let (h, w) = (image.height as usize, image.width as usize);
         let plane = h * w;
         let mut px = vec![0f32; 3 * plane];
-        for (i, rgb) in image.rgb.chunks_exact(3).enumerate() {
+        for (i, rgb) in image.rgb.as_chunks::<3>().0.iter().enumerate() {
             for c in 0..3 {
                 px[c * plane + i] = f32::from(rgb[c]) / 255.0;
             }

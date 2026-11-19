@@ -176,7 +176,7 @@ fn parity_dir(var: &str) -> PathBuf {
     PathBuf::from(std::env::var(var).unwrap_or_else(|_| panic!("set {var} to a fixture directory")))
 }
 
-/// The SmolVLA control loop against the reference policy's `select_action`
+/// The `SmolVLA` control loop against the reference policy's `select_action`
 /// loop. `PRAECISE_SMOLVLA_PARITY` names a directory with `policy/`,
 /// `backbone/`, `fixture.json` and `fixture.safetensors`.
 #[test]
@@ -302,7 +302,7 @@ fn groot_matches_reference() {
     assert!(worst_f <= tol && worst_a <= tol, "GR00T differs from the reference");
 }
 
-/// The MolmoAct2 vision backbone against the reference.
+/// The `MolmoAct2` vision backbone against the reference.
 /// `PRAECISE_MOLMOACT2_VISION_PARITY` names a directory with `policy/`
 /// (`config.json`, `model.safetensors`), `fixture.json` and
 /// `fixture.safetensors` (written by
@@ -360,7 +360,7 @@ fn molmoact2_vision_config_reads_a_release() {
     assert!(cfg.pool_mask);
 }
 
-/// The MolmoAct2 prompt prefix through the release's preprocessing
+/// The `MolmoAct2` prompt prefix through the release's preprocessing
 /// against the reference policy (`PRAECISE_MOLMOACT2_PREFIX_PARITY`, made by
 /// `tests/parity/make_molmoact2_prefix_fixture.py`): the prompt text, ids and
 /// pooling indices exactly, the crops to the 8-bit level, then the image
@@ -455,7 +455,7 @@ fn molmoact2_language_config_reads_a_release() {
     assert!((sin[128] - 1f32.sin()).abs() < 1e-7);
 }
 
-/// The MolmoAct2 action expert against the reference's flow-matching
+/// The `MolmoAct2` action expert against the reference's flow-matching
 /// loop (`PRAECISE_MOLMOACT2_ACTION_PARITY`, made by
 /// `tests/parity/make_molmoact2_action_fixture.py`): the context masks
 /// exactly, then each sample's action chunk from the same noise, once from
@@ -573,7 +573,7 @@ fn molmoact2_action_config_reads_a_release() {
     assert!(molmoact2::MolmoAct2ActionConfig::from_json(&bad).is_err());
 }
 
-/// The MolmoAct2 control loop from frames, through an embodiment of the
+/// The `MolmoAct2` control loop from frames, through an embodiment of the
 /// release's statistics, against the lerobot policy's pre-processor,
 /// `select_action` loop and post-processor
 /// (`PRAECISE_MOLMOACT2_ROLLOUT_PARITY`, made by
@@ -776,7 +776,7 @@ fn relative_poses_compose_after_the_reference() {
 /// prediction are checked; then every executed action (robot units, of
 /// order one in the fixture) is compared. Patches must match exactly, except
 /// by one level where the fixture comes from another architecture and the
-/// release uses OpenCV's area interpolation.
+/// release uses `OpenCV`'s area interpolation.
 #[test]
 #[ignore = "needs a released policy and a reference fixture"]
 fn groot_rollout_matches_reference() {
@@ -810,7 +810,7 @@ fn groot_rollout_matches_reference() {
         let inputs = p.inputs(&obs).unwrap();
         let grids: Vec<(usize, usize)> = inputs.images.iter().map(|i| i.grid).collect();
         let ids = p.policy().encoder().expand_placeholders(&inputs.tokens, &grids);
-        let want_ids: Vec<u32> = fx.st.get(&format!("chunk.{k}.input_ids")).unwrap().bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let want_ids: Vec<u32> = fx.st.get(&format!("chunk.{k}.input_ids")).unwrap().bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
         assert_eq!(ids, want_ids, "chunk {k}: prompt");
         let patches: Vec<f32> = inputs.images.iter().flat_map(|i| i.patches.iter().copied()).collect();
         let want_px = fx.f32s(&format!("chunk.{k}.pixel_values"));

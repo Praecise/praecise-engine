@@ -1,5 +1,5 @@
 //! Parity against a small random reference checkpoint
-//! (tests/parity/make_wan_pipeline_fixtures.py): prompt tokens, final latents
+//! (`tests/parity/make_wan_pipeline_fixtures.py)`: prompt tokens, final latents
 //! and decoded frames of text-to-video and first-frame-conditioned runs from
 //! the reference's starting noise. Run with
 //! `PRAECISE_WAN_PIPELINE_PARITY=<dir> cargo test wan_pipeline_parity -- --ignored`.
@@ -19,7 +19,7 @@ fn dir() -> PathBuf {
 fn bin(name: &str) -> Vec<f32> {
     std::fs::read(dir().join(format!("{name}.bin")))
         .unwrap()
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
@@ -86,7 +86,7 @@ fn wan_pipeline_parity() {
         // Per step, only text-to-video compares exactly: with a first frame the
         // reference keeps noise in frame 0 of its sampler state and swaps the
         // condition in at the end, where the native sampler holds it fixed.
-        for (i, pair) in trace.chunks_exact(2).enumerate() {
+        for (i, pair) in trace.as_chunks::<2>().0.iter().enumerate() {
             let cv = cos(&pair[0], &bin(&format!("{name}_velocity{i}")));
             let cl = cos(&pair[1], &bin(&format!("{name}_step{i}")));
             println!("{name} step {i}: velocity cosine {cv:.7}, latents cosine {cl:.7}");
@@ -162,7 +162,7 @@ fn wan_session_matches_generation() {
 
 /// Stage outputs of a released checkpoint against the reference's for one
 /// step (prompt states, the velocity after k blocks, the autoencoder round
-/// trip; tests/parity/make_wan_checkpoint_stages.py). Run with
+/// trip; `tests/parity/make_wan_checkpoint_stages.py`). Run with
 /// `PRAECISE_WAN_STAGES=<dir> PRAECISE_WAN_CHECKPOINT=<ckpt>
 /// cargo test wan_checkpoint_stages -- --ignored`; set
 /// `PRAECISE_WAN_STAGES_EXACT=1` for the exact graph over bf16 weights.
@@ -173,7 +173,7 @@ fn wan_checkpoint_stages() {
     let rd = |name: &str| -> Vec<f32> {
         let path = d.join(format!("{name}.bin"));
         let b = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        b.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+        b.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
     };
     let m: Value = serde_json::from_slice(&std::fs::read(d.join("meta.json")).unwrap()).unwrap();
     let exact = std::env::var("PRAECISE_WAN_STAGES_EXACT").is_ok();

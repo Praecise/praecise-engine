@@ -365,7 +365,7 @@ impl DecisionHead {
                 let mut parts = rest.split('.');
                 let n: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
                 let level: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-                if n < 2 || n > 255 || level >= n || parts.next().is_some() {
+                if !(2..=255).contains(&n) || level >= n || parts.next().is_some() {
                     return Err(inference(format!("invalid decision score bias {key}")));
                 }
                 let value: f32 = model

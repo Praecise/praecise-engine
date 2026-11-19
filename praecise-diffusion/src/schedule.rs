@@ -67,7 +67,7 @@ mod tests {
         assert!((s[0] - 1.0).abs() < 1e-6);
         assert_eq!(s[4], 0.0);
         assert!((empirical_mu(4096, 4) - 2.291_179_894).abs() < 1e-8);
-        for (i, want) in [1.0, 0.967_383_99, 0.908_143_92, 0.767_199_96].iter().enumerate() {
+        for (i, want) in [1.0, 0.967_384, 0.908_143_92, 0.767_199_96].iter().enumerate() {
             assert!((s[i] - want).abs() < 1e-6, "step {i}: {} vs {want}", s[i]);
         }
         assert!(s.windows(2).all(|w| w[0] > w[1]), "strictly decreasing");

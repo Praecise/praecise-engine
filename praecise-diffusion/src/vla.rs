@@ -135,7 +135,7 @@ impl FeatureNorm {
     }
 
     fn check(&self, x: &[f32]) -> Result<()> {
-        if self.mode != NormMode::Identity && x.len() % self.lo.len().max(1) != 0 {
+        if self.mode != NormMode::Identity && !x.len().is_multiple_of(self.lo.len().max(1)) {
             return Err(Error::Request(format!("{} values do not divide into rows of {}", x.len(), self.lo.len())));
         }
         Ok(())
@@ -183,7 +183,7 @@ impl FeatureNorm {
                     NormMode::MinMax | NormMode::Quantiles | NormMode::Quantile10 => {
                         let den = hi - lo;
                         let den = if den == 0.0 { self.eps } else { den };
-                        (v + 1.0) / 2.0 * den + lo
+                        f32::midpoint(v, 1.0) * den + lo
                     }
                 }
             })

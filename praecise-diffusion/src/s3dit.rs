@@ -79,7 +79,7 @@ impl S3DitConfig {
         if self.n_kv_heads != self.n_heads || !self.qk_norm || self.siglip_feat_dim.is_some() {
             return bad("only full-head attention with query/key norms and no image features is implemented");
         }
-        if self.dim % self.n_heads != 0 || self.axes_dims.len() != 3 || self.axes_lens.len() != 3 {
+        if !self.dim.is_multiple_of(self.n_heads) || self.axes_dims.len() != 3 || self.axes_lens.len() != 3 {
             return bad("expected three rotary axes over whole heads");
         }
         if self.axes_dims.iter().sum::<u64>() != self.head_dim() || self.axes_dims.iter().any(|d| d % 2 != 0) {

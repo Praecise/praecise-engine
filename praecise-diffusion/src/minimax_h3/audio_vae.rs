@@ -6,7 +6,7 @@
 //! strided convolution that doubles the width, then snake and an output
 //! convolution. A projection block maps the trunk to the latent width: a
 //! normed linear path plus causal attention whose heads are averaged and
-//! adaptively pooled to the latent width, followed by a pre-norm GeGLU MLP;
+//! adaptively pooled to the latent width, followed by a pre-norm `GeGLU` MLP;
 //! the posterior mean head finishes it. The decoder is a pointwise input
 //! projection and an anti-aliased AMP generator (shared with the LTX-2
 //! vocoder) whose output is clamped to `[-1, 1]`. Every convolution is

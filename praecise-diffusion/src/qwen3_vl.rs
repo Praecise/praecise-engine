@@ -178,7 +178,7 @@ impl Qwen3VlConfig {
         let (q, kv) = (t.num_attention_heads * hd, t.num_key_value_heads * hd);
         let f = WType::F32;
         // 8-bit blocks hold 32 columns; narrower rows stay float32.
-        let q8 = |cols: u64| if linear == WType::Q8_0 && cols % 32 != 0 { f } else { linear };
+        let q8 = |cols: u64| if linear == WType::Q8_0 && !cols.is_multiple_of(32) { f } else { linear };
         let mut s = vec![WeightSpec::new(format!("{TEXT}.embed_tokens.weight"), &[t.vocab_size, d], embed)];
         for i in 0..t.num_hidden_layers {
             let p = format!("{TEXT}.layers.{i}");

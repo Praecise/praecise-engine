@@ -2,7 +2,7 @@
 //! chunk) that share one noise schedule.
 //!
 //! Two samplers: rectified-flow Euler on a rationally shifted linear schedule,
-//! and second-order bh2 UniPC in clean-sample space on the shifted linear grid
+//! and second-order bh2 `UniPC` in clean-sample space on the shifted linear grid
 //! with integer model ticks (one model evaluation per step; the corrector reuses
 //! it). [`guide`] combines an unconditional and a conditional prediction per
 //! stream so each stream can carry its own guidance scale.
@@ -10,7 +10,7 @@
 use crate::error::{Error, Result};
 use crate::unipc::{shifted_linear_schedule, UniPc};
 
-/// Training timesteps of the UniPC grid.
+/// Training timesteps of the `UniPC` grid.
 pub const NUM_TRAIN_TIMESTEPS: u64 = 1000;
 
 /// Which solver drives the denoising.
@@ -18,7 +18,7 @@ pub const NUM_TRAIN_TIMESTEPS: u64 = 1000;
 pub enum SamplerKind {
     /// First-order rectified-flow Euler.
     Euler,
-    /// Second-order bh2 UniPC, predicting the clean sample.
+    /// Second-order bh2 `UniPC`, predicting the clean sample.
     UniPc,
 }
 

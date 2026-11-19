@@ -153,7 +153,7 @@ impl SessionConfig {
     pub fn validate(&self, stride: usize) -> Result<()> {
         let bad = |m: &str| Err(Error::Request(m.into()));
         let s = stride as u32 * 2;
-        if self.width == 0 || self.height == 0 || self.width % s != 0 || self.height % s != 0 {
+        if self.width == 0 || self.height == 0 || !self.width.is_multiple_of(s) || !self.height.is_multiple_of(s) {
             return bad("width and height must be positive multiples of the patch stride");
         }
         if !(self.fps > 0.0 && self.fps.is_finite()) {

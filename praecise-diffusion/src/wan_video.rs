@@ -6,12 +6,12 @@
 //! padding rows take part through the transformer's text projection. The
 //! video is generated in a 48-channel latent at 1/16 of the resolution and
 //! 1/4 of the frame rate (plus the first frame), sampled with flow-shifted
-//! UniPC under classifier-free guidance, and decoded frame by frame by the
+//! `UniPC` under classifier-free guidance, and decoded frame by frame by the
 //! causal autoencoder.
 //!
 //! A conditioning image becomes the first latent frame: it is encoded, its
 //! tokens carry timestep 0, and it stays clean through sampling (zero
-//! velocity keeps a UniPC sample fixed).
+//! velocity keeps a `UniPC` sample fixed).
 
 use std::time::Instant;
 

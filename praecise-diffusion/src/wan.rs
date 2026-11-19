@@ -466,7 +466,7 @@ impl Net<'_, '_> {
         self.add_bias(y, p)
     }
 
-    /// Channel RMS norm with gain, then SiLU, on `[W, H, C, T]`.
+    /// Channel RMS norm with gain, then `SiLU`, on `[W, H, C, T]`.
     fn norm_silu(&mut self, p: &str, x: Tn) -> Tn {
         let c = self.g.permute(x, [1, 2, 0, 3]);
         let c = self.g.cont(c);
@@ -646,31 +646,31 @@ pub fn encode_frames(backend: &Backend, cfg: &WanVaeConfig, vae: &Weights, frame
     let Some(head) = frames.first() else {
         return Err(Error::Request("no frames to encode".into()));
     };
-    if (frames.len() - 1) % 4 != 0 {
+    if !(frames.len() - 1).is_multiple_of(4) {
         return Err(Error::Request(format!("{} frames to encode; the encoder takes 1 + 4k", frames.len())));
     }
     let (w, h) = (head.width as usize, head.height as usize);
     let patched = |img: &RgbImage| {
         let mut px = vec![0f32; 3 * w * h];
-        for (i, p) in img.rgb.chunks_exact(3).enumerate() {
+        for (i, p) in img.rgb.as_chunks::<3>().0.iter().enumerate() {
             for c in 0..3 {
                 px[c * w * h + i] = f32::from(p[c]) / 127.5 - 1.0;
             }
         }
         patchify(&px, w, h)
     };
-    let cache = Weights::zeros(&backend, &cfg.encoder_cache_specs(w as i64, h as i64))?;
+    let cache = Weights::zeros(backend, &cfg.encoder_cache_specs(w as i64, h as i64))?;
     let lt = 1 + (frames.len() - 1) / 4;
     let mut graphs: Vec<(Graph, EncodeIo)> = Vec::new();
     for first in [true, false].into_iter().take(lt.min(2)) {
-        let mut g = Graph::new(&backend)?;
+        let mut g = Graph::new(backend)?;
         let io = build_encoder(&mut g, cfg, vae, &cache, w as i64, h as i64, first);
         g.finish(&[io.mean])?;
         graphs.push((g, io));
     }
     let mut per_frame: Vec<Vec<f32>> = Vec::with_capacity(lt);
     for t in 0..lt {
-        let chunk: &[RgbImage] = if t == 0 { &frames[..1] } else { &frames[1 + 4 * (t - 1)..1 + 4 * t] };
+        let chunk: &[RgbImage] = if t == 0 { &frames[..1] } else { &frames[(1 + 4 * (t - 1))..=(4 * t)] };
         let mut input = Vec::new();
         for f in chunk {
             input.extend(patched(f));
@@ -898,7 +898,7 @@ mod tests {
         // The earlier phase is the complement: the two sum to a plain mean.
         let prev = avg_down_kernel(2, 4, true, true, 0).unwrap();
         for (a, b) in k.iter().zip(&prev) {
-            assert!(a * b == 0.0);
+            assert_eq!(a * b, 0.0);
         }
         let total: f32 = k.iter().chain(&prev).sum();
         assert!((total - 4.0).abs() < 1e-5);

@@ -42,11 +42,10 @@ impl<'p> ChunkRollout<'p> {
     /// # Errors
     /// When fixed noise has the wrong length.
     pub fn new(policy: &'p dyn ChunkPolicy, noise: NoiseSource) -> Result<Self> {
-        if let NoiseSource::Fixed(n) = &noise {
-            if n.len() != policy.noise_len() {
+        if let NoiseSource::Fixed(n) = &noise
+            && n.len() != policy.noise_len() {
                 return Err(Error::Request(format!("the policy reads {} noise values, got {}", policy.noise_len(), n.len())));
             }
-        }
         Ok(Self { policy, noise, chunks: 0, queue: VecDeque::new() })
     }
 

@@ -19,7 +19,7 @@ impl Matrix {
 
     /// The matrix of an ISO/IEC 23091-2 `matrix_coefficients` code and a
     /// full-range flag; `None` for codes this crate does not convert
-    /// (identity, YCgCo, constant-luminance).
+    /// (identity, `YCgCo`, constant-luminance).
     #[must_use]
     pub fn from_code(code: u32, full: bool) -> Option<Self> {
         let m = match code {

@@ -1,4 +1,4 @@
-//! HunyuanImage 3.0 image side: the parts around the language backbone that turn latents into
+//! `HunyuanImage` 3.0 image side: the parts around the language backbone that turn latents into
 //! backbone inputs and backbone outputs into a velocity, and the latent decoder.
 //!
 //! The backbone denoises the image inside its own token sequence: every step, the noisy latent
@@ -544,7 +544,7 @@ impl HunyuanImage3Vae {
         let (files, cfg) = open(path)?;
         let v = &cfg.vae;
         let ch: Vec<u64> = v.block_out_channels.iter().rev().copied().collect();
-        if ch[0] % v.latent_channels != 0 {
+        if !ch[0].is_multiple_of(v.latent_channels) {
             return Err(Error::Config("decoder input width is not a multiple of the latent channels".into()));
         }
         let mut h = Hosts { files: &files, kt: if exact { WType::F32 } else { WType::F16 }, v: Vec::new() };

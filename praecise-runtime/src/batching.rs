@@ -1496,7 +1496,7 @@ impl CommitmentLog {
     }
 
     fn finish(self, prompt_tokens: u32) -> Option<InferenceCommitment> {
-        (!self.incomplete && !self.steps.is_empty()).then(|| InferenceCommitment {
+        (!self.incomplete && !self.steps.is_empty()).then_some(InferenceCommitment {
             k: self.k as u8,
             prompt_tokens,
             steps: self.steps,

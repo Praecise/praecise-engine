@@ -146,14 +146,11 @@ fn emit(pic: &Dav1dPicture, container: Option<Matrix>, sink: &mut Sink<'_>) -> R
     if pic.p.layout != DAV1D_PIXEL_LAYOUT_I420 {
         return Err(Error::Request("AV1 video that is not 4:2:0 is not decoded".into()));
     }
-    let m = match container {
-        Some(m) => m,
-        None => {
-            let seq = pic.seq_hdr.ok_or_else(|| codec("picture without a sequence header"))?;
-            // SAFETY: the header lives as long as the picture reference.
-            let seq = unsafe { seq.as_ref() };
-            Matrix::from_code(seq.mtrx, seq.color_range != 0).ok_or_else(|| Error::Request(format!("AV1 matrix coefficients {} are not decoded", seq.mtrx)))?
-        }
+    let m = if let Some(m) = container { m } else {
+        let seq = pic.seq_hdr.ok_or_else(|| codec("picture without a sequence header"))?;
+        // SAFETY: the header lives as long as the picture reference.
+        let seq = unsafe { seq.as_ref() };
+        Matrix::from_code(seq.mtrx, seq.color_range != 0).ok_or_else(|| Error::Request(format!("AV1 matrix coefficients {} are not decoded", seq.mtrx)))?
     };
     let (w, h) = (pic.p.w as usize, pic.p.h as usize);
     let (cw, ch) = Yuv420::chroma_dims(w, h);
