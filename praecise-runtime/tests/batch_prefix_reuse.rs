@@ -10,6 +10,7 @@ use std::sync::Arc;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
+use praecise_runtime::toploc::StepRecord;
 use praecise_runtime::{BatchEngine, BatchPrompt, BatchRequest, GenerationConfig, InferenceResult};
 use tokio::sync::oneshot;
 
@@ -43,33 +44,44 @@ fn engine(backend: &Arc<LlamaBackend>, path: &str) -> BatchEngine {
     BatchEngine::spawn("m".into(), model, backend.clone(), 1024, false).expect("spawn")
 }
 
-/// The committed tokens and every committed logit, which must be finite.
-fn tokens(var: &str, what: &str, r: &InferenceResult) -> Vec<u32> {
+/// The committed steps; every committed logit must be finite.
+fn steps<'a>(var: &str, what: &str, r: &'a InferenceResult) -> &'a [StepRecord] {
     let steps = &r.commitment.as_ref().expect("the batch engine records a commitment").steps;
     for (i, s) in steps.iter().enumerate() {
         assert!(s.top_k.iter().all(|e| e.logit.is_finite()), "{var}: {what}: a non-finite logit at step {i}");
     }
-    steps.iter().map(|s| s.token_id).collect()
+    steps
+}
+
+/// Both answers must be the same tokens; when they are not, say where they part
+/// and what the scores there were.
+fn same(var: &str, what: &str, a: &[StepRecord], b: &[StepRecord]) {
+    let ids = |s: &[StepRecord]| s.iter().map(|x| x.token_id).collect::<Vec<_>>();
+    if ids(a) == ids(b) {
+        return;
+    }
+    let at = a.iter().zip(b).position(|(x, y)| x.token_id != y.token_id).unwrap_or(a.len().min(b.len()));
+    let top = |s: &[StepRecord]| s.get(at).map(|x| x.top_k.iter().map(|e| (e.token_id, e.logit)).collect::<Vec<_>>());
+    panic!("{var}: {what}: the answers part at step {at} of {}/{}: first {:?} vs second {:?}", a.len(), b.len(), top(a), top(b));
 }
 
 fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
     let warm = engine(backend, path);
     let first = generate(&warm, PROMPT, 24);
-    tokens(var, "first answer", &first);
+    steps(var, "first answer", &first);
 
     // The exact extension: the prompt, what was answered, and a little more.
     let extended = format!("{PROMPT}{} Nobody in the village had ever seen", first.text);
     let again = generate(&warm, &extended, 16);
-    let warm_tokens = tokens(var, "warm extension", &again);
     // The same request once more hits the cache in full.
     let repeat = generate(&warm, &extended, 16);
-    assert_eq!(warm_tokens, tokens(var, "warm repeat", &repeat), "{var}: the same request answered differently from a warm cache");
+    same(var, "the same request answered differently from a warm cache", steps(var, "warm extension", &again), steps(var, "warm repeat", &repeat));
     warm.shutdown();
 
     let cold = engine(backend, path);
-    let cold_tokens = tokens(var, "cold extension", &generate(&cold, &extended, 16));
+    let cold_answer = generate(&cold, &extended, 16);
     cold.shutdown();
-    assert_eq!(warm_tokens, cold_tokens, "{var}: an exact extension answered differently from a cold engine");
+    same(var, "an exact extension answered differently from a cold engine", steps(var, "warm extension", &again), steps(var, "cold extension", &cold_answer));
 }
 
 #[test]
