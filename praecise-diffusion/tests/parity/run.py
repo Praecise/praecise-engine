@@ -17,9 +17,20 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# family: (script, variable, test filter, packages, extra pip arguments)
+# family: (script, variable, test filter, packages; diffusers from its main branch, which the newer models need)
 FAMILIES = {
-    "umt5": ("make_umt5_fixtures.py", "PRAECISE_UMT5_PARITY", "umt5::parity", ["numpy", "safetensors", "transformers"]),
+    "pipeline": ("make_fixtures.py", "PRAECISE_DIFFUSION_PARITY", "pipeline::parity", ["git+https://github.com/huggingface/diffusers", "numpy", "transformers"]),
+    "cosmos3_mot": ("make_cosmos3_mot_fixtures.py", "PRAECISE_COSMOS3_MOT_PARITY", "cosmos3::parity", ["git+https://github.com/huggingface/diffusers", "numpy", "safetensors"]),
+    "flux3": ("make_flux3_fixtures.py", "PRAECISE_FLUX3_PARITY", "flux3::parity", ["safetensors"]),
+    "flux3_image": ("make_flux3_image_fixtures.py", "PRAECISE_FLUX3_IMAGE_PARITY", "flux3::image::parity", ["git+https://github.com/huggingface/diffusers", "numpy", "safetensors"]),
+    "flux3_policy": ("make_flux3_policy_fixtures.py", "PRAECISE_FLUX3_POLICY_PARITY", "flux3::policy::parity", ["safetensors"]),
+    "flux3_text": ("make_flux3_text_fixtures.py", "PRAECISE_FLUX3_TEXT_PARITY", "flux3::text_encoder", ["transformers"]),
+    "flux3_vae": ("make_flux3_vae_fixtures.py", "PRAECISE_FLUX3_VAE_PARITY", "flux3::video_vae", ["safetensors"]),
+    "gemma3": ("make_gemma3_fixtures.py", "PRAECISE_GEMMA3_PARITY", "gemma3", ["safetensors", "transformers"]),
+    "qwen_image": ("make_qwen_image_fixtures.py", "PRAECISE_QWEN_IMAGE_PARITY", "qwen_image::parity", ["git+https://github.com/huggingface/diffusers"]),
+    "qwen_image21": ("make_qwen_image21_fixtures.py", "PRAECISE_QWEN_IMAGE21_PARITY", "qwen_image21::parity", ["git+https://github.com/huggingface/diffusers"]),
+    "umt5": ("make_umt5_fixtures.py", "PRAECISE_UMT5_PARITY", "umt5::parity", ["safetensors", "transformers"]),
+    "wan_dit": ("make_wan_dit_fixtures.py", "PRAECISE_WAN_DIT_PARITY", "wan_dit::parity", ["git+https://github.com/huggingface/diffusers", "safetensors"]),
 }
 
 
