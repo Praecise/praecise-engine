@@ -53,16 +53,32 @@ fn steps<'a>(var: &str, what: &str, r: &'a InferenceResult) -> &'a [StepRecord] 
     steps
 }
 
-/// Both answers must be the same tokens; when they are not, say where they part
-/// and what the scores there were.
+/// The score gap, in one step's committed top-k, between its best token and `token`.
+fn gap(step: &StepRecord, token: u32) -> Option<f32> {
+    let best = step.top_k.iter().map(|e| e.logit).fold(f32::MIN, f32::max);
+    step.top_k.iter().find(|e| e.token_id == token).map(|e| best - e.logit)
+}
+
+/// Decoded one token at a time and prefilled at once, the logits round apart
+/// (measured up to 0.5 on CPU, as in `batch_scoring`), so a cache hit of another
+/// length may swap a near tie. Two answers are the same up to that rounding when
+/// they are the same tokens, or when at the step where they part each one's token
+/// is within the rounding of the other's best score.
+const ROUNDING: f32 = 0.5;
+
 fn same(var: &str, what: &str, a: &[StepRecord], b: &[StepRecord]) {
-    let ids = |s: &[StepRecord]| s.iter().map(|x| x.token_id).collect::<Vec<_>>();
-    if ids(a) == ids(b) {
-        return;
-    }
-    let at = a.iter().zip(b).position(|(x, y)| x.token_id != y.token_id).unwrap_or(a.len().min(b.len()));
-    let top = |s: &[StepRecord]| s.get(at).map(|x| x.top_k.iter().map(|e| (e.token_id, e.logit)).collect::<Vec<_>>());
-    panic!("{var}: {what}: the answers part at step {at} of {}/{}: first {:?} vs second {:?}", a.len(), b.len(), top(a), top(b));
+    let at = match a.iter().zip(b).position(|(x, y)| x.token_id != y.token_id) {
+        None => {
+            assert_eq!(a.len(), b.len(), "{var}: {what}: one answer is longer");
+            return;
+        }
+        Some(at) => at,
+    };
+    let (x, y) = (&a[at], &b[at]);
+    let (ga, gb) = (gap(x, y.token_id), gap(y, x.token_id));
+    let near = |g: Option<f32>| g.is_some_and(|g| g <= ROUNDING);
+    let top = |s: &StepRecord| s.top_k.iter().map(|e| (e.token_id, e.logit)).collect::<Vec<_>>();
+    assert!(near(ga) && near(gb), "{var}: {what}: the answers part at step {at} beyond rounding: {:?} vs {:?}", top(x), top(y));
 }
 
 fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
