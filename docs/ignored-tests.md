@@ -15,11 +15,15 @@ in step when a test is added or removed.
   `batch_encoder_decoder`, `batch_prefix_reuse`. Run on every change to `batching.rs`, `toploc.rs` or the migration code.
 - **throughput** (`batch_throughput`, a timing): the same command with `PRAECISE_TEST_THROUGHPUT_MODEL`
   and `_CONCURRENCY`; `_DRAFT=mtp:<n>` loads the MTP head.
-- **flux3-image** (`PRAECISE_FLUX3_IMAGE_PARITY`): fixtures from `praecise-diffusion/tests/parity/make_flux3_image_fixtures.py`;
-  `cargo test -p praecise-diffusion --lib flux3::image::parity -- --ignored`.
-- **Not yet under a job** (a fix row with an owner, not a waiver): every other parity test below, which
-  needs a reference fixture set or released weights; each is run by generating its fixtures with its own
-  `tests/parity` script and setting the variable named in its `ignore` reason.
+- **parity** (`praecise-diffusion/tests/parity/run.py <family>`): builds a family's fixtures with its
+  `make_*_fixtures.py` script (tiny random models, no released weights; torch, transformers and diffusers
+  main come from a virtual environment the script makes) and runs that module's `--ignored` tests with the
+  fixture variables set. Families: cosmos3_mot, flux3, flux3_image, flux3_policy, flux3_text, flux3_vae, gemma3, ltx2, matrix_game, pipeline, qwen_image, qwen_image21, umt5, wan_dit. `run.py --list` shows each family's scripts and variables.
+- **Not yet under a job** (a fix row with an owner, not a waiver): the parity tests of modules whose fixtures
+  need a checkpoint, a tokenizer directory or several options (flux3 packing and release, music, trellis2,
+  cosmos3 older and action, zimage, the qwen edit and vision-language tests, minimax_h3, vla, wan_video);
+  each needs its own `run.py` entry. The `_BENCH_*` tests in `ggml.rs` and `wan_dit.rs` are timings, run on
+  the hardware being measured.
 
 ## `praecise-diffusion/src/cosmos3/parity.rs` (1)
 - `cosmos3_mot_parity`: needs PRAECISE_COSMOS3_MOT_PARITY fixtures
