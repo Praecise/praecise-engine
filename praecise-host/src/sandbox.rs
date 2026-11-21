@@ -362,7 +362,7 @@ mod linux {
     }
 
     fn limits() -> std::result::Result<(), String> {
-        for (res, v) in [(libc::RLIMIT_CORE, 0u64), (libc::RLIMIT_NOFILE, 4096)] {
+        for (res, v) in [(libc::RLIMIT_CORE, 0), (libc::RLIMIT_NOFILE, 4096)] {
             let l = libc::rlimit { rlim_cur: v, rlim_max: v };
             if unsafe { libc::setrlimit(res, &l) } != 0 {
                 return Err(format!("setrlimit: {}", errno()));
