@@ -254,7 +254,7 @@ impl Engines {
     pub fn release(&self, model_id: &str, engine: &str) -> bool {
         let released = {
             let mut s = self.state.lock();
-            if !s.held.get(model_id).is_some_and(|h| h.engine == engine) {
+            if s.held.get(model_id).is_none_or(|h| h.engine != engine) {
                 return false;
             }
             let Some(held) = s.held.remove(model_id) else { return false };
