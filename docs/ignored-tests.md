@@ -12,7 +12,7 @@ in step when a test is added or removed.
 - **models** (x86 build host, `PRAECISE_TEST_KV_MODEL`, `PRAECISE_TEST_HYBRID_MODEL`, a small encoder-decoder GGUF):
   `cargo test --locked -p praecise-runtime --features bundled-llama --release --test <name> -- --ignored`
   for `kv_migration`, `batch_migration`, `batch_scoring`, `batch_yield`, `batch_limits`,
-  `batch_encoder_decoder`, `batch_prefix_reuse`. Run on every change to `batching.rs`, `toploc.rs` or the migration code.
+  `batch_encoder_decoder`, `batch_prefix_reuse`, `batch_session_reuse`. Run on every change to `batching.rs`, `toploc.rs` or the migration code.
 - **throughput** (`batch_throughput`, a timing): the same command with `PRAECISE_TEST_THROUGHPUT_MODEL`
   and `_CONCURRENCY`; `_DRAFT=mtp:<n>` loads the MTP head.
 - **parity** (`praecise-diffusion/tests/parity/run.py <family>`): builds a family's fixtures with its
