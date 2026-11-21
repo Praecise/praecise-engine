@@ -44,7 +44,7 @@ fn generate(engine: &BatchEngine, prompt: &str, salt: &str) -> InferenceResult {
 
 fn engine(backend: &Arc<LlamaBackend>, path: &str) -> BatchEngine {
     let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default().with_n_gpu_layers(0)).expect("load");
-    BatchEngine::spawn_with_projector("m".into(), model, backend.clone(), 4096, false, None).expect("spawn")
+    BatchEngine::spawn("m".into(), model, backend.clone(), 4096, false).expect("spawn")
 }
 
 /// The committed steps; every committed logit must be finite.
