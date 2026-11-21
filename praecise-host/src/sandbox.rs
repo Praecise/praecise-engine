@@ -162,6 +162,12 @@ pub fn enter_if_requested() {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "kernel ABI values: libc constants whose C types differ by architecture (c_char, BPF fields, syscall numbers, rlim_t) are narrowed to the field they fill"
+)]
 mod linux {
     use super::Confinement;
     use std::ffi::{CString, OsString};
@@ -238,6 +244,13 @@ mod linux {
 
     /// Confine this process and exec the program as PID 1 of a new PID
     /// namespace; relays its exit status.
+    // Under AppArmor's unprivileged user namespace restriction the unshare
+    // succeeds but the namespace has no capabilities, so the refusal shows
+    // up at the first write to the id maps.
+    const ALLOW: &str = "Allow unprivileged user namespaces for this executable: on Ubuntu install an \
+         AppArmor profile granting `userns` to it (or set kernel.apparmor_restrict_unprivileged_userns=0); \
+         elsewhere check user.max_user_namespaces > 0 and kernel.unprivileged_userns_clone = 1";
+
     pub(super) fn launch(args: &[OsString]) -> std::result::Result<i32, String> {
         let (c, program) = parse(args)?;
         if program.is_empty() {
@@ -256,12 +269,6 @@ mod linux {
             | libc::CLONE_NEWNET
             | libc::CLONE_NEWIPC
             | libc::CLONE_NEWPID;
-        // Under AppArmor's unprivileged user namespace restriction the unshare
-        // succeeds but the namespace has no capabilities, so the refusal shows
-        // up at the first write to the id maps.
-        const ALLOW: &str = "Allow unprivileged user namespaces for this executable: on Ubuntu install an \
-             AppArmor profile granting `userns` to it (or set kernel.apparmor_restrict_unprivileged_userns=0); \
-             elsewhere check user.max_user_namespaces > 0 and kernel.unprivileged_userns_clone = 1";
         if unsafe { libc::unshare(flags) } != 0 {
             return Err(format!("the kernel refused new user namespaces ({}). {ALLOW}", errno()));
         }
@@ -277,7 +284,7 @@ mod linux {
         if pid > 0 {
             let mut status = 0;
             loop {
-                let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+                let r = unsafe { libc::waitpid(pid, &raw mut status, 0) };
                 if r == pid {
                     break;
                 }
@@ -364,7 +371,7 @@ mod linux {
     fn limits() -> std::result::Result<(), String> {
         for (res, v) in [(libc::RLIMIT_CORE, 0), (libc::RLIMIT_NOFILE, 4096)] {
             let l = libc::rlimit { rlim_cur: v, rlim_max: v };
-            if unsafe { libc::setrlimit(res, &l) } != 0 {
+            if unsafe { libc::setrlimit(res, &raw const l) } != 0 {
                 return Err(format!("setrlimit: {}", errno()));
             }
         }
@@ -425,7 +432,7 @@ mod linux {
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
-                &attr as *const RulesetAttr,
+                &raw const attr,
                 std::mem::size_of::<RulesetAttr>(),
                 0u32,
             )
@@ -466,7 +473,7 @@ mod linux {
             // A rule on a file may only carry file rights.
             let access = if path.is_dir() { access } else { access & (FS_EXECUTE | FS_READ_FILE | FS_WRITE_FILE) };
             let rule = PathBeneath { allowed_access: access, parent_fd: pfd };
-            let r = unsafe { libc::syscall(libc::SYS_landlock_add_rule, fd, RULE_PATH_BENEATH, &rule as *const PathBeneath, 0u32) };
+            let r = unsafe { libc::syscall(libc::SYS_landlock_add_rule, fd, RULE_PATH_BENEATH, &raw const rule, 0u32) };
             unsafe { libc::close(pfd) };
             if r != 0 {
                 return Err(format!("Landlock rule for {}: {}", path.display(), errno()));
@@ -563,7 +570,7 @@ mod linux {
         f.push(stmt(RET, eperm));
         f.push(stmt(RET, libc::SECCOMP_RET_ALLOW));
         let prog = libc::sock_fprog { len: f.len() as u16, filter: f.as_mut_ptr() };
-        if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog as *const libc::sock_fprog) } != 0 {
+        if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const prog) } != 0 {
             return Err(format!("seccomp: {}", errno()));
         }
         Ok(())

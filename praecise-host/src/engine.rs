@@ -50,9 +50,9 @@ impl EngineEnv {
     /// An environment for a hosted `backend`: a Python environment at `root`
     /// with the engine's packages installed and [`ADAPTER`] written by
     /// [`install_adapter`], run as `bin/python3 praecise_adapter.py <backend>`.
-    /// The serving engines (vLLM, SGLang, TensorRT-LLM) get loopback: their
+    /// The serving engines (vLLM, `SGLang`, TensorRT-LLM) get loopback: their
     /// workers and collective-communication setup meet on 127.0.0.1 even on
-    /// one device. transformers and OpenVINO GenAI run in one process and
+    /// one device. transformers and `OpenVINO` `GenAI` run in one process and
     /// get none.
     ///
     /// # Errors
@@ -197,9 +197,9 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(Vec<u8>, Entry)>, files: &mut Ve
 /// Hash the files `walk` listed, on up to eight threads, into their entries.
 fn hash_files(entries: &mut [(Vec<u8>, Entry)], files: &[(usize, PathBuf)]) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    type Hashed = Result<Vec<(usize, [u8; 32])>>;
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get).min(8);
     let next = AtomicUsize::new(0);
-    type Hashed = Result<Vec<(usize, [u8; 32])>>;
     let results: Vec<Hashed> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {

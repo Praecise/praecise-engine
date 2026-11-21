@@ -100,6 +100,10 @@ impl RuntimeHost {
     /// # Errors
     /// When the host cannot be confined or started, or refuses the model (for
     /// example because it cannot reach the GPU on a GPU host).
+    ///
+    /// # Panics
+    /// Never in practice: the child is spawned with all three pipes.
+    #[allow(clippy::needless_pass_by_value, reason = "the catalog row is handed over to the host for good; callers build it for this call")]
     pub fn start(spec: &HostSpec, model_id: &str, model_dir: &Path, scratch: &Path, entry: Value) -> Result<Self> {
         std::fs::create_dir_all(scratch)?;
         let mut read_only = spec.read_only.clone();

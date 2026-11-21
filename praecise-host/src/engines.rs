@@ -254,11 +254,11 @@ impl Engines {
     pub fn release(&self, model_id: &str, engine: &str) -> bool {
         let released = {
             let mut s = self.state.lock();
-            match s.held.get(model_id) {
-                Some(h) if h.engine == engine => {}
-                _ => return false,
+            if !s.held.get(model_id).is_some_and(|h| h.engine == engine) {
+                return false;
             }
-            s.held.remove(model_id).expect("present")
+            let Some(held) = s.held.remove(model_id) else { return false };
+            held
         };
         if released.gpu_bytes > 0 {
             self.budget.give_back(model_id);

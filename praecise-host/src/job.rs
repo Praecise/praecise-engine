@@ -522,7 +522,11 @@ const STDERR_TAIL: usize = 60;
 /// environment whose digest differs from its pin; [`Error::Start`] when the
 /// host cannot be confined; [`Error::Failed`] when the program fails, exits
 /// without a reply or runs past its time limit.
+///
+/// # Panics
+/// Never in practice: the child is spawned with all three pipes.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines, reason = "one pass over a job's life: prepare, confine, spawn, stream events, collect; split points share ten locals")]
 pub fn run_job(engine: &JobEngine, req: JobRequest, mut on_event: impl FnMut(&Value)) -> Result<JobOutcome> {
     let started = Instant::now();
     let prog = program(&req.program).ok_or_else(|| Error::Refused(format!("no job program {}", req.program)))?;
@@ -630,12 +634,9 @@ pub fn run_job(engine: &JobEngine, req: JobRequest, mut on_event: impl FnMut(&Va
         }
         match rx.recv_timeout(left.min(Duration::from_secs(1))) {
             Ok(Ok(l)) => {
-                let v: Value = match serde_json::from_str(&l) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        broke = Some(format!("broke the protocol: {}", l.chars().take(200).collect::<String>()));
-                        break;
-                    }
+                let v: Value = if let Ok(v) = serde_json::from_str(&l) { v } else {
+                    broke = Some(format!("broke the protocol: {}", l.chars().take(200).collect::<String>()));
+                    break;
                 };
                 if let Some(e) = v.get("event") {
                     on_event(e);
@@ -808,6 +809,7 @@ pub fn copy_outputs(from: &Path, to: &Path) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value, reason = "call sites pass json! literals")]
     fn params(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
     }

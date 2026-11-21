@@ -38,7 +38,7 @@ fn run(args: &[String]) -> Result<Value, Error> {
     let mut params = Map::new();
     let mut text_params = Vec::new();
     let mut inputs = BTreeMap::new();
-    let mut timeout = Duration::from_secs(4 * 3600);
+    let mut timeout = Duration::from_hours(4);
     let mut confine = Confine::Full;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -81,13 +81,10 @@ fn run(args: &[String]) -> Result<Value, Error> {
     let config: Value = serde_json::from_slice(&std::fs::read(&engines)?)?;
     let all = job::engines_from_json(&config)?;
     let engine = all.get(decl.engine).ok_or_else(|| refused(format!("{} needs the {} engine, which {} does not configure", decl.name, decl.engine, engines.display())))?;
-    let run_dir = match run_dir {
-        Some(d) => d,
-        None => {
-            let base = std::env::temp_dir().join(format!("praecise-job-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            base
-        }
+    let run_dir = if let Some(d) = run_dir { d } else {
+        let base = std::env::temp_dir().join(format!("praecise-job-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        base
     };
     let keep = run_dir.clone();
     let req = JobRequest { program, params, inputs, run_dir, timeout, confine };
