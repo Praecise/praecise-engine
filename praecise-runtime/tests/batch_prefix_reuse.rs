@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 const PROMPT: &str = "The lighthouse keeper climbed the spiral stairs each evening, counting every step and \
                       listening to the sea below. One night the lamp would not light, and";
 
-fn generate(engine: &BatchEngine, prompt: &str, max_tokens: u32) -> InferenceResult {
+fn generate(engine: &BatchEngine, prompt: &str, salt: &str) -> InferenceResult {
     let (result_tx, rx): (_, oneshot::Receiver<praecise_runtime::Result<InferenceResult>>) = oneshot::channel();
     engine
         .submit(BatchRequest {
@@ -27,8 +27,11 @@ fn generate(engine: &BatchEngine, prompt: &str, max_tokens: u32) -> InferenceRes
                 top_k: Some(1),
                 repeat_penalty: 1.0,
                 repeat_last_n: 0,
-                max_tokens,
-                commitment_k: Some(4),
+                max_tokens: 12,
+                seed: 7,
+                enable_thinking: Some(false),
+                cache_salt: Some(salt.into()),
+                commitment_k: Some(8),
                 ..GenerationConfig::default()
             },
             token_tx: None,
@@ -41,7 +44,7 @@ fn generate(engine: &BatchEngine, prompt: &str, max_tokens: u32) -> InferenceRes
 
 fn engine(backend: &Arc<LlamaBackend>, path: &str) -> BatchEngine {
     let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default().with_n_gpu_layers(0)).expect("load");
-    BatchEngine::spawn("m".into(), model, backend.clone(), 1024, false).expect("spawn")
+    BatchEngine::spawn_with_projector("m".into(), model, backend.clone(), 4096, false, None).expect("spawn")
 }
 
 /// The committed steps; every committed logit must be finite.
@@ -83,21 +86,26 @@ fn same(var: &str, what: &str, a: &[StepRecord], b: &[StepRecord]) {
 
 fn run(var: &str, path: &str, backend: &Arc<LlamaBackend>) {
     let warm = engine(backend, path);
-    let first = generate(&warm, PROMPT, 24);
+    let first = generate(&warm, PROMPT, "tenant-a");
     steps(var, "first answer", &first);
+    // The same request again: its whole prompt is in the cache, and the answer
+    // still carries the commitment that was asked for.
+    let again = generate(&warm, PROMPT, "tenant-a");
+    steps(var, "identical re-send", &again);
+    assert!(again.cached_tokens + 1 >= again.input_tokens, "{var}: an identical re-send reused {} of {}", again.cached_tokens, again.input_tokens);
 
-    // The exact extension: the prompt, what was answered, and a little more.
-    let extended = format!("{PROMPT}{} Nobody in the village had ever seen", first.text);
-    let again = generate(&warm, &extended, 16);
-    // The same request once more hits the cache in full.
-    let repeat = generate(&warm, &extended, 16);
-    same(var, "the same request answered differently from a warm cache", steps(var, "warm extension", &again), steps(var, "warm repeat", &repeat));
+    // The exact extension: the prompt, what was answered, and one more turn.
+    let extended = format!("{PROMPT}{}\n\nAnd one more.", again.text);
+    let warm_answer = generate(&warm, &extended, "tenant-a");
+    let repeat = generate(&warm, &extended, "tenant-a");
+    same(var, "the same request answered differently from a warm cache", steps(var, "warm extension", &warm_answer), steps(var, "warm repeat", &repeat));
     warm.shutdown();
 
     let cold = engine(backend, path);
-    let cold_answer = generate(&cold, &extended, 16);
+    let cold_answer = generate(&cold, &extended, "cold-a");
     cold.shutdown();
-    same(var, "an exact extension answered differently from a cold engine", steps(var, "warm extension", &again), steps(var, "cold extension", &cold_answer));
+    same(var, "an exact extension answered differently from a cold engine", steps(var, "warm extension", &warm_answer), steps(var, "cold extension", &cold_answer));
+    assert_eq!(warm_answer.text.is_empty(), cold_answer.text.is_empty(), "{var}: one answer is empty");
 }
 
 #[test]
