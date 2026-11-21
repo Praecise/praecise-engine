@@ -130,7 +130,9 @@ const KV_BLOB_MIN_VERSION: u16 = 1;
 /// count, then its cells. The reader writes it back as a cache of its own
 /// stream count with every other stream empty.
 pub const WHOLE_MAGIC: &[u8; 4] = b"PRKW";
+#[cfg(any(feature = "bundled-llama", test))]
 const PART_VERBATIM: u8 = 0;
+#[cfg(any(feature = "bundled-llama", test))]
 const PART_ONE_STREAM: u8 = 1;
 const DIGEST_LEN: usize = 32;
 const HEADER_LEN: usize = 4 + 2 + 2 + DIGEST_LEN + DIGEST_LEN + 4 + 4;
@@ -325,15 +327,18 @@ pub fn is_whole_payload(payload: &[u8]) -> bool {
     payload.starts_with(WHOLE_MAGIC)
 }
 
+#[cfg(any(feature = "bundled-llama", test))]
 fn whole_err(m: impl Into<String>) -> Error {
     Error::KvSequence(m.into())
 }
 
+#[cfg(any(feature = "bundled-llama", test))]
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     b.get(at..at + 4).map(|w| u32::from_le_bytes(w.try_into().expect("4 bytes")))
 }
 
 /// Frame the parts of a whole-sequence payload.
+#[cfg(any(feature = "bundled-llama", test))]
 fn frame_whole(parts: &[(u8, &[u8])]) -> Vec<u8> {
     let len = 8 + parts.iter().map(|p| 9 + p.1.len()).sum::<usize>();
     let mut out = Vec::with_capacity(len);
@@ -348,6 +353,7 @@ fn frame_whole(parts: &[(u8, &[u8])]) -> Vec<u8> {
 }
 
 /// The parts of a whole-sequence payload, in order.
+#[cfg(any(feature = "bundled-llama", test))]
 fn whole_parts(payload: &[u8]) -> Result<Vec<(u8, &[u8])>> {
     let bad = || whole_err("malformed whole-sequence payload");
     if !is_whole_payload(payload) {
@@ -377,6 +383,7 @@ fn whole_parts(payload: &[u8]) -> Result<Vec<(u8, &[u8])>> {
 /// One attention cache written for one sequence by a context of `n` streams
 /// (`n u32`, then per stream a cell count and, when it is not zero, the cells)
 /// holds cells in one stream at most. Return that stream's entry alone.
+#[cfg(any(feature = "bundled-llama", test))]
 fn one_stream(cache: &[u8]) -> Result<Vec<u8>> {
     let n = u32_at(cache, 0).filter(|&n| n >= 1).ok_or_else(|| whole_err("attention cache without streams"))? as usize;
     let header = 4 + 4 * n;
@@ -424,6 +431,7 @@ pub struct CacheLayout {
 /// extension (2D positions and the cell's token, 12 bytes), which the entry
 /// does not announce: the size that makes the whole entry parse exactly is the
 /// one.
+#[cfg(any(feature = "bundled-llama", test))]
 fn cache_layout(entry: &[u8]) -> Result<Option<CacheLayout>> {
     let cells = u32_at(entry, 0).ok_or_else(|| whole_err("attention cache entry without a cell count"))?;
     if cells == 0 {
@@ -436,6 +444,7 @@ fn cache_layout(entry: &[u8]) -> Result<Option<CacheLayout>> {
         .ok_or_else(|| whole_err("attention cache entry does not parse as cells of one layout"))
 }
 
+#[cfg(any(feature = "bundled-llama", test))]
 fn layout_with(e: &[u8], cells: usize, ext: usize) -> Option<CacheLayout> {
     let i32_at = |at: usize| u32_at(e, at).map(|v| v as i32);
     let u64_at = |at: usize| e.get(at..at + 8).map(|w| u64::from_le_bytes(w.try_into().expect("8 bytes")));
@@ -482,6 +491,7 @@ fn layout_with(e: &[u8], cells: usize, ext: usize) -> Option<CacheLayout> {
 
 /// How many cells the first attention cache of a whole-sequence payload holds:
 /// the full-attention cache, one cell per position. `None` without one.
+#[cfg(any(feature = "bundled-llama", test))]
 fn whole_cells(payload: &[u8]) -> Result<Option<u32>> {
     let first = whole_parts(payload)?.into_iter().find(|p| p.0 == PART_ONE_STREAM);
     first.map(|(_, e)| u32_at(e, 0).ok_or_else(|| whole_err("attention cache entry without a cell count"))).transpose()
@@ -489,6 +499,7 @@ fn whole_cells(payload: &[u8]) -> Result<Option<u32>> {
 
 /// The layouts of a whole-sequence payload's attention caches, in order, for
 /// those that hold cells.
+#[cfg(any(feature = "bundled-llama", test))]
 fn whole_layouts(payload: &[u8]) -> Result<Vec<CacheLayout>> {
     let mut out = Vec::new();
     for (kind, bytes) in whole_parts(payload)? {
@@ -501,6 +512,7 @@ fn whole_layouts(payload: &[u8]) -> Result<Vec<CacheLayout>> {
 
 /// Write a whole-sequence payload back in the backend's form for a context of
 /// `streams` attention streams (`None` for a model without an attention cache).
+#[cfg(any(feature = "bundled-llama", test))]
 fn expand_whole(payload: &[u8], streams: Option<u32>) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(payload.len());
     for (kind, bytes) in whole_parts(payload)? {
