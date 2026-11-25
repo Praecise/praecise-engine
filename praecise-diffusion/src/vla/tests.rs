@@ -256,3 +256,43 @@ fn state_bins_match_the_reference_digitisation() {
     assert_eq!(pi05::discretize_state(&[-1.5, -1.0, 0.0, 0.999, 1.0, 2.0]), vec![-1, 0, 128, 255, 255, 255]);
     assert_eq!(pi05::prompt(" pick_up\nthe cube ", &[3, 200]), "Task: pick up the cube, State: 3 200;\nAction: ");
 }
+
+/// The GR00T N1.7 backbone and action head against the reference model.
+/// `PRAECISE_GROOT_PARITY` names a directory with `policy/`,
+/// `backbone/config.json`, `fixture.json` and `fixture.safetensors`
+/// (written by `tests/parity/make_groot_fixture.py`): for every sample the
+/// backbone hidden states and the action chunk are compared.
+#[test]
+#[ignore = "needs a released policy and a reference fixture"]
+fn groot_matches_reference() {
+    let dir = parity_dir("PRAECISE_GROOT_PARITY");
+    let fx = Fixture::open(&dir);
+    let (opts, tol) = parity_options();
+    let p = groot::GrootPolicy::load(&dir.join("policy"), &dir.join("backbone/config.json"), fx.usize("embodiment"), opts).unwrap();
+    let tokens: Vec<u32> = fx.meta["tokens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let start = std::time::Instant::now();
+    let (mut worst_f, mut worst_a) = (0f32, 0f32);
+    for s in 0..fx.usize("samples") {
+        let hw = &fx.meta["sizes"][s];
+        let (h, w) = (hw[0].as_u64().unwrap() as usize, hw[1].as_u64().unwrap() as usize);
+        let px = fx.f32s(&format!("{s}.pixels"));
+        let want_px = fx.f32s(&format!("{s}.pixel_values"));
+        let img = p.encoder().image(&px, (h, w)).unwrap();
+        let dp = img.patches.iter().zip(&want_px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert_eq!(img.patches.len(), want_px.len(), "patch layout");
+        assert!(dp < 1e-5, "sample {s}: patches differ by {dp}");
+        let (feats, _) = p.features(&tokens, &[(&px, (h, w))]).unwrap();
+        let want_f = fx.f32s(&format!("{s}.features"));
+        assert_eq!(feats.len(), want_f.len(), "backbone tokens");
+        let scale = want_f.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let df = feats.iter().zip(&want_f).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / scale;
+        let got = p.predict(&tokens, &[(&px, (h, w))], &fx.f32s(&format!("{s}.state")), &fx.f32s(&format!("{s}.noise"))).unwrap();
+        let want = fx.f32s(&format!("{s}.actions"));
+        let da = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        eprintln!("sample {s}: patches {dp:.1e}, backbone {df:.3e} (relative), actions {da:.3e} (got {:?})", &got[..3]);
+        worst_f = worst_f.max(df);
+        worst_a = worst_a.max(da);
+    }
+    eprintln!("worst backbone {worst_f:.3e}, worst action {worst_a:.3e} (tolerance {tol:.1e}); wall {:.1}s", start.elapsed().as_secs_f32());
+    assert!(worst_f <= tol && worst_a <= tol, "GR00T differs from the reference");
+}

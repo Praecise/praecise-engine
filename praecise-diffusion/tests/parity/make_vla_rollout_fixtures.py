@@ -249,6 +249,8 @@ def main():
     from lerobot.processor.pipeline import PolicyProcessorPipeline
 
     torch.manual_seed(a.seed)
+    # Importing the policy class registers its config type.
+    policy_class(json.loads((Path(a.policy) / "config.json").read_text())["type"])
     cfg = PreTrainedConfig.from_pretrained(a.policy)
     cfg.device = "cpu"
     if hasattr(cfg, "load_vlm_weights"):

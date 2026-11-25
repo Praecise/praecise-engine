@@ -478,3 +478,89 @@ impl GrootHead {
         Ok(g.read_f32(xt))
     }
 }
+
+/// A GR00T N1.7 policy: the Qwen3-VL backbone truncated after the release's
+/// `select_layer` decoder layers, whose last hidden states (before any
+/// norm) feed the action head.
+pub struct GrootPolicy {
+    encoder: crate::qwen3_vl::Qwen3VlEncoder,
+    head: GrootHead,
+}
+
+impl std::fmt::Debug for GrootPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrootPolicy").field("device", &self.head.device()).finish_non_exhaustive()
+    }
+}
+
+impl GrootPolicy {
+    /// Load a release directory (`config.json` and its safetensors, the
+    /// backbone stored under `backbone.model.`) with the backbone's Qwen3-VL
+    /// `config.json` given separately, keeping embodiment `embodiment`.
+    ///
+    /// # Errors
+    /// On a missing or malformed file, an unknown embodiment, or a backend
+    /// failure.
+    pub fn load(dir: &Path, backbone_config: &Path, embodiment: usize, opts: LoadOptions) -> Result<Self> {
+        let pc = read_json(&dir.join("config.json"))?;
+        let layers = pc.get("select_layer").and_then(Value::as_u64).ok_or_else(|| Error::Config("config gives no select_layer".into()))? as usize;
+        let cfg = crate::qwen3_vl::Qwen3VlConfig::from_json(read_json(backbone_config)?)?;
+        let head = GrootHead::load(dir, embodiment, opts)?;
+        if cfg.text_config.hidden_size != head.config().backbone_dim {
+            return Err(Error::Config("backbone width differs from the head's backbone_embedding_dim".into()));
+        }
+        let files = match read_json(&dir.join("model.safetensors.index.json")) {
+            Ok(index) => {
+                let mut f: Vec<String> = index
+                    .get("weight_map")
+                    .and_then(Value::as_object)
+                    .map(|m| m.values().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .unwrap_or_default();
+                f.sort();
+                f.dedup();
+                f.into_iter().map(|n| dir.join(n)).collect()
+            }
+            Err(_) => vec![dir.join("model.safetensors")],
+        };
+        let st = SafeTensors::open(&files)?.renamed(|n| n.strip_prefix("backbone.model.").map(str::to_owned))?;
+        let encoder = crate::qwen3_vl::Qwen3VlEncoder::from_safetensors(cfg, st, opts, Some(layers))?;
+        Ok(Self { encoder, head })
+    }
+
+    /// The backbone.
+    #[must_use]
+    pub fn encoder(&self) -> &crate::qwen3_vl::Qwen3VlEncoder {
+        &self.encoder
+    }
+
+    /// The action head.
+    #[must_use]
+    pub fn head(&self) -> &GrootHead {
+        &self.head
+    }
+
+    /// The backbone hidden states `[tokens][width]` and the image-token mask
+    /// for a prompt with one image placeholder per image (`[3][h][w]` in
+    /// `[0, 1]`, sides multiples of the merged patch).
+    ///
+    /// # Errors
+    /// As [`crate::qwen3_vl::Qwen3VlEncoder::forward`].
+    pub fn features(&self, tokens: &[u32], images: &[(&[f32], (usize, usize))]) -> Result<(Vec<f32>, Vec<bool>)> {
+        let imgs = images.iter().map(|(px, hw)| self.encoder.image(px, *hw)).collect::<Result<Vec<_>>>()?;
+        let grids: Vec<(usize, usize)> = imgs.iter().map(|i| i.grid).collect();
+        let ids = self.encoder.expand_placeholders(tokens, &grids);
+        let image_id = self.encoder.config().image_token_id;
+        let feats = self.encoder.forward(&ids, &imgs)?;
+        Ok((feats, ids.iter().map(|&t| t == image_id).collect()))
+    }
+
+    /// One action chunk `[horizon][max_action_dim]` in normalised units.
+    ///
+    /// # Errors
+    /// As [`Self::features`] and [`GrootHead::sample`].
+    pub fn predict(&self, tokens: &[u32], images: &[(&[f32], (usize, usize))], state: &[f32], noise: &[f32]) -> Result<Vec<f32>> {
+        let (feats, image) = self.features(tokens, images)?;
+        let valid = vec![true; image.len()];
+        self.head.sample(&feats, &image, &valid, state, noise)
+    }
+}

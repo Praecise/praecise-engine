@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::flux3::packing::Frame;
 use crate::safetensors::SafeTensors;
 
+pub mod groot;
 pub mod pi05;
 pub mod rollout;
 pub mod siglip;
