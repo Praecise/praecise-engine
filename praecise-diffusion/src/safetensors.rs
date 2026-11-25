@@ -632,7 +632,7 @@ fn parse_gguf(map: &[u8], file: usize, metadata: &mut HashMap<String, String>) -
             1 => Dtype::F16,
             30 => Dtype::Bf16,
             // SAFETY: a range-checked lookup in ggml's static type table.
-            t if t < sys::GGML_TYPE_COUNT && unsafe { sys::ggml_is_quantized(t as sys::ggml_type) } => Dtype::Quant(t),
+            t if t < sys::GGML_TYPE_COUNT as _ && unsafe { sys::ggml_is_quantized(t as sys::ggml_type) } => Dtype::Quant(t),
             t => return Err(format!("tensor {name}: unsupported type {t}")),
         };
         let len = dtype.bytes(&shape).ok_or_else(|| format!("tensor {name}: rows are not whole blocks"))? as usize;
