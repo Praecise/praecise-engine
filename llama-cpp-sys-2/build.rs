@@ -1220,6 +1220,9 @@ fn main() {
 
     if cfg!(feature = "rocm") {
         config.define("GGML_HIP", "ON");
+        // The Rust binary links as a position-independent executable; the HIP objects must be
+        // position-independent too, or the linker stops on R_X86_64_32 relocations.
+        config.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
     }
 
     if cfg!(feature = "sycl") {
