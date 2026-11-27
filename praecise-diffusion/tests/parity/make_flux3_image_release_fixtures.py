@@ -8,8 +8,8 @@ Needs the gated release weights and BFL's `flux3` package (github.com/black-fore
 
 Each case writes, under <out>/<tag>/: meta.json (the final prompt, size, steps, guidance, seed, reference
 paths as given, [orig w, h, prepared w, h] per reference), refN_orig.rgb / refN_prepared.rgb (raw 8-bit RGB
-before and after the reference's own preparation), out.rgb (the decoded image), noise.f32 (the starting latent tokens, rounded to bfloat16, row-major (h*w, 128)),
-ctx.f32 (the text context of the prompt, (L, 20480)), out.f32 (the clean latent tokens), out.png.
+before and after the reference's own preparation), out.rgb (the decoded image), noise.bin (the starting latent tokens, rounded to bfloat16, row-major (h*w, 128)),
+ctx.bin (the text context of the prompt, (L, 20480)), out.bin (the clean latent tokens), out.png.
 The engine test (`flux3::image::parity::flux3_image_release_parity`) feeds the same noise and compares.
 The reference's torch CPU randn is not reproduced by the engine, so the noise is always handed over.
 No token is read or written here: the weights are on disk already.
@@ -84,9 +84,9 @@ def main() -> None:
             tokens = denoise(dit, pack([[text[0], cond, image], [text[1], cond, image]]), schedule, guidance)
         directory = out / tag
         directory.mkdir(parents=True, exist_ok=True)
-        dump(directory / "noise.f32", noise)
-        dump(directory / "ctx.f32", ctx)
-        dump(directory / "out.f32", tokens)
+        dump(directory / "noise.bin", noise)
+        dump(directory / "ctx.bin", ctx)
+        dump(directory / "out.bin", tokens)
         picture = to_pil(pipe.autoencoder.decode(tokens, ids))
         picture.save(directory / "out.png")
         (directory / "out.rgb").write_bytes(np.asarray(picture).tobytes())
