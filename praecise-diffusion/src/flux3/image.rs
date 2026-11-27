@@ -109,6 +109,60 @@ pub fn reference_time(t: f32) -> f32 {
     bf16_round(bf16_round(t) * 1000.0) / 1000.0
 }
 
+/// The release's tensor name of a diffusers `Flux3Transformer2DModel` tensor
+/// (the inverse of diffusers' `convert_flux3_transformer_checkpoint_to_diffusers`).
+#[must_use]
+pub fn native_name(key: &str) -> String {
+    const EXACT: [(&str, &str); 6] = [
+        ("timestep_embedder.linear_1.weight", "time_in.in_layer.weight"),
+        ("timestep_embedder.linear_2.weight", "time_in.out_layer.weight"),
+        ("target_timestep_embedder.linear_1.weight", "ref_time_in.in_layer.weight"),
+        ("target_timestep_embedder.linear_2.weight", "ref_time_in.out_layer.weight"),
+        ("proj_out.weight", "final_layer.image.linear.weight"),
+        ("norm_out.linear.weight", "final_layer.image.adaLN_modulation.1.weight"),
+    ];
+    const PREFIXES: [(&str, &str); 4] = [
+        ("x_embedders.", "emb_in."),
+        ("context_embedder.", "txt_in."),
+        ("mode_blocks.", "content_mode_blocks."),
+        ("single_transformer_blocks.", "single_blocks."),
+    ];
+    const SUFFIXES: [(&str, &str); 8] = [
+        ("attn.to_q.weight", "q_proj.weight"),
+        ("attn.to_k.weight", "k_proj.weight"),
+        ("attn.to_v.weight", "v_proj.weight"),
+        ("attn.to_out.0.weight", "attn_out.weight"),
+        ("attn.norm_q.weight", "norm.query_norm.scale"),
+        ("attn.norm_k.weight", "norm.key_norm.scale"),
+        ("ff.linear_in.weight", "mlp_in.weight"),
+        ("ff.linear_out.weight", "mlp_out.weight"),
+    ];
+    if let Some((_, native)) = EXACT.iter().find(|(d, _)| *d == key) {
+        return (*native).to_string();
+    }
+    let mut name = key.to_string();
+    if let Some((from, to)) = PREFIXES.iter().find(|(d, _)| name.starts_with(d)) {
+        name = format!("{to}{}", &name[from.len()..]);
+    }
+    if name.contains("stream_modulations.") {
+        name = name.replace(".linear.weight", ".lin.weight");
+    }
+    if let Some((from, to)) = SUFFIXES.iter().find(|(d, _)| name.ends_with(d)) {
+        name = format!("{}{to}", &name[..name.len() - from.len()]);
+    }
+    name
+}
+
+/// The diffusers shards of the transformer under the release's tensor names.
+/// The final layer's modulation is stored `[scale, shift]` there and
+/// `[shift, scale]` in the release's own file: its halves swap.
+fn native_names(st: SafeTensors) -> Result<SafeTensors> {
+    let rows = st.get("norm_out.linear.weight").map(|v| v.shape[0]).ok_or_else(|| Error::MissingTensor("norm_out.linear.weight".into()))?;
+    let st = st.renamed(|k| Some(native_name(k)))?;
+    let name = native_name("norm_out.linear.weight");
+    st.regroup_rows(&name.clone(), &[(name, vec![(rows / 2, rows), (0, rows / 2)])])
+}
+
 /// Where [`Flux3Image::edit`] takes the output size from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputSize {
@@ -147,11 +201,13 @@ impl Flux3Image {
     /// Configuration, weight or backend failures, each named; a checkpoint
     /// whose transformer is not an image model, or whose parts disagree.
     pub fn load(files: &CheckpointFiles, variant: Option<&str>, opts: LoadOptions) -> Result<Self> {
-        let dit_path = match variant {
-            Some(v) => files.root.join("variants").join(v).join("model.safetensors"),
-            None => files.root.join("model.safetensors"),
+        let st = match variant {
+            Some(v) => SafeTensors::open(&[files.root.join("variants").join(v).join("model.safetensors")])?,
+            None if files.root.join("model.safetensors").is_file() => SafeTensors::open(&[files.root.join("model.safetensors")])?,
+            // The diffusers shards of the same weights, under diffusers' names.
+            None => native_names(SafeTensors::open(&files.weights("transformer")?)?)?,
         };
-        let st = SafeTensors::open(&[dit_path])?.dequantize_nvfp4()?.dequantize_scaled_f8()?;
+        let st = st.dequantize_nvfp4()?.dequantize_scaled_f8()?;
         let dit = Flux3Transformer::from_safetensors(&st, opts)?.with_spatial_rope_scale(IMAGE_ROPE_SCALE);
         drop(st);
         let cfg = dit.config();
@@ -187,7 +243,9 @@ impl Flux3Image {
     /// Load whichever transformer the checkpoint directory holds: the
     /// bfloat16 `model.safetensors`, else the first of [`QUANT_VARIANTS`]
     /// present under `variants/` (a quantised entry's directory carries only
-    /// its own transformer beside the shared text encoder and autoencoder).
+    /// its own transformer beside the shared text encoder and autoencoder),
+    /// else the diffusers shards under `transformer/`, whose tensors are read
+    /// under the release's names.
     ///
     /// # Errors
     /// No transformer in the directory; otherwise as [`Flux3Image::load`].
@@ -195,14 +253,17 @@ impl Flux3Image {
         if files.root.join("model.safetensors").is_file() {
             return Self::load(files, None, opts);
         }
-        match QUANT_VARIANTS.iter().find(|v| files.root.join("variants").join(v).join("model.safetensors").is_file()) {
-            Some(v) => Self::load(files, Some(v), opts),
-            None => Err(Error::Weights(format!(
-                "{}: no model.safetensors, nor variants/{{{}}}/model.safetensors",
-                files.root.display(),
-                QUANT_VARIANTS.join(",")
-            ))),
+        if let Some(v) = QUANT_VARIANTS.iter().find(|v| files.root.join("variants").join(v).join("model.safetensors").is_file()) {
+            return Self::load(files, Some(v), opts);
         }
+        if files.weights("transformer").is_ok() {
+            return Self::load(files, None, opts);
+        }
+        Err(Error::Weights(format!(
+            "{}: no model.safetensors, nor variants/{{{}}}/model.safetensors, nor transformer/*.safetensors",
+            files.root.display(),
+            QUANT_VARIANTS.join(",")
+        )))
     }
 
     /// Sample with `recipe` instead of the reference code's numbers.
@@ -399,6 +460,82 @@ pub(crate) fn text_ids(n: usize) -> Vec<[i32; 4]> {
 mod tests {
     use super::*;
 
+    /// diffusers' `convert_flux3_transformer_checkpoint_to_diffusers`, the other way.
+    fn diffusers_name(native: &str) -> String {
+        const EXACT: [(&str, &str); 6] = [
+            ("time_in.in_layer.weight", "timestep_embedder.linear_1.weight"),
+            ("time_in.out_layer.weight", "timestep_embedder.linear_2.weight"),
+            ("ref_time_in.in_layer.weight", "target_timestep_embedder.linear_1.weight"),
+            ("ref_time_in.out_layer.weight", "target_timestep_embedder.linear_2.weight"),
+            ("final_layer.image.linear.weight", "proj_out.weight"),
+            ("final_layer.image.adaLN_modulation.1.weight", "norm_out.linear.weight"),
+        ];
+        if let Some((_, d)) = EXACT.iter().find(|(n, _)| *n == native) {
+            return (*d).to_string();
+        }
+        let mut k = native.to_string();
+        for (from, to) in [("emb_in.", "x_embedders."), ("txt_in.", "context_embedder."), ("content_mode_blocks.", "mode_blocks."), ("single_blocks.", "single_transformer_blocks.")] {
+            if k.starts_with(from) {
+                k = format!("{to}{}", &k[from.len()..]);
+                break;
+            }
+        }
+        k = k.replace(".lin.weight", ".linear.weight");
+        for (from, to) in [
+            ("q_proj.weight", "attn.to_q.weight"),
+            ("k_proj.weight", "attn.to_k.weight"),
+            ("v_proj.weight", "attn.to_v.weight"),
+            ("attn_out.weight", "attn.to_out.0.weight"),
+            ("norm.query_norm.scale", "attn.norm_q.weight"),
+            ("norm.key_norm.scale", "attn.norm_k.weight"),
+            ("mlp_in.weight", "ff.linear_in.weight"),
+            ("mlp_out.weight", "ff.linear_out.weight"),
+        ] {
+            if k.ends_with(from) {
+                k = format!("{}{to}", &k[..k.len() - from.len()]);
+                break;
+            }
+        }
+        k
+    }
+
+    #[test]
+    fn diffusers_tensor_names_map_back_to_the_releases() {
+        let mut names = vec![
+            "emb_in.image.weight".to_string(),
+            "emb_in.image_cond.weight".into(),
+            "txt_in.weight".into(),
+            "time_in.in_layer.weight".into(),
+            "time_in.out_layer.weight".into(),
+            "ref_time_in.in_layer.weight".into(),
+            "ref_time_in.out_layer.weight".into(),
+            "final_layer.image.linear.weight".into(),
+            "final_layer.image.adaLN_modulation.1.weight".into(),
+        ];
+        for kind in ["early", "single"] {
+            for m in ["image", "image_cond", "txt"] {
+                names.push(format!("{kind}_stream_modulations.{m}.lin.weight"));
+            }
+        }
+        let block = |p: &str, names: &mut Vec<String>| {
+            for t in ["q_proj.weight", "k_proj.weight", "v_proj.weight", "attn_out.weight", "mlp_in.weight", "mlp_out.weight", "norm.query_norm.scale", "norm.key_norm.scale"] {
+                names.push(format!("{p}.{t}"));
+            }
+        };
+        for m in ["image", "image_cond"] {
+            block(&format!("content_mode_blocks.{m}.3"), &mut names);
+        }
+        block("txt_mode_blocks.4", &mut names);
+        block("single_blocks.27", &mut names);
+        for n in &names {
+            let d = diffusers_name(n);
+            assert_ne!(&d, n, "{n} is renamed in diffusers");
+            assert_eq!(&native_name(&d), n, "{d}");
+        }
+        assert_eq!(diffusers_name("txt_mode_blocks.4.q_proj.weight"), "txt_mode_blocks.4.attn.to_q.weight");
+        assert_eq!(native_name("txt_mode_blocks.0.ff.linear_out.weight"), "txt_mode_blocks.0.mlp_out.weight");
+    }
+
     #[test]
     fn the_default_recipe_is_the_release_reference_code() {
         let r = Recipe::default();
@@ -431,7 +568,7 @@ mod tests {
         let dir = std::env::temp_dir().join("praecise-flux3-image-empty");
         std::fs::create_dir_all(&dir).unwrap();
         let err = Flux3Image::load_release(&CheckpointFiles::new(&dir), LoadOptions::default()).unwrap_err();
-        assert!(err.to_string().contains("variants/{fp8r,nvfp4}/model.safetensors"), "{err}");
+        assert!(err.to_string().contains("variants/{fp8r,nvfp4}/model.safetensors, nor transformer/*.safetensors"), "{err}");
     }
 
     #[test]
