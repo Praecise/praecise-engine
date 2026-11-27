@@ -120,3 +120,40 @@ it.
 - How the prompt upsampler interacts: the card recommends full scene
   captions written by a separate model, which callers run themselves; the
   pipeline takes the prompt as given.
+
+## Release reference code against diffusers
+
+BFL's own inference code (github.com/black-forest-labs/flux-3-image-klein,
+`flux3/pipeline.py`, `sampling.py`, `dit.py`) was read against this
+pipeline. The DiT, the text context (Qwen3-VL-4B, layers 4 to 32 every
+fourth, padded to a multiple of 80, padding at rotary position 1), the
+half-step image positions, the reference `l` coordinates and the
+autoencoder agree. Differences, and what was done:
+
+- Time shift: the release code uses `alpha = 16.0` for both models; the
+  diffusers modular pipeline defaults to 6.93. Base guidance: 4.0 in the
+  release code and its model card, 3.5 in diffusers. `Recipe` holds both
+  sets; `Recipe::REFERENCE` (the release code) is the default and
+  `Recipe::DIFFUSERS` reproduces the earlier numbers. Only the release
+  weights can settle which the model was trained with:
+  `flux3_image_release_parity` and the example prompts and seeds in BFL's
+  `examples/` are the check.
+- bfloat16 inputs: the release code starts from noise rounded to bfloat16
+  and hands the transformer bfloat16 timesteps, so its sinusoid sees
+  `bf16(1000 * bf16(t))`. `Recipe::bf16_inputs` does the same.
+- Prompts longer than 4096 tokens are truncated (the encoder's own limit is
+  8192).
+- Reference preparation is in the release's pipeline, not the model:
+  `flux3::image::prepare` ports it (single reference kept whole on a padded
+  canvas under 4 MiP, Lanczos, reflect padding, cropped back; several
+  references under 1 MiP, centre-cropped to the 16-pixel grid), and
+  `Flux3Image::edit` applies it.
+- torch's CPU `randn` is not reproduced: a seed gives different noise than
+  the reference's. Parity runs hand the reference's noise over.
+- Not here: the prompt upsampler (a separate Qwen3.5 model the release asks
+  callers to run), the safety classifier, and fp8 and NVFP4 compute (the
+  quantised transformers load and are widened to the load precision).
+- Layout: the transformer is the root `model.safetensors`, read by
+  `Flux3Image::load_release`, which takes a quantised entry's
+  `variants/<fp8r|nvfp4>/model.safetensors` when the root file is absent.
+  The diffusers `transformer/` shards are not read.

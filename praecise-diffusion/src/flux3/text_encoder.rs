@@ -54,6 +54,7 @@ pub struct TextEncoder {
     layers: Vec<usize>,
     exact: bool,
     padding_position: Option<i32>,
+    max_tokens: usize,
 }
 
 impl std::fmt::Debug for TextEncoder {
@@ -100,7 +101,7 @@ impl TextEncoder {
         let backend = Backend::select(opts.cpu_threads)?;
         tracing::info!(backend = backend.name(), gpu = backend.is_gpu(), "text encoder backend selected");
         let w = Weights::load(&backend, &st, &cfg.weight_specs(LAYOUT, last, opts.precision.wtype())?)?;
-        Ok(Self { backend, cfg, w, theta, tokenizer, pad, layers: layers.to_vec(), exact: opts.precision == Precision::F32, padding_position: None })
+        Ok(Self { backend, cfg, w, theta, tokenizer, pad, layers: layers.to_vec(), exact: opts.precision == Precision::F32, padding_position: None, max_tokens: MAX_TOKENS })
     }
 
     /// Give every padding token position `pos` instead of continuing the
@@ -119,6 +120,14 @@ impl TextEncoder {
         self.cfg.hidden_size as usize * self.layers.len()
     }
 
+    /// Truncate prompts to `n` tokens (template included) instead of
+    /// [`MAX_TOKENS`].
+    #[must_use]
+    pub fn with_max_tokens(mut self, n: usize) -> Self {
+        self.max_tokens = n.min(MAX_TOKENS);
+        self
+    }
+
     /// Template, tokenize and pad `prompt`: to `fixed_length` tokens when
     /// given (truncating longer prompts), else to the next multiple of
     /// [`PAD_MULTIPLE`] (at most [`MAX_TOKENS`]).
@@ -132,9 +141,9 @@ impl TextEncoder {
         let text = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
         let enc = self.tokenizer.encode(text, false).map_err(|e| Error::Tokenizer(e.to_string()))?;
         let mut ids: Vec<i32> = enc.get_ids().iter().map(|&t| t as i32).collect();
-        ids.truncate(fixed_length.unwrap_or(MAX_TOKENS));
+        ids.truncate(fixed_length.unwrap_or(self.max_tokens));
         let real = ids.len();
-        let n = fixed_length.unwrap_or_else(|| (real.div_ceil(PAD_MULTIPLE) * PAD_MULTIPLE).min(MAX_TOKENS));
+        let n = fixed_length.unwrap_or_else(|| (real.div_ceil(PAD_MULTIPLE) * PAD_MULTIPLE).min(self.max_tokens));
         ids.resize(n, self.pad as i32);
         Ok(PromptTokens { ids, real })
     }
