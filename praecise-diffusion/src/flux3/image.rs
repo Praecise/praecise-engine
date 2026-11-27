@@ -163,6 +163,74 @@ fn native_names(st: SafeTensors) -> Result<SafeTensors> {
     st.regroup_rows(&name.clone(), &[(name, vec![(rows / 2, rows), (0, rows / 2)])])
 }
 
+/// The FLUX.2 autoencoder's configuration (diffusers `AutoencoderKLFlux2`), which the release's
+/// `ae.safetensors` matches tensor for tensor in shape: 4 levels of 128/256/512/512 channels, two
+/// residual blocks each, 32 latent channels patched 2x2 to 128, and batch statistics.
+pub const FLUX2_VAE_CONFIG: &str = r#"{"act_fn":"silu","batch_norm_eps":0.0001,"block_out_channels":[128,256,512,512],"in_channels":3,"latent_channels":32,"layers_per_block":2,"mid_block_add_attention":true,"norm_num_groups":32,"out_channels":3,"patch_size":[2,2],"use_post_quant_conv":true,"use_quant_conv":true}"#;
+
+/// The diffusers name of a tensor of the release's `ae.safetensors` (BFL's own autoencoder naming,
+/// `flux3/autoencoder.py`). Decoder levels run in the opposite order there: `decoder.up.N` is
+/// diffusers' `up_blocks.(3 - N)`.
+#[must_use]
+pub fn ae_name(key: &str) -> String {
+    let parts: Vec<&str> = key.split('.').collect();
+    let tail = |from: usize| parts[from..].join(".");
+    match parts.as_slice() {
+        ["encoder", "quant_conv", ..] => format!("quant_conv.{}", tail(2)),
+        ["decoder", "post_quant_conv", ..] => format!("post_quant_conv.{}", tail(2)),
+        [side @ ("encoder" | "decoder"), "norm_out", ..] => format!("{side}.conv_norm_out.{}", tail(2)),
+        [side @ ("encoder" | "decoder"), "mid", blk, rest @ ..] => {
+            let rest = rest.join(".");
+            match *blk {
+                "block_1" => format!("{side}.mid_block.resnets.0.{rest}"),
+                "block_2" => format!("{side}.mid_block.resnets.1.{rest}"),
+                _ => format!("{side}.mid_block.attentions.0.{}", attn_tail(&rest)),
+            }
+        }
+        ["encoder", "down", n, "downsample", rest @ ..] => format!("encoder.down_blocks.{n}.downsamplers.0.{}", rest.join(".")),
+        ["encoder", "down", n, "block", m, rest @ ..] => format!("encoder.down_blocks.{n}.resnets.{m}.{}", resnet_tail(&rest.join("."))),
+        ["decoder", "up", n, rest @ ..] if n.parse::<usize>().is_ok_and(|n| n < 4) => {
+            let d = 3 - n.parse::<usize>().unwrap_or(0);
+            match rest {
+                ["upsample", r @ ..] => format!("decoder.up_blocks.{d}.upsamplers.0.{}", r.join(".")),
+                ["block", m, r @ ..] => format!("decoder.up_blocks.{d}.resnets.{m}.{}", resnet_tail(&r.join("."))),
+                _ => key.to_string(),
+            }
+        }
+        _ => key.to_string(),
+    }
+}
+
+fn resnet_tail(rest: &str) -> String {
+    rest.replacen("nin_shortcut", "conv_shortcut", 1)
+}
+
+fn attn_tail(rest: &str) -> String {
+    match rest.split_once('.') {
+        Some(("norm", r)) => format!("group_norm.{r}"),
+        Some(("q", r)) => format!("to_q.{r}"),
+        Some(("k", r)) => format!("to_k.{r}"),
+        Some(("v", r)) => format!("to_v.{r}"),
+        Some(("proj_out", r)) => format!("to_out.0.{r}"),
+        _ => rest.to_string(),
+    }
+}
+
+/// The release's autoencoder tensors under the diffusers names, the attention projections (1x1
+/// convolutions there) viewed as matrices.
+fn diffusers_ae(st: SafeTensors) -> Result<SafeTensors> {
+    let attn: Vec<(String, u64)> = st
+        .names()
+        .filter(|n| n.contains(".attn_1.") && n.ends_with(".weight") && !n.contains(".norm."))
+        .filter_map(|n| st.get(n).map(|v| (ae_name(n), v.shape[0])))
+        .collect();
+    let mut st = st.renamed(|k| Some(ae_name(k)))?;
+    for (name, c) in attn {
+        st = st.reshaped(&name, &[c, c])?;
+    }
+    Ok(st)
+}
+
 /// Where [`Flux3Image::edit`] takes the output size from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputSize {
@@ -232,7 +300,14 @@ impl Flux3Image {
             )));
         }
         let backend = opts.backend()?;
-        let ae = Autoencoder::load(&backend, files, Autoencoder::config(files)?)?;
+        let ae = if files.root.join("vae").is_dir() {
+            Autoencoder::load(&backend, files, Autoencoder::config(files)?)?
+        } else {
+            // The release's own layout: the autoencoder is `ae.safetensors` in BFL's tensor names,
+            // the FLUX.2 architecture (every tensor is shape-checked against the config at load).
+            let st = SafeTensors::open(&[files.root.join("ae.safetensors")])?;
+            Autoencoder::load_from(&backend, diffusers_ae(st)?, Autoencoder::config_from_json(FLUX2_VAE_CONFIG)?)?
+        };
         let latent = ae.cfg.latent_channels * 4;
         if cfg.streams.iter().any(|(_, c)| *c != latent) {
             return Err(Error::Config("transformer and autoencoder latent widths disagree".into()));
@@ -534,6 +609,25 @@ mod tests {
         }
         assert_eq!(diffusers_name("txt_mode_blocks.4.q_proj.weight"), "txt_mode_blocks.4.attn.to_q.weight");
         assert_eq!(native_name("txt_mode_blocks.0.ff.linear_out.weight"), "txt_mode_blocks.0.mlp_out.weight");
+    }
+
+    #[test]
+    fn the_releases_real_autoencoder_names_map_onto_the_diffusers_ones_exactly() {
+        let list = include_str!("image/ae_keys.txt");
+        let pick = |tag: &str| -> Vec<&str> { list.lines().filter_map(|l| l.strip_prefix(tag)).collect() };
+        let (release, diffusers) = (pick("A "), pick("D "));
+        assert_eq!((release.len(), diffusers.len()), (251, 251));
+        let mut mapped: Vec<String> = release.iter().map(|k| ae_name(k)).collect();
+        mapped.sort();
+        let mut want: Vec<String> = diffusers.iter().map(|k| (*k).to_string()).collect();
+        want.sort();
+        assert_eq!(mapped, want);
+    }
+
+    #[test]
+    fn the_flux2_autoencoder_config_parses() {
+        let cfg = Autoencoder::config_from_json(FLUX2_VAE_CONFIG).unwrap();
+        assert_eq!(cfg.block_out_channels, [128, 256, 512, 512]);
     }
 
     #[test]

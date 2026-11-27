@@ -547,12 +547,27 @@ impl Autoencoder {
 
     /// Encoder and decoder weights and the latent statistics from `vae/`.
     pub(crate) fn load(backend: &Backend, files: &CheckpointFiles, cfg: VaeConfig) -> Result<Self> {
-        let vae_files = SafeTensors::open(&files.weights("vae")?)?;
+        Self::load_from(backend, SafeTensors::open(&files.weights("vae")?)?, cfg)
+    }
+
+    /// As [`Autoencoder::load`], from tensors already opened under the
+    /// diffusers names.
+    pub(crate) fn load_from(backend: &Backend, vae_files: SafeTensors, cfg: VaeConfig) -> Result<Self> {
         let mut specs = cfg.weight_specs();
         specs.extend(cfg.encoder_weight_specs());
         let w = Weights::load(backend, &vae_files, &specs)?;
         let (bn_mean, bn_std) = vae::latent_stats(&vae_files, &cfg)?;
         Ok(Self { cfg, w, bn_mean, bn_std })
+    }
+
+    /// The configuration of a FLUX.2 autoencoder given as JSON text.
+    pub(crate) fn config_from_json(text: &str) -> Result<VaeConfig> {
+        let cfg: VaeConfig = parse(serde_json::from_str(text).map_err(|e| Error::Config(format!("vae config: {e}")))?, "vae config")?;
+        cfg.validate()?;
+        if cfg.patch_size != [2, 2] || !cfg.use_post_quant_conv {
+            return Err(Error::Config("expected patched latent statistics and a post-quantisation convolution".into()));
+        }
+        Ok(cfg)
     }
 
     /// Pixels per latent token along each side.
