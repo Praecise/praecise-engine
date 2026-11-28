@@ -85,7 +85,7 @@ hidden behind a passing check.
 | Every non-NVIDIA row is unverified | A run on the silicon, recorded in [hardware.md](hardware.md). In rough order of reach: AMD Instinct and Radeon (HIP, Vulkan), Apple M-series (Metal), Intel Arc (SYCL, OpenVINO), Ryzen AI and Core Ultra NPUs, Ascend, Snapdragon |
 | Per-hardware, per-quantization dispatch tables exist only for NVIDIA | Pinned-clock sweeps on each architecture (`gfx942`, `gfx950`, `gfx1151`, Apple, Arc), as [acceleration-research.md](acceleration-research.md) describes for NVIDIA |
 | No deterministic kernel set off CPU and CUDA | An audit of reduction order per backend on its own device. HIP and MUSA compile the CUDA kernel sources but use hipBLAS and muBLAS and split by a different device, so the CUDA audit does not carry over |
-| The fork's sync with llama.cpp 1.0.0 is proved on the CPU only | The fork is synced with upstream 1.0.0 (ggml 1.0.0), which removes the deprecated API, moves the multimodal code out of `clip` and changes the CUDA attention and quantized-product kernels the fork patches. Built on an x86-64 CPU: the merged tree, with upstream's architecture test (155 of 155) and gradient test passing; `llama-cpp-sys-2` and `llama-cpp-2` with `mtmd` type-check against it. Nothing has been compiled on any GPU backend, the other crates have not been compiled against it, and the workspace's own tests have not run. Closing this takes the remaining crates type-checked and the runtime tests run, then a CUDA build, the backend comparison tests on each backend, and the fork's patches re-validated on hardware |
+| The fork's sync with llama.cpp 1.1.0 is proved on the CPU only | The fork is synced with upstream 1.1.0 (2026-11-26), which brings Inkling 2 and Inkling 2 Mini (`inkling2`, `inkling2_loop`), rewrites the CUDA flash attention kernel and the warp primitives, and drops the fork's HIP shuffle macros. Built and tested on an x86-64 CPU: the merged tree builds in full, upstream's architecture test passes (163 of 163, `inkling2` and `inkling2_loop` among them), as do the gradient, grammar, chat and parser tests; `llama-cpp-sys-2`, `llama-cpp-2` and `praecise-diffusion` build and pass their tests against it. Nothing has been compiled on any GPU backend. The CUDA merge in particular is unbuilt: the fork's banded attention no longer rides the MMA kernel (it runs on its own kernel), and the fused group norm, the MMQ offsets and the MMF ids path were carried over by hand. Closing this takes a CUDA build and the backend comparison tests on each backend, the banded attention measured against the MMA path it lost, and the fork's patches re-validated on hardware |
 | No hosted engines on macOS | Confinement for macOS written and tested on a Mac. Until then Apple is reached through linked Metal and CoreML, and MLX and vllm-metal are not hosted |
 | Static links for vendor-SDK backends are unproven | A build of `sycl`, `openvino`, `cann`, `musa`, `zdnn`, `webgpu`, `hexagon` and `et` on a machine with each SDK. Until then a static build leaves the vendor runtime to the final crate and a `dynamic-link` build carries it |
 | The Windows compute-accelerator device class is unchecked on an NPU | A run of `praecise-hw` on a Windows machine with an NPU |
@@ -221,6 +221,15 @@ speculation; each is a note of where the next gap will open.
 
 ## Changelog
 
+- **2026-11-28.** The llama.cpp fork is synced with upstream 1.1.0 (2026-11-26),
+  which first loads Inkling 2 (`inkling2`, upstream 5c008e000) and Inkling 2
+  Mini (`inkling2_loop`, upstream 29b52d398). The Hy4 flash architecture
+  `hy_v4_next_dfly` that AngelSlim's GGUFs carry is not upstream (its pull
+  request, ggml-org/llama.cpp 32517, was closed unmerged); upstream's own
+  `hy_v4_flash` is in. The fork keeps its parser serializer (the engine passes
+  the parser as a string), now covering the token, until-branch and rule-start
+  parsers, and takes upstream's Inkling parser; `wrapper_oai.cpp` passes the
+  tool choice and the tools to upstream's tool-choice parser.
 - **2026-11-13.** The llama.cpp fork is synced in source with upstream 1.0.0
   (ggml 1.0.0). Upstream removed its deprecated API, so the bindings call
   the replacements it names (`llama_model_*`, `llama_vocab_*`,

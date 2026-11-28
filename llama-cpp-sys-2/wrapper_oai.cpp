@@ -25,6 +25,14 @@ struct llama_rs_chat_parse_state_oaicompat {
         : syntax(std::move(syntax_in)) {}
 };
 
+// The tool choice arrives as the bare word (auto, none, required) or as the JSON object of the OpenAI field.
+static common_json tool_choice_from_string(const std::string & value) {
+    if (!value.empty() && value[0] == '{') {
+        return common_json::parse(value);
+    }
+    return common_json(value);
+}
+
 static std::string random_string(size_t length = 32) {
     static constexpr char chars[] =
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -449,7 +457,7 @@ static llama_rs_status apply_chat_template_oaicompat(
             inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(params->tools));
         }
         if (params->tool_choice && std::strlen(params->tool_choice) > 0) {
-            inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(params->tool_choice);
+            inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(tool_choice_from_string(params->tool_choice), inputs.tools);
         }
         if (params->json_schema && std::strlen(params->json_schema) > 0) {
             inputs.json_schema = params->json_schema;
@@ -949,8 +957,8 @@ extern "C" llama_rs_status llama_rs_chat_tool_choice_parse_oaicompat(
         return LLAMA_RS_STATUS_OK;
     }
     try {
-        const auto parsed = common_chat_tool_choice_parse_oaicompat(tool_choice);
-        *out_choice = static_cast<llama_rs_chat_tool_choice_oaicompat>(parsed);
+        const auto parsed = common_chat_tool_choice_parse_oaicompat(tool_choice_from_string(tool_choice), {});
+        *out_choice = static_cast<llama_rs_chat_tool_choice_oaicompat>(parsed.mode);
         return LLAMA_RS_STATUS_OK;
     } catch (const std::exception &) {
         return LLAMA_RS_STATUS_EXCEPTION;
