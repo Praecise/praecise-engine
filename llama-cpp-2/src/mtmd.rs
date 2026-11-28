@@ -1293,12 +1293,17 @@ impl MtmdGenAudio {
             n_past: 0,
             out_mode: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUT_AUTO,
             speaker_ref: input.speaker_reference.map_or(std::ptr::null_mut(), |b| b.bitmap.as_ptr()),
+            speaker_ref_text: std::ptr::null(),
             lang: self.language.as_ref().map_or(std::ptr::null(), |l| l.as_ptr()),
             top_k: input.top_k,
             top_p: input.top_p,
             temp: -1.0, // the model's default frame temperature
             seed: input.seed,
             out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
+            speed: 1.0,      // the model's own pace
+            loudness: 0.0,   // the model's own loudness
+            cfg_scale: 0.0,  // the model's own guidance
+            flow_steps: 0,   // the model's own solver steps
             stream: false,
         };
         match unsafe { llama_cpp_sys_2::mtmd_helper_gen_audio_set_input(self.ptr.as_ptr(), &raw const inp) } {
@@ -1332,12 +1337,17 @@ impl MtmdGenAudio {
             n_past: 0,
             out_mode: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUT_AUTO,
             speaker_ref: std::ptr::null_mut(),
+            speaker_ref_text: std::ptr::null(),
             lang: std::ptr::null(),
             top_k: cond.top_k,
             top_p: cond.top_p,
             temp: -1.0, // the model's default frame temperature
             seed: cond.seed,
             out_type: llama_cpp_sys_2::MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,
+            speed: 1.0,      // the model's own pace
+            loudness: 0.0,   // the model's own loudness
+            cfg_scale: 0.0,  // the model's own guidance
+            flow_steps: 0,   // the model's own solver steps
             stream: false,
         };
         let c = llama_cpp_sys_2::mtmd_helper_gen_audio_cond {
